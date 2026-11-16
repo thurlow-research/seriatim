@@ -1,0 +1,53 @@
+# --- Secrets and local config: never commit ---
+.envrc
+.env
+.env.*
+!.env.example
+!.envrc.example
+*.pem
+*.key
+*.p12
+secrets/
+config.local.*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# --- Testing, coverage, mutation ---
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mutmut-cache
+mutants/
+.hypothesis/
+.tox/
+.nox/
+
+# --- Type checking and linting caches ---
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# --- PPE / Docker local runtime ---
+ppe/data/
+ppe/logs/
+*.log
+
+# --- Editors and OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

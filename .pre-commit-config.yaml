@@ -1,0 +1,6 @@
+# Install once: pre-commit install
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2  # tag commit 43fae355e6fe4d99d2a7b240a224b85e2903aeb4
+    hooks:
+      - id: gitleaks
