@@ -1,6 +1,6 @@
 # ADR-001: Seriatim architecture
 
-**Status:** revision 3, proposed. **Date:** 2026-11-16.
+**Status:** revision 4, proposed. **Date:** 2026-11-16.
 **Requirements:** [SPEC](../SPEC.md). **Evidence:** [EVALUATION](../EVALUATION.md).
 **First slice:** [TD-slice-1](../design/TD-slice-1.md).
 
@@ -32,7 +32,7 @@ defects (SPEC §1, F1 to F4). This ADR records how Seriatim is built instead.
 | D2 | The sidecar **takes Ollama's port 11434**. Ollama moves to **`127.0.0.1:11435`**. |
 | D3 | Busy means an **immediate admission 429**, marked `X-Seriatim-Gate: busy`. There is no queue. The gateway spills over **only on that marker**. |
 | D4 | **Byte-for-byte passthrough.** `num_ctx` is never changed; an over-limit value is rejected. |
-| D5 | The gateway is a **thin router**: it routes by fit (D14), and combines the read-only views. |
+| D5 | The gateway is a **thin router**: it routes by the operator's eligibility rules, and combines the read-only views. |
 | D6 | **Bearer keys** with `infer` and `admin` scopes. Nodes store hashes. Each node has its own keys. |
 | D7 | **Python 3.12, Starlette, uvicorn (h11), httpx, anyio and pydantic-settings.** A 30-line OS lock (`fcntl.flock` / `msvcrt.locking`) for the singleton. WinSW and launchd run the services. |
 | D8 | **The contract comes first** (Appendix A), plus a black-box behaviour suite, so another implementation can drop in. |
@@ -40,7 +40,8 @@ defects (SPEC §1, F1 to F4). This ADR records how Seriatim is built instead.
 | D10 | **Abnormal ends and restarts drain.** A slot is freed only after the upstream connection is closed and a bounded drain has passed. |
 | D11 | **One sidecar per Ollama**, enforced by a host-wide file lock. |
 | D12 | **Exact classification.** Only verified method and path pairs are ungated. Everything unknown is gated and needs `admin`. Unsafe raw paths are rejected before matching. |
-| D14 | **Fit is derived, not hand-set.** Each sidecar measures and reports its capacity. The gateway estimates a model's footprint from its bytes plus the KV cache for the requested context, with a relative margin. A node of unknown capacity is excluded unless it carries an explicit override. |
+| D14 | **Measured fit is deferred.** Sidecars measure and report capacity now; admission from it is a later slice, calibrated on real nodes. Until then, routing uses the operator's rules and fails closed without them. |
+| D15 | **Metrics through the host's exporter.** Sidecar and gateway write Prometheus text files for the standard `node_exporter` / `windows_exporter` textfile collector; Seriatim opens no metrics port. |
 
 ## 3. Decisions and the alternatives rejected
 
@@ -111,9 +112,12 @@ on. The local-only check (REQ-53) and the fail-closed exposure check (REQ-19) co
 **Decision.**
 - Bodies are forwarded as the exact bytes received, and responses as raw bytes, without
   decoding.
-- A body is parsed only to check `num_ctx` (S3) and, on the gateway, to read `model` and
-  `options.num_ctx` for routing (D14). The parse is strict: duplicate keys, wrong types and
-  conflicting placements are rejected as ambiguous. Parsing never changes the bytes sent.
+- A body is parsed only to check `num_ctx` on the sidecar (S3), and on the gateway to read
+  `model` for routing (D5). The parse is strict, and never changes the bytes sent.
+  - **The sidecar** rejects duplicate keys, wrong types and conflicting placements of
+    `num_ctx` as `NUM_CTX_AMBIGUOUS`.
+  - **The gateway** rejects invalid JSON, duplicate top-level keys, and a missing, empty
+    or non-string `model` as `BAD_REQUEST_BODY` (SPEC REQ-32).
 - An over-limit value gets 422. `num_ctx` on `/v1` gets 400 with a hint (rulings Q2 and Q3).
 
 **Alternatives rejected.**
@@ -129,18 +133,20 @@ on. The local-only check (REQ-53) and the fail-closed exposure check (REQ-19) co
 ### D5. The gateway is a thin router
 
 **Decision.**
-- **Routing.** Candidates are the nodes that are healthy, list the model, and on which the
-  model fits (D14). Candidates are tried in priority order.
+- **Routing.** Candidates are the nodes that are healthy, list the model, and are eligible
+  for it under the operator's rules: a per-model eligible-nodes list, `capacity =
+  "unlimited"`, or `max_params_b` (SPEC REQ-32). A node with no rule is excluded. Candidates
+  are tried in priority order.
 - **Discovery.** A node whose discovery failed is in an *unknown* state, never treated as "has
   no models". So 404 is given only when every node answered (REQ-34).
 - **The fleet is configuration.** The gateway knows only the nodes its config lists, with
-  their URLs, keys, priorities and optional overrides. Their capacity is discovered from
-  each sidecar (D14). Nothing in the code names a node, a count, a GPU model, a platform or a
+  their URLs, keys, priorities and size rules. Each sidecar's measured capacity is shown next
+  to those rules (D14). Nothing in the code names a node, a count, a GPU model, a platform or a
   memory size. A changed file is validated and swapped in atomically without a
   restart (SPEC REQ-44, REQ-45). A home lab's machines change, so a fixed topology would go
   stale.
 - **Combined views and `/models/select`.** It combines the read-only views and serves
-  `/models/select` from configuration and the fit rule (D14).
+  `/models/select` from configuration and the same eligibility rules.
 
 **Alternatives rejected.**
 - **Parsing the model name** (`:32b`). Names are free text, and Ollama's metadata is the
@@ -326,116 +332,109 @@ exactly one sidecar process runs on the host.
 - **A deny-by-default 404 for unknown endpoints.** It would break new Ollama features until
   Seriatim is updated. Gating them and requiring `admin` is just as safe and keeps them usable.
 
-### D14. Fit is derived from measured capacity; overrides are explicit; unknown fails closed
+### D14. Measured fit: deferred, with open problems
 
-**Context.** Revision 2 routed on a hand-set `max_params_b` per node, and the memory probes
-were advisory. That only works for someone who knows their machines' limits in billions of
-parameters. It is also wrong in both directions: the memory a model needs depends on its
-quantisation and on the context length requested, not on its parameter count.
+**Status.** Deferred to its own slice, "Measured fit", after S4 ships. It gets its own TD and
+review.
 
-**Decision.**
-- **Each sidecar reports capacity** in `/seriatim/status` (SPEC REQ-16): `usable_bytes`,
-  its `source`, `basis` and `measured_at`, the per-device figures, and the node's
-  `default_num_ctx`.
-  - **NVIDIA:** per device, `free` plus the memory held by Ollama's own processes, which
-    can be evicted. When that can't be attributed, `free` alone. The node's figure is its
-    largest device, unless the operator sets `gpu_pool = "sum"`.
-  - **Apple:** Metal's recommended GPU working-set size, or the operator's raised
-    `iogpu.wired_limit_mb` when one is set. Either is a budget, not a measurement of free
-    memory, and SPEC REQ-33 states that limit.
-- **The gateway estimates the footprint** of a model at a context length:
-  `required = (weights_bytes + kv_bytes) × (1 + fit_margin)`.
-  - `weights_bytes` is the `size` that the node's `/api/tags` lists. That is the size of the
-    model file, which tracks the weights as loaded. It is preferred to the `parameter_size`
-    label, which ignores quantisation.
-  - `kv_bytes = n_ctx_alloc × Σ_layers head_count_kv × (key_length + value_length) × 2`,
-    from `/api/show` `model_info`.
-    - The key and value lengths are read separately, because they can differ.
-    - The cache is always taken as `f16`, because a quantised cache depends on flash
-      attention and on model support, which Seriatim can't verify.
-    - `n_ctx` is padded to 256, and resolved as in SPEC REQ-32: the request's
-      `options.num_ctx`, the model's own default, the node's default, and finally the
-      model's maximum.
-    - Architectures with another cache layout (latent attention, recurrent or state-space
-      models) are not estimated. Their metadata counts as unsupported.
-  - `fit_margin` defaults to 0.25 and is relative only.
-- **A model fits** when `required ≤ usable_bytes`. Being loaded already is not taken as
-  proof, because Ollama may have put part of it on the CPU.
-- **Freshness.** A report older than 45 s, a failed read, or critical memory pressure on a
-  Mac, makes the node's capacity unknown.
-- **Overrides win, and are visible.**
-  - **`max_params_b`** replaces the measured check with a parameter-count check.
-  - **`capacity = "unlimited"`** turns the check off.
-  - `/seriatim/nodes` shows which mode applies to each node, and why.
-- **Unknown fails closed.** A node with no capacity report and no override is excluded, with
-  the reason `capacity_unknown`. If that leaves no candidate, the client gets 503
-  `CAPACITY_UNKNOWN`. Seriatim never guesses.
+**Context.** Revision 3 had the gateway derive fit itself: model bytes plus an estimated KV
+cache, times a 25 % margin, compared with each node's measured capacity, with
+`MODEL_TOO_LARGE` and `CAPACITY_UNKNOWN` as routing verdicts. The revision-3 review showed
+that the rule was not yet sound (problems 1 to 3 below). A rule that guesses and fails
+closed can refuse work on a healthy fleet, while one that guesses and lets work through
+breaks SPEC REQ-33.
 
-**Why this formula.**
-- **Weights plus the KV cache** are the two terms that dominate. Both can be computed from
-  data that Ollama already exposes, with no table of models in Seriatim.
-- **The context term matters.** A model with a 128k maximum context can need more memory
-  for its cache than for its weights. A rule that ignores `num_ctx` would send it to a
-  machine where Ollama then spills layers to the CPU.
-- **The margin.** Compute buffers, CUDA or Metal runtime overhead and graph allocations are
-  not exposed. A relative margin scales with the model, while an absolute reserve would
-  build a hardware size into the defaults. 0.25 is a starting point. S7's tests check the
-  rule against fixtures; S10 and the GPU-node slices (S5, S6) record the estimated and the
-  actual `size_vram` for each model they load, and the margin is revised from that data.
-- **Errors fall on the safe side.** Over-estimating only means a model is refused, or sent
-  to another node. Under-estimating means it runs slowly on the CPU, without any error
-  being reported.
+**Decision for Phase 1.**
+- **Measure now.** S4 ships the capacity probes (SPEC REQ-16). Each sidecar reports its
+  capacity, with source and basis, and `/seriatim/nodes` shows it next to the configured
+  rules, together with each loaded model's `size` and `size_vram`.
+- **Route by the operator's rules.** S7 routes by a per-model eligible-nodes list,
+  `capacity = "unlimited"` or `max_params_b` (SPEC REQ-32). A node with none of them is
+  excluded, with the distinct verdict `no_size_policy` and the error
+  `SIZE_POLICY_MISSING`. Nothing hardware-specific is built in (SPEC REQ-44).
+- **Then calibrate.** Once S4 runs on real NVIDIA and Apple nodes, their capacity
+  recordings, together with the `size_vram` that Ollama actually used for each model and
+  context, become the calibration data for the "Measured fit" slice.
 
-**Alternatives considered.**
-- **Hand-set `max_params_b` only** (revision 2). This is simple, but it needs per-machine
-  knowledge, ignores quantisation and context, and goes stale after a hardware change. It
-  is kept as an override.
-- **Parameter count × bytes per parameter from the quantisation label.** The labels are
-  free text (`Q4_K_M`, `F16`, `MXFP4`). Mixed quantisations make the per-parameter size
-  approximate, and the file size already contains the answer.
-- **Weights only, ignoring the context.** This fails exactly where the risk is: long
-  contexts.
-- **Asking Ollama to load the model and watching the result** (a trial load, or reading
-  `size_vram` after the fact). It is accurate, but the cost is a full model load, and on a
-  failure the node has already spilled to the CPU. It also needs the slot. Rejected as the
-  router's mechanism, but used to calibrate the margin.
-- **Trusting the configured KV cache type** (`q8_0` or `q4_0`, at roughly half or a
-  quarter of `f16`). This would let longer contexts through, but if flash attention is off,
-  or the model does not support it, Ollama silently uses `f16`. The estimate would then be
-  2 to 4 times too small. It can be revisited once Ollama reports the effective cache type.
-- **Summing every GPU's memory.** Ollama's split across devices is not exposed, and one
-  pool hides fragmentation. Using the largest device is safe, and `gpu_pool = "sum"` opts in.
-- **Ollama's own memory estimator.** It is not exposed through its API, and calling into its
-  Go internals would tie Seriatim to one Ollama version.
-- **Routing on measured *free* memory at request time.** On NVIDIA, idle models that Ollama
-  could evict count as used. On Apple, free memory is not measurable at all. Capacity
-  ignores what Ollama can evict, which gives a stable answer. A busy node is handled by the
-  gate, not by the fit rule.
-- **A default capacity when none is reported** (for example a fixed fraction of RAM). This
-  is a hardware assumption, and wrong on many machines. Excluding the node, with a visible
-  reason and an opt-in `unlimited` flag, is safer.
+**Open problems for the "Measured fit" slice** (from the revision-3 review, items 5 to 7;
+not solved here):
+1. **A single 25% margin is wrong in both directions.**
+   - Applied to `weights_bytes`, it refuses a 32B Q4 model on a 24 GiB card even at 4k
+     context.
+   - It is still not a bound: graph and compute buffers, batch size, multimodal projectors,
+     `options.num_gpu`/`main_gpu`, and `OLLAMA_NUM_PARALLEL` (which multiplies KV) all fall
+     outside it.
+
+   So REQ-33's "never too small" isn't established, and a guessed rule that fails closed
+   can refuse work on a healthy fleet.
+2. **Long-context models get refused by default.** With no node context default, the
+   effective `n_ctx` falls back to the model's maximum (128k+), which inflates KV for any
+   `/v1/*` request or any native request without `num_ctx`.
+3. **Unsupported layouts and a failed `/api/show` have no complete error path.** MLA,
+   SWA/hybrid, embedding and vision models are refused or misestimated. A node whose tags
+   list the model but whose `/api/show` fails gets no defined verdict.
+
+**What the later slice starts from.** These are recorded as starting points, not
+decisions:
+- **The candidate formula:** revision 3's `(weights + KV) × (1 + margin)`.
+- **The review findings already folded in:**
+  - separate key and value lengths;
+  - an `f16` cache unless the effective type can be verified;
+  - context padding;
+  - no "already loaded fits" shortcut;
+  - the largest single device on multi-GPU nodes.
+
+**Alternatives considered for Phase 1.**
+- **Ship revision 3's rule anyway.** Rejected for the reasons above.
+- **A hard-coded default policy**, such as a fraction of measured memory. Rejected because
+  it is a hardware assumption and still unvalidated.
+- **No size check at all** until the slice lands. Rejected because it reopens E3, a model
+  sent to a machine too small for it.
+- **Operator rules, with measurements shown beside them** (chosen). Correct by construction
+  relative to the operator's choice, visible, and it produces the data the later slice
+  needs.
 
 **Consequences.**
-- **Every node is checked the same way.** Routing makes no assumption about the
-  machine-count, the vendor or the operating system.
-- **CPU-only nodes** need `capacity = "unlimited"` or `max_params_b`. Without one of those,
-  they are excluded, and `/seriatim/nodes` says why.
-- **The gateway calls `/api/show`** once per model digest per node, and caches the result.
-- **A node without `OLLAMA_CONTEXT_LENGTH`** sizes requests that carry no `num_ctx` at the
-  model's full trained context, which can refuse models that would run. The operator guide
-  says to set it, and `/seriatim/nodes` warns when it is unset.
-- **Memory taken by other programs** after a report, or on a Mac at all, is not seen. The
-  guarantee is relative to the report (SPEC REQ-33), and the operator guide says to run
-  nothing else on a node's GPU.
-- **On Apple, the GPU working-set limit** is read through Metal, which needs the optional
-  `pyobjc-framework-Metal`. Without it, a Mac reports no capacity, and fails closed or
-  takes an override.
+- **Every node needs a rule.** Each node needs a rule for the models it should serve,
+  either an eligible-nodes entry, `unlimited` or `max_params_b`. The operator guide and
+  `/seriatim/nodes` warnings say so.
+- **The guarantee is relative.** REQ-33 holds exactly, but only relative to those rules.
+
+### D15. Metrics through the host exporter's textfile collector
+
+**Context.** Operators already run Prometheus with the standard host exporters
+(`node_exporter`, `windows_exporter`), and add service metrics through their textfile
+collectors. Seriatim's own surface is deliberately small: one port on each node, every
+route but health authenticated, and an exposure check (D2, D6, D12).
+
+**Decision.**
+- **A file, not a port.** The sidecar and the gateway each write a `.prom` file atomically,
+  every 15 s, into a configured textfile-collector directory (SPEC REQ-67).
+- **No `/metrics` route.** Seriatim adds no metrics route and no metrics port.
+- **Bounded labels.** Only bounded, non-secret labels are used: node ids, states, error
+  codes, path kinds. Model names and key ids are never labels.
+
+**Alternatives rejected.**
+- **A `/metrics` HTTP route on each sidecar.** It needs either a new unauthenticated route,
+  which breaks "everything but health needs a key", or bearer configuration in every
+  scraper. It also gives a LAN attacker a new target, and its exposure would need checking
+  too.
+- **A separate exporter process.** It is one more service to deploy and supervise on every
+  OS, and it would still need to read the sidecar's state from somewhere.
+- **Push to a Pushgateway.** It needs network egress and a central component, and stale
+  series must be cleaned up by hand.
+
+**Consequences.**
+- **No exporter, no metrics.** A host without an exporter gets none, and `/seriatim/status`
+  still works.
+- **A short lag.** Metrics lag by up to 15 s plus the scrape interval. That is fine for
+  dashboards and alerts, and `/seriatim/status` is the real-time view.
 
 ## 4. Components
 
 | component | package | runs on | state |
 |---|---|---|---|
-| sidecar | `node/seriatim_node` | each node (any OS with Python and Ollama) | slots (in memory), the singleton lock file, config |
+| sidecar | `node/seriatim_node` | each node (any OS with Python and Ollama) | slots (in memory), the singleton lock file, `node-state.json` (the admin switch), config |
 | gateway | `gateway/seriatim_gateway` | one central host (container or systemd) | node health and discovery cache (in memory, rebuilt from the nodes) |
 | contract | `contract/openapi.yaml` | — | — |
 | deploy | `deploy/windows`, `deploy/macos` | GPU nodes | config, logs |
@@ -456,7 +455,7 @@ quantisation and on the context length requested, not on its parameter count.
 
 | header | where | meaning |
 |---|---|---|
-| `Retry-After` | 429, and 503 except `OLLAMA_EXPOSED` | whole seconds |
+| `Retry-After` | 429, and 503 except `OLLAMA_EXPOSED`, `SIZE_POLICY_MISSING` and `NODE_OFFLINE` | whole seconds |
 | `X-Seriatim-Gate` | every sidecar response | `acquired` (the request held a slot), `ungated`, or `busy` (the admission 429) |
 | `X-Seriatim-Node` | gateway responses; also a request header for admin calls | the node that served the request, or the node to target |
 | `X-Seriatim-Partial` | gateway combined views | comma-separated ids of nodes that didn't answer |
@@ -509,11 +508,12 @@ Every error Seriatim produces has this form (Ollama's own errors pass through as
 | `GPU_BUSY` | 429 | yes | yes | sidecar |
 | `BAD_PATH` | 400 | no | yes | both |
 | `AUTH_AMBIGUOUS` | 400 | no | yes | both |
-| `BAD_REQUEST_BODY`, `NUM_CTX_AMBIGUOUS`, `NUM_CTX_UNSUPPORTED_ROUTE` | 400 | no | yes | sidecar |
+| `BAD_REQUEST_BODY` | 400 | no | yes | both (gateway: before routing, SPEC REQ-32) |
+| `NUM_CTX_AMBIGUOUS`, `NUM_CTX_UNSUPPORTED_ROUTE` | 400 | no | yes | sidecar |
 | `NODE_REQUIRED`, `UNKNOWN_TASK` | 400 | no | yes | gateway |
 | `AUTH_MISSING`, `AUTH_INVALID` | 401 | no | yes | both |
 | `FORBIDDEN_SCOPE` | 403 | no | yes | both |
-| `NOT_FOUND` (a reserved `/seriatim/*` path) | 404 | no | yes | both |
+| `NOT_FOUND` (a reserved `/seriatim/*` path, or an unknown node id in `X-Seriatim-Node` or `/seriatim/admin/nodes/{id}/*`) | 404 | no | yes | both |
 | `MODEL_NOT_FOUND` | 404 | no | yes | gateway |
 | `METHOD_NOT_ALLOWED` | 405 | no | yes | both |
 | `REQUEST_BODY_TIMEOUT` | 408 | yes | yes | both |
@@ -521,16 +521,17 @@ Every error Seriatim produces has this form (Ollama's own errors pass through as
 | `BODY_TOO_LARGE` | 413 | no | yes | both |
 | `NUM_CTX_EXCEEDS_LIMIT` | 422 | no | yes | sidecar |
 | `MODEL_SIZE_UNKNOWN` | 422 | no | yes | gateway |
-| `MODEL_TOO_LARGE` | 422 | no | yes | gateway |
+| `MODEL_NOT_ELIGIBLE` | 422 | no | yes | gateway |
 | `INTERNAL` | 500 | yes | **no** | both |
 | `UPSTREAM_UNAVAILABLE` | 502 | yes | yes (the connect failed) | both |
 | `UPSTREAM_PROTOCOL_ERROR` | 502 | yes | **no** | both |
 | `NODE_STARTING` | 503 | yes | yes | sidecar |
+| `NODE_OFFLINE` (the admin switch, SPEC REQ-19a) | 503 | no | yes | sidecar |
 | `EXPOSURE_UNVERIFIED` | 503 | yes | yes | sidecar |
 | `OLLAMA_EXPOSED` | 503 | **no** | yes | sidecar |
 | `NODE_SATURATED` (the ungated connection pool is full) | 503 | yes | yes | sidecar |
 | `DISCOVERY_INCOMPLETE` | 503 | yes | yes | gateway |
-| `CAPACITY_UNKNOWN` | 503 | yes | yes | gateway |
+| `SIZE_POLICY_MISSING` | 503 | no | yes | gateway |
 | `GPU_OFFLINE` (no healthy node can serve the model) | 503 | **no** | yes | gateway |
 | `LOCK_HOLD_EXCEEDED` | 504 | yes | **no** | sidecar |
 | `HTTP_VERSION_UNSUPPORTED` | 505 | no | yes | both |
@@ -577,9 +578,10 @@ The details are in TD-slice-1 §3.
 | T9 | Spoofing: forging Seriatim headers through Ollama | A compromised or odd upstream sets `X-Seriatim-Gate: busy` to trigger replays | The sidecar strips every reserved header from Ollama's responses (§5.3) | — |
 | T10 | Spoofing: a rogue node lies to the gateway | A fake 429, `/api/tags` or status | Nodes are configured explicitly; the gateway authenticates to them | Responses from nodes are not authenticated without TLS (see T2) |
 | T11 | Cross-site requests from a LAN browser | A web page calling a node | Bearer only, no cookies, no CORS headers (and Ollama's are stripped) | Blind requests are possible, and are rejected with 401 |
-| T12 | Information disclosure through status and errors | Health, the 429 body | Health gives only a status and reasons; the 429 shows only `busy_for_s`; status needs a key | Key holders see which models are loaded |
+| T12 | Information disclosure through status, errors and metrics | Health, the 429 body; the metrics file (REQ-67) carries no keys, addresses or model names, but is served to anyone who can reach the host exporter | Health gives only a status and reasons; the 429 shows only `busy_for_s`; status needs a key; the exporter's own listener, authentication and firewall are the boundary for metrics, and the docs say so | Key holders see which models are loaded |
 | T13 | Elevation: two sidecars on one Ollama | A second instance on another port, or with another lock directory | The host-wide OS lock in a fixed directory (D11); the local-only check's one-process check | Containers with separate filesystems (D11) |
 | T14 | Supply chain | A malicious dependency or Action | `uv.lock`; Actions pinned by SHA; gitleaks verified by checksum; nodes install only tagged releases, by hand, until automated deployment is designed (SPEC §7.6) | A compromise between pinned updates |
+| T16 | DoS: the admin switch takes nodes out of service | A stolen admin key calls `offline` on every node | The switch is `admin` scope on the sidecar and the gateway; each change is logged with the key id; read-only routes stay available, so the state is visible; `online` reverses it (SPEC REQ-19a, §6.1a) | Admin key holders are trusted; they can already delete models |
 | T15 | Repudiation | "Who used the GPU?" | A request log with key id, request id, path, model and timings (REQ-22) | Logs are local and not tamper-proof |
 
 ## 8. Residual risks
@@ -598,13 +600,12 @@ The details are in TD-slice-1 §3.
 5. **Ollama API drift.** New endpoints are gated and need `admin` (D12). The fixtures and route
    list captured for each version catch format changes before an upgrade (REQ-56).
 6. **The gateway as a single point of failure.** Clients can fall back to a sidecar directly.
-7. **The fit estimate can be wrong.** The margin covers the overheads that can't be
-   measured. A model with missing metadata is rejected (`MODEL_SIZE_UNKNOWN`) unless an
-   override applies. The estimate is compared with the actual `size_vram` on real hardware
-   (D14).
-8. **Capacity is never invented.** A node that can't measure it is excluded unless the
-   operator sets an override. On a fleet without overrides, a probe failure therefore takes
-   a node out of routing, and that is visible in `/seriatim/nodes`.
+7. **An operator rule can be wrong.** A too-generous `max_params_b` or eligible-nodes entry
+   lets a model reach a machine too small for it. `/seriatim/nodes` shows the measured
+   capacity and each loaded model's `size_vram` next to the rule, so a model partly on
+   the CPU is visible (D14).
+8. **Capacity is never invented.** A probe that can't measure reports `unavailable` or
+   `none`. In Phase 1 that only affects what `/seriatim/nodes` shows, not routing.
 
 ## 9. Evaluation summary
 
@@ -644,14 +645,15 @@ The evidence is in [EVALUATION.md](../EVALUATION.md). In short:
 | **S1** Contract + sidecar gate, 429, passthrough | `contract/openapi.yaml`; `node/`: config, classification, gate with drain, proxy (streaming, disconnects, hold limit, framing-safe errors), startup quarantine, singleton, health, logs | TD-slice-1 §8: C, K, G, H, B, S, F, E, R, HL, L, K-OAS; PPE P1–P7 | **TD-slice-1** |
 | **S2** Sidecar auth | keys (hashes, ids, scopes), `keygen`, 401/403, `AUTH_AMBIGUOUS`, constant-time comparison against every hash, the hourly unauthenticated warning | A1–A12: every route class × {missing, wrong, infer, admin} key; ambiguous credentials; key never in logs or upstream; startup refusals | TD-slice-2 |
 | **S3** `num_ctx` policy | strict body inspection (duplicate keys, types, conflicts); limits by pattern with an overlap check; `/v1` rule; the holder's model in status | N1–N10, with wire-capture proof in the PPE that the bytes are unchanged | TD-slice-3 |
-| **S4** Status, capacity, exposure | `/seriatim/status` with `capacity` (REQ-16); pluggable probes for NVIDIA (`nvidia-smi` GPU and compute-app queries) and Apple (`hw.memsize` + Metal `recommendedMaxWorkingSetSize`), `none` and `unavailable`; the fixture-replay probe for tests; `default_num_ctx`, `kv_cache_type` and `flash_attention`; `/api/ps` error state; the fail-closed exposure check; health extensions; non-loopback listen enabled | M1–M12 from recorded probe fixtures, with no hardware: NVIDIA one and two devices, `CUDA_VISIBLE_DEVICES` hiding a device, another process using memory, `used_memory` `[N/A]` (`free_only`), mismatched device sets between the two queries, Apple with Metal, Apple without Metal (`usable_bytes: null`), each memory-pressure level, no GPU (`none`), probe failure and timeout (`unavailable`), malformed output; a lint that no probe default contains a memory size; X1–X6 (exposed, unverifiable, timeout, incomplete, first-check gating, recovery) | TD-slice-4 |
+| **S4** Status, capacity, exposure | `/seriatim/status` with `capacity` (REQ-16), for information; pluggable probes: NVIDIA (inventory A, compute apps, `/api/ps`, inventory B; the service's process tree via `psutil`), Apple (`hw.memsize`, the wired limit, Metal `recommendedMaxWorkingSetSize`, pressure), `none` and `unavailable`; the fixture-replay probe for tests; `default_num_ctx`, `kv_cache_type` and `flash_attention`; `/api/ps` error state; the fail-closed exposure check; the admin offline/online switch with its persisted `node-state.json` (REQ-19a); the node metrics file (REQ-67); health extensions, including `offline`; non-loopback listen enabled | MX1–MX10 (node side: `promtool`, names and labels, atomic write, write failure isolated, null figures omitted, no secrets, unset directory); AS1–AS12 (offline refuses new gated work while in-flight work finishes; ungated and admin still served; admission/offline and offline/online barrier tests; refusal precedence with startup and drain; persists across restart, a kill mid-write, and failures before and after the rename; unreadable state starts offline; online restores; non-admin 403); M1–M16 from recorded probe fixtures, with no hardware: an idle GPU (no process rows), one and two devices, Ollama's tree vs another process, a PID outside the tree with an Ollama name, WDDM `[N/A]` with `/api/ps` crediting (`free_plus_ps`) and without, multi-device `[N/A]`, a succeeded-empty vs failed vs malformed process query, a transition with retry and without recovery, Windows full-path mixed-case names, `CUDA_VISIBLE_DEVICES` as indices, UUIDs, unmatched and MIG; Apple with Metal (limit unset and raised), without Metal (limit raised: `wired_limit`; unset: `unavailable`), pressure 1/2/4 and unmapped, a Mac without unified memory; no GPU (`none`); failure, timeout and malformed output (`unavailable`); every report validated against `Capacity`, plus K-CAP's arithmetic (free and usable at most total; the top-level figure equals the largest device's) and the tie rule for `basis`; the service-tree lookup failing and denied descendants; mixed numeric and `[N/A]` rows; CUDA order (indices with and without `PCI_BUS_ID`, full UUIDs, a rejected prefix, an empty value); expectations written by hand; a lint that no probe default contains a memory size; X1–X6 (exposed, unverifiable, timeout, incomplete, first-check gating, recovery) | TD-slice-4 |
 | **S5** Deploy: Windows | install, WinSW templates, `check-local-only`, `update-models` (through the sidecar), weekly maintenance | Pester with stubbed system commands; a manual node run, output pasted | TD-slice-5 |
 | **S6** Deploy: macOS | install, launchd plists, the same scripts; the Metal-under-LaunchDaemon result recorded | bats with stubbed `lsof`, `launchctl` and `curl`; a manual node run | TD-slice-6 |
-| **S7** Gateway core | node config (any number of nodes) with live reload (REQ-44, REQ-45), discovery with unknown states, `/api/show` cache by digest, fit routing (D14) with the four capacity modes and `size_overrides`, `CAPACITY_UNKNOWN` and `MODEL_TOO_LARGE`, the capacity reason in `/seriatim/nodes`, passthrough, spill-over on the admission marker only, replay-safe failover, client auth, `NODE_REQUIRED`, compatibility headers | R-GW1–R-GW20, run against fleets of 1, 2 and 5 nodes; reload cases (a valid swap, an invalid file kept out, a node added or removed while a request is running, a changed `max_params_b`), using `/api/tags` and `/api/show` captured in the PPE from real micro-models; fit cases from the S4 probe fixtures: measured fits and does not fit, the `num_ctx` order (request `options.num_ctx`, model, node, maximum) and a top-level `num_ctx` ignored, unequal key and value lengths, per-layer `head_count_kv`, an unsupported layout, a loaded but partly offloaded model still checked, a stale report, critical pressure, `gpu_pool`, the error order of REQ-32, a golden `kv_bytes` table and calibration fixtures as independent expectations, the `max_params_b` override winning over measured, `unlimited`, capacity unknown excluded (`CAPACITY_UNKNOWN`), every node too small (`MODEL_TOO_LARGE`), missing metadata (`MODEL_SIZE_UNKNOWN`), both overrides set (a config error); property tests of the fit rule and REQ-33 over generated capacities and models; upstream-429 vs admission-429 cases; every-candidate-once with 3 nodes | TD-slice-7 |
-| **S8** Gateway combined views | `/api/tags`, `/api/ps` and `/api/version` merges with schemas; partial flags; `/seriatim/nodes`; health | V1–V8 | TD-slice-8 |
-| **S9** `/models/select` | task preferences, routing, `fits` from the fit rule (D14) with `fit_basis`; `null` only when capacity is unknown | SEL1–SEL8 | TD-slice-9 |
-| **S10** Gateway deploy + two-node PPE | Dockerfile, systemd example, a two-node PPE with real size metadata | P-GW1–P-GW7 (routing, never-too-small, busy isolation between nodes (F1), spill-over, combined views, streaming end to end, failover) | TD-slice-10 |
+| **S7** Gateway core | node config (any number of nodes) with live reload (REQ-44, REQ-45), discovery with unknown states, eligibility routing (REQ-32: per-model eligible-nodes lists, `capacity = "unlimited"`, `max_params_b`, `size_overrides`; no rule → `no_size_policy`), the verdict order with `lists_model` and `rule_verdict` (an offline node keeps its last discovery), a pinned node evaluated alone, `POST /api/show` routed without rules, every node's verdict in routing errors, `SIZE_POLICY_MISSING` and `MODEL_NOT_ELIGIBLE`, `BAD_REQUEST_BODY` on an unreadable `model`, passthrough, spill-over on the admission marker only, replay-safe failover, client auth, `NODE_REQUIRED`, compatibility headers | R-GW1–R-GW20, run against fleets of 1, 2 and 5 nodes that mix the three rules and nodes with none; the rule order (a list wins over `unlimited` and `max_params_b`), `:latest` matching, both `unlimited` and `max_params_b` set (a config error), a list naming an unknown node (a config error), an unparseable `parameter_size` (`size_unknown`), a pinned `X-Seriatim-Node` request checked against its node's rules, the REQ-32 error order with every node's verdict listed; property tests of REQ-32 and REQ-33 over generated fleets, rules and models; reload cases (a valid swap, an invalid file kept out, a node added or removed while a request is running, a changed rule), using `/api/tags` captured in the PPE from real micro-models; upstream-429 vs admission-429 cases; every-candidate-once with 3 nodes | TD-slice-7 |
+| **S8** Gateway combined views and admin switch | `/api/tags` (one entry per name, `name` and `model`, `seriatim_digests` when digests differ), `/api/ps`, `/api/version` and `/v1/models` merges with schemas; partial flags; `/seriatim/nodes` with each node's rules, measured capacity, loaded models' `size_vram`, `admin_state` and warnings (REQ-42); the admin switch routes (REQ-42a) and the `offline` verdict; the gateway metrics file (REQ-67); health | V1–V8; MX1–MX10 (gateway side, including per-node series across reloads); GA1–GA8 (forward and confirm, unreachable sidecar 502, unknown id 404, timeout with unknown outcome reconciled, older revision ignored, fail over around an offline node, online restores, non-admin 403) | TD-slice-8 |
+| **S9** `/models/select` | task preferences, eligibility routing (REQ-32), `eligibility_basis`, every other node in `alternatives` with its verdict, routing errors as in REQ-32 | SEL1–SEL8 | TD-slice-9 |
+| **S10** Gateway deploy + two-node PPE | Dockerfile, systemd example, a two-node PPE with real size metadata; the client-compatibility suite (REQ-62a) with pinned `ollama` and `openai` clients, and the README's verified-versions line | P-GW1–P-GW7 (routing, never-too-small, busy isolation between nodes (F1), spill-over, combined views, streaming end to end, failover); CC1–CC16 (both clients against plain Ollama, a sidecar and the gateway: chat, generate, completions and embeddings, streamed and not; errors raise the client's exception with retries off; listing against a sidecar and the gateway's union; baseline repeatability; combined-view fields through `ollama` and raw HTTP) | TD-slice-10 |
 | **S11** TLS (optional) | certificate and key settings for the sidecar and the gateway; PPE TLS smoke test | T1–T4 | TD-slice-11 |
+| *Deferred* Measured fit | Admission from measured capacity (D14). Starts after S4 has run on real NVIDIA and Apple nodes, calibrated against their capacity recordings and the actual `size_vram`. It starts from D14's open problems | — | its own TD |
 | *Deferred* Automated promotion and deployment | Not designed in Phase 1. A later slice starts from the open problems in SPEC §7.6. Deploys are manual until then | — | its own TD |
 | **S12** Release 0.1.0 | operator guide, supported Ollama versions, changelog, tag | a full PPE run in CI, plus each node's local-only output | none |
 
@@ -704,16 +706,17 @@ components:
     BODY_TOO_LARGE:            { status: 413, retryable: false, replay_safe: true }
     NUM_CTX_EXCEEDS_LIMIT:     { status: 422, retryable: false, replay_safe: true }
     MODEL_SIZE_UNKNOWN:        { status: 422, retryable: false, replay_safe: true }
-    MODEL_TOO_LARGE:           { status: 422, retryable: false, replay_safe: true }
+    MODEL_NOT_ELIGIBLE:        { status: 422, retryable: false, replay_safe: true }
     INTERNAL:                  { status: 500, retryable: true,  replay_safe: false }
     UPSTREAM_UNAVAILABLE:      { status: 502, retryable: true,  replay_safe: true }
     UPSTREAM_PROTOCOL_ERROR:   { status: 502, retryable: true,  replay_safe: false }
     NODE_STARTING:             { status: 503, retryable: true,  replay_safe: true }
+    NODE_OFFLINE:              { status: 503, retryable: false, replay_safe: true }
     EXPOSURE_UNVERIFIED:       { status: 503, retryable: true,  replay_safe: true }
     OLLAMA_EXPOSED:            { status: 503, retryable: false, replay_safe: true }
     NODE_SATURATED:            { status: 503, retryable: true,  replay_safe: true }
     DISCOVERY_INCOMPLETE:      { status: 503, retryable: true,  replay_safe: true }
-    CAPACITY_UNKNOWN:          { status: 503, retryable: true,  replay_safe: true }
+    SIZE_POLICY_MISSING:       { status: 503, retryable: false, replay_safe: true }
     GPU_OFFLINE:               { status: 503, retryable: false, replay_safe: true }
     LOCK_HOLD_EXCEEDED:        { status: 504, retryable: true,  replay_safe: false }
     HTTP_VERSION_UNSUPPORTED:  { status: 505, retryable: false, replay_safe: true }
@@ -735,7 +738,7 @@ components:
     X-Rerouted-From:
       schema: { type: string }
     X-Reroute-Reason:
-      schema: { type: string, enum: [busy] }
+      schema: { type: string, enum: [busy, offline, starting, saturated, exposure, unreachable] }
 
   schemas:
     ErrorCode:
@@ -744,10 +747,10 @@ components:
              NUM_CTX_UNSUPPORTED_ROUTE, NODE_REQUIRED, UNKNOWN_TASK, AUTH_MISSING, AUTH_INVALID,
              FORBIDDEN_SCOPE, NOT_FOUND, MODEL_NOT_FOUND, METHOD_NOT_ALLOWED,
              REQUEST_BODY_TIMEOUT, UPLOAD_INTERRUPTED, BODY_TOO_LARGE, NUM_CTX_EXCEEDS_LIMIT, MODEL_SIZE_UNKNOWN,
-             MODEL_TOO_LARGE, INTERNAL, UPSTREAM_UNAVAILABLE, UPSTREAM_PROTOCOL_ERROR, NODE_STARTING,
+             MODEL_NOT_ELIGIBLE, INTERNAL, UPSTREAM_UNAVAILABLE, UPSTREAM_PROTOCOL_ERROR, NODE_STARTING,
              EXPOSURE_UNVERIFIED, OLLAMA_EXPOSED, NODE_SATURATED, DISCOVERY_INCOMPLETE,
              GPU_OFFLINE, LOCK_HOLD_EXCEEDED, HTTP_VERSION_UNSUPPORTED, UPSTREAM_STREAM_BROKEN,
-             CAPACITY_UNKNOWN]
+             SIZE_POLICY_MISSING, NODE_OFFLINE]
     ErrorEnvelope:
       description: Every error Seriatim itself produces.
       type: object
@@ -763,20 +766,29 @@ components:
         busy_for_s: { type: number, minimum: 0 }
         limit: { type: integer, minimum: 1 }
         hint: { type: string }
-        n_ctx: { type: integer, minimum: 1, description: MODEL_TOO_LARGE only }
-        required_bytes: { type: integer, minimum: 0, description: MODEL_TOO_LARGE only }
         nodes:
-          description: Routing errors (SPEC REQ-32) only. One verdict per healthy node that lists the model.
+          description: Routing errors (SPEC REQ-32) only. One verdict for every configured node.
           type: array
           items:
             type: object
             required: [id, verdict, reason]
             properties:
               id: { type: string }
-              verdict: { type: string, enum: [fits, too_small, capacity_unknown, metadata_missing] }
+              verdict: { type: string, enum: [eligible, not_eligible, no_size_policy, size_unknown, model_absent, discovery_unknown, offline, unhealthy] }
+              lists_model: { type: [boolean, 'null'], description: null means unknown (SPEC REQ-32) }
+              rule_verdict: { type: [string, 'null'], enum: [eligible, not_eligible, no_size_policy, size_unknown, null], description: the rules applied to last known metadata; set for offline and unhealthy nodes }
               reason: { type: string }
             additionalProperties: false
       additionalProperties: false
+      allOf:
+        - if:
+            properties:
+              error_code: { enum: [DISCOVERY_INCOMPLETE, MODEL_NOT_FOUND, SIZE_POLICY_MISSING, MODEL_SIZE_UNKNOWN, MODEL_NOT_ELIGIBLE] }
+              source: { const: gateway }
+            required: [error_code, source]
+          then:
+            required: [nodes]
+            properties: { nodes: { minItems: 1 } }
     UpstreamError:
       description: >
         An error produced by Ollama, passed through unchanged (status and bytes). Seriatim does
@@ -798,13 +810,14 @@ components:
       type: object
       required: [status]
       properties:
-        status: { type: string, enum: [ok, degraded] }
+        status: { type: string, enum: [ok, degraded, offline] }
         reasons:
           type: array
           items:
             type: string
             enum: [ollama_unreachable, ollama_bad_response, slot_overdue, slot_stuck,
-                   starting, ollama_exposed, exposure_unverified, no_healthy_node]
+                   starting, ollama_exposed, exposure_unverified, no_healthy_node,
+                   offline_admin]
       additionalProperties: false
     Slot:
       type: object
@@ -819,9 +832,10 @@ components:
         drain_remaining_s: { type: [number, 'null'], minimum: 0 }
     NodeStatus:
       type: object
-      required: [node, version, starting, slots, capacity, loaded_models, ollama]
+      required: [node, version, starting, admin_state, slots, capacity, loaded_models, ollama]
       properties:
         node: { type: string }
+        admin_state: { $ref: '#/components/schemas/AdminState' }
         version: { type: string }
         starting: { type: boolean }
         slots: { type: array, items: { $ref: '#/components/schemas/Slot' } }
@@ -847,9 +861,11 @@ components:
           items:
             description: Ollama /api/tags model entry, unchanged, plus seriatim_nodes.
             type: object
-            required: [name, seriatim_nodes]
+            required: [name, model, seriatim_nodes]
             properties:
               name: { type: string }
+              model: { type: string }
+              seriatim_digests: { type: object, additionalProperties: { type: string }, description: present only when the nodes' digests differ }
               digest: { type: string }
               details: { type: object }
               seriatim_nodes: { type: array, items: { type: string }, minItems: 1 }
@@ -863,9 +879,10 @@ components:
           items:
             description: Ollama /api/ps model entry, unchanged, plus seriatim_node.
             type: object
-            required: [name, seriatim_node]
+            required: [name, model, seriatim_node]
             properties:
               name: { type: string }
+              model: { type: string }
               seriatim_node: { type: string }
         seriatim_partial: { type: array, items: { type: string } }
     CombinedVersion:
@@ -882,72 +899,129 @@ components:
         task: { type: string }
         context_tokens: { type: integer, minimum: 1 }
       additionalProperties: false
-    Capacity:
-      description: Measured capacity (SPEC REQ-16). Figures are null unless measured; never estimated.
+    AdminState:
+      description: The node's admin offline/online switch (SPEC REQ-19a). The sidecar is the source of truth.
       type: object
-      required: [source, usable_bytes, devices, default_num_ctx, measured_at]
+      required: [offline, reason, since, changed_by, revision]
+      properties:
+        offline: { type: boolean }
+        revision: { type: integer, minimum: 0, description: persisted; increments on every committed change }
+        reason: { type: [string, 'null'], maxLength: 200 }
+        since: { type: [string, 'null'], format: date-time }
+        changed_by: { type: [string, 'null'], description: key id, never the key }
+      additionalProperties: false
+    AdminOfflineRequest:
+      type: object
+      properties:
+        reason: { type: string, maxLength: 200 }
+      additionalProperties: false
+    Capacity:
+      description: >
+        Measured capacity (SPEC REQ-16). Information only in Phase 1; routing uses the
+        operator's rules. Figures are null unless measured; never estimated. Every failure,
+        on any platform, is source unavailable. Arithmetic that JSON Schema can't express is
+        checked by the contract tests (K-CAP): free_bytes <= total_bytes and usable_bytes <=
+        total_bytes on each device, and on NVIDIA the top-level usable_bytes equals the
+        largest device's.
+      type: object
+      required: [source, usable_bytes, devices, default_num_ctx, kv_cache_type, flash_attention, measured_at]
       properties:
         source: { type: string, enum: [nvidia-smi, apple-metal, none, unavailable] }
         basis:
           type: [string, 'null']
-          enum: [free_plus_ollama, free_only, recommended_working_set, wired_limit, null]
+          enum: [free_plus_ollama, free_plus_ps, free_only, recommended_working_set, wired_limit, null]
+        transition: { type: boolean, description: nvidia-smi only; inventories disagreed on every retry }
         usable_bytes: { type: [integer, 'null'], minimum: 0, description: largest device on NVIDIA }
         error: { type: string }
+        warnings: { type: array, items: { type: string } }
         total_bytes: { type: [integer, 'null'], minimum: 0 }
-        wired_limit_mb: { type: [integer, 'null'], minimum: 0, description: apple-metal only }
-        memory_pressure: { type: [string, 'null'], enum: [normal, warn, critical, null], description: apple-metal only }
+        wired_limit_mb: { type: [integer, 'null'], minimum: 0, description: apple-metal only; 0 when unset }
+        memory_pressure: { type: [string, 'null'], enum: [normal, warn, critical, null], description: apple-metal only; null when unreadable or unmapped }
+        pressure_error: { type: string }
         default_num_ctx: { type: [integer, 'null'], minimum: 1 }
-        kv_cache_type: { type: [string, 'null'], description: reported only; the fit rule assumes f16 }
+        kv_cache_type: { type: [string, 'null'], description: as configured; reported only }
         flash_attention: { type: [boolean, 'null'] }
         measured_at: { type: string, format: date-time }
         devices:
           type: array
           items:
             type: object
-            required: [id, total_bytes, free_bytes, usable_bytes, basis]
+            required: [index, uuid, name, total_bytes, used_bytes, free_bytes, ollama_used_bytes, usable_bytes, basis]
             properties:
-              id: { type: string, description: index on NVIDIA; device names are not used for routing }
+              index: { type: integer, minimum: 0 }
+              uuid: { type: string, description: as reported by nvidia-smi (sanitised in fixtures) }
               name: { type: string }
               total_bytes: { type: integer, minimum: 0 }
+              used_bytes: { type: integer, minimum: 0 }
               free_bytes: { type: integer, minimum: 0 }
-              ollama_used_bytes: { type: [integer, 'null'], minimum: 0 }
+              ollama_used_bytes: { type: [integer, 'null'], minimum: 0, description: attributed (free_plus_ollama), credited from /api/ps (free_plus_ps), or null (free_only) }
               usable_bytes: { type: integer, minimum: 0 }
-              basis: { type: string, enum: [free_plus_ollama, free_only] }
+              basis: { type: string, enum: [free_plus_ollama, free_plus_ps, free_only] }
+            additionalProperties: false
       allOf:
         - if: { properties: { source: { const: nvidia-smi } } }
           then:
+            required: [basis]
             properties:
               usable_bytes: { type: integer }
+              basis: { enum: [free_plus_ollama, free_plus_ps, free_only] }
               devices: { minItems: 1 }
         - if: { properties: { source: { const: apple-metal } } }
           then:
-            required: [total_bytes, memory_pressure]
-            properties: { total_bytes: { type: integer } }
+            required: [basis, total_bytes, wired_limit_mb, memory_pressure]
+            properties:
+              usable_bytes: { type: integer }
+              total_bytes: { type: integer }
+              basis: { enum: [recommended_working_set, wired_limit] }
+              devices: { maxItems: 0 }
         - if: { properties: { source: { enum: [none, unavailable] } } }
           then:
             properties:
               usable_bytes: { type: 'null' }
+              basis: { type: 'null' }
               devices: { maxItems: 0 }
+        - if: { properties: { source: { const: unavailable } } }
+          then:
+            required: [error]
+        - if:
+            required: [source, memory_pressure]
+            properties: { source: { const: apple-metal }, memory_pressure: { type: 'null' } }
+          then:
+            required: [pressure_error]
     SelectResponse:
       type: object
-      required: [model, node, fits, fit_basis, reasons]
+      required: [model, node, eligibility_basis, reasons, alternatives]
       properties:
         model: { type: string }
-        node: { type: string }
-        fits: { type: boolean, const: true, description: the chosen node always fits }
-        fit_basis: { type: string, enum: [measured, max_params_b, unlimited] }
-        required_bytes: { type: [integer, 'null'], minimum: 0 }
+        node: { type: string, description: always eligible (SPEC REQ-39) }
+        eligibility_basis: { type: string, enum: [eligible_nodes, unlimited, max_params_b] }
+        context_tokens: { type: integer, minimum: 1, description: echoed; does not affect the choice in Phase 1 }
         reasons: { type: array, items: { type: string } }
         alternatives:
+          description: Every other configured node, for the chosen model.
           type: array
           items:
             type: object
+            required: [node, verdict, reason]
             properties:
-              model: { type: string }
               node: { type: string }
-              verdict: { type: string, enum: [fits, too_small, capacity_unknown, metadata_missing] }
+              verdict: { type: string, enum: [eligible, not_eligible, no_size_policy, size_unknown, model_absent, discovery_unknown, offline, unhealthy] }
+              reason: { type: string }
+            additionalProperties: false
+      additionalProperties: false
 
   responses:
+    NodeAdminResult:
+      description: The sidecar confirmed the change (SPEC REQ-42a).
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [node, admin_state]
+            properties:
+              node: { type: string }
+              admin_state: { $ref: '#/components/schemas/AdminState' }
+            additionalProperties: false
     Busy:
       description: >
         Either Seriatim's admission 429 (X-Seriatim-Gate busy, ErrorEnvelope with GPU_BUSY;
@@ -967,7 +1041,7 @@ components:
     Unavailable:
       description: >
         Seriatim 503 (NODE_STARTING, EXPOSURE_UNVERIFIED, NODE_SATURATED, DISCOVERY_INCOMPLETE,
-        CAPACITY_UNKNOWN and GPU_OFFLINE carry Retry-After; OLLAMA_EXPOSED does not), or Ollama's own 503 passed
+        and GPU_OFFLINE carry Retry-After; OLLAMA_EXPOSED, SIZE_POLICY_MISSING and NODE_OFFLINE do not), or Ollama's own 503 passed
         through.
       headers:
         Retry-After: { schema: { type: string, pattern: '^[0-9]+$' } }
@@ -1022,14 +1096,16 @@ components:
     x-seriatim-gate: gated
     x-seriatim-scope: infer
     requestBody:
-      description: Opaque Ollama request; forwarded byte-for-byte. Seriatim may read
-        `num_ctx` and `options.num_ctx` (slice S3) but never rewrites the body.
+      description: Opaque Ollama request; forwarded byte-for-byte. The sidecar may read
+        `num_ctx` and `options.num_ctx` (SPEC REQ-8, REQ-9); the gateway reads `model`
+        (SPEC REQ-32). Neither ever rewrites the body.
       content: { application/json: {} }
     responses:
       '200': { $ref: '#/components/responses/Passthrough' }
       '400': { $ref: '#/components/responses/Error' }
       '401': { $ref: '#/components/responses/Unauthorized' }
       '403': { $ref: '#/components/responses/Error' }
+      '404': { $ref: '#/components/responses/Error' }
       '408': { $ref: '#/components/responses/Error' }
       '413': { $ref: '#/components/responses/Error' }
       '422': { $ref: '#/components/responses/Error' }
@@ -1048,8 +1124,12 @@ components:
       '400': { $ref: '#/components/responses/Error' }
       '401': { $ref: '#/components/responses/Unauthorized' }
       '403': { $ref: '#/components/responses/Error' }
+      '404': { $ref: '#/components/responses/Error' }
+      '408': { $ref: '#/components/responses/Error' }
+      '413': { $ref: '#/components/responses/Error' }
       '502': { $ref: '#/components/responses/Error' }
       '503': { $ref: '#/components/responses/Unavailable' }
+      '505': { $ref: '#/components/responses/Error' }
       default: { $ref: '#/components/responses/Passthrough' }
   x-seriatim-admin-operation: &admin
     x-seriatim-gate: ungated
@@ -1059,8 +1139,12 @@ components:
       '400': { $ref: '#/components/responses/Error' }
       '401': { $ref: '#/components/responses/Unauthorized' }
       '403': { $ref: '#/components/responses/Error' }
+      '404': { $ref: '#/components/responses/Error' }
+      '408': { $ref: '#/components/responses/Error' }
+      '413': { $ref: '#/components/responses/Error' }
       '502': { $ref: '#/components/responses/Error' }
       '503': { $ref: '#/components/responses/Unavailable' }
+      '505': { $ref: '#/components/responses/Error' }
       default: { $ref: '#/components/responses/Passthrough' }
 
 # Unlisted method+path pairs are gated and need the admin scope (SPEC REQ-5).
@@ -1080,6 +1164,70 @@ paths:
       responses:
         '200': { description: Node status, content: { application/json: { schema: { $ref: '#/components/schemas/NodeStatus' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /seriatim/admin/offline:
+    post:
+      x-seriatim-roles: [sidecar]
+      x-seriatim-scope: admin
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: '#/components/schemas/AdminOfflineRequest' } } }
+      responses:
+        '200': { description: The resulting state, content: { application/json: { schema: { $ref: '#/components/schemas/AdminState' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '505': { $ref: '#/components/responses/Error' }
+  /seriatim/admin/online:
+    post:
+      x-seriatim-roles: [sidecar]
+      x-seriatim-scope: admin
+      responses:
+        '200': { description: The resulting state, content: { application/json: { schema: { $ref: '#/components/schemas/AdminState' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '505': { $ref: '#/components/responses/Error' }
+  /seriatim/admin/nodes/{id}/offline:
+    post:
+      x-seriatim-roles: [gateway]
+      x-seriatim-scope: admin
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: '#/components/schemas/AdminOfflineRequest' } } }
+      responses:
+        '200': { $ref: '#/components/responses/NodeAdminResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+        '505': { $ref: '#/components/responses/Error' }
+  /seriatim/admin/nodes/{id}/online:
+    post:
+      x-seriatim-roles: [gateway]
+      x-seriatim-scope: admin
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { $ref: '#/components/responses/NodeAdminResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+        '505': { $ref: '#/components/responses/Error' }
   /seriatim/nodes:
     get:
       x-seriatim-roles: [gateway]
@@ -1104,22 +1252,45 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [id, healthy, priority, capacity_mode, capacity_reason, last_check]
+                      required: [id, healthy, admin_state, priority, size_policy, eligible_for_models, capacity, loaded, warnings, last_check]
                       properties:
                         id: { type: string }
                         healthy: { type: boolean }
+                        admin_state:
+                          description: As last reported by the node's sidecar; null if never read.
+                          oneOf:
+                            - $ref: '#/components/schemas/AdminState'
+                            - type: 'null'
                         priority: { type: integer }
-                        capacity_mode: { type: string, enum: [measured, max_params_b, unlimited, unknown] }
-                        capacity_reason:
-                          description: >
-                            Why this mode applies, e.g. "override: max_params_b set in config",
-                            "override: capacity = unlimited", "measured by nvidia-smi",
-                            or for unknown: "capacity_unknown: probe unavailable (<error>)".
-                          type: string
-                        usable_bytes: { type: [integer, 'null'], minimum: 0 }
+                        size_policy: { type: string, enum: [unlimited, max_params_b, none], description: the node's own rule; eligible-nodes lists are in eligible_for_models }
                         max_params_b: { type: [number, 'null'] }
+                        eligible_for_models: { type: array, items: { type: string }, description: models whose eligible-nodes list names this node }
+                        capacity:
+                          description: The node's last Capacity report, shown next to the configured rules; null if it could not be read.
+                          oneOf:
+                            - $ref: '#/components/schemas/Capacity'
+                            - type: 'null'
+                        capacity_error: { type: string, description: required when capacity is null }
+                        loaded:
+                          description: From the node's /api/ps. size_vram < size means part of the model is on the CPU.
+                          type: [array, 'null']
+                          items:
+                            type: object
+                            required: [model, size, size_vram]
+                            properties:
+                              model: { type: string }
+                              size: { type: integer, minimum: 0 }
+                              size_vram: { type: integer, minimum: 0 }
+                        warnings: { type: array, items: { type: string } }
                         last_check: { type: string, format: date-time }
                         status: { $ref: '#/components/schemas/NodeStatus' }
+                      allOf:
+                        - if: { properties: { capacity: { type: 'null' } }, required: [capacity] }
+                          then: { required: [capacity_error] }
+                        - if: { properties: { size_policy: { const: max_params_b } } }
+                          then:
+                            required: [max_params_b]
+                            properties: { max_params_b: { type: number, exclusiveMinimum: 0 } }
         '401': { $ref: '#/components/responses/Unauthorized' }
   /models/select:
     get:

@@ -6,7 +6,7 @@
 **Not in this slice:**
 - auth (S2);
 - the `num_ctx` policy (S3);
-- `/seriatim/status`, memory and the exposure check (S4);
+- `/seriatim/status`, the capacity report and the exposure check (S4);
 - deploy (S5, S6); automated deployment is deferred (SPEC §7.6);
 - the gateway (S7 and later);
 - TLS (S11).
@@ -784,7 +784,7 @@ also run on `windows-latest` and `macos-latest`.
 | HL3 | Upstream `/api/version` returns each of: 500; 200 `not json`; 200 `[]`; 200 `{}`; 200 `{"version":""}`; 200 `{"version":7}` → each gives 503 with `["ollama_bad_response"]` | 18 |
 | HL4 | An injected overdue lease → `slot_overdue`; an injected stuck slot → `slot_stuck`. The body never contains the version string | 18 |
 | L1 | After H1, B1, E1 and S4: one JSON log line each, with the fields in Appendix A. No line contains the body marker string, the `Authorization` value or the `X-API-Key` value | 22, 13 |
-| K-OAS1 | `contract/openapi.yaml` passes `openapi-spec-validator` (OpenAPI 3.1). Every path's `x-seriatim-gate` and `x-seriatim-scope` agree with `classify()`; `x-seriatim-unknown-endpoint` agrees with rule 5 | 5, G7 |
+| K-OAS1 | `contract/openapi.yaml` passes `openapi-spec-validator` (OpenAPI 3.1). Every Ollama path's `x-seriatim-gate` and `x-seriatim-scope` agree with `classify()` (Seriatim's own `/seriatim/*` and `/models/select` paths are not Ollama routes and are not classified); `x-seriatim-unknown-endpoint` agrees with rule 5 | 5, G7 |
 | K-OAS2 | Every collected error body validates against `ErrorEnvelope`, in-stream records against `StreamErrorRecord`, and health bodies against `Health` | 25 |
 | K-OAS3 | `set(ErrorCode)` equals the contract's `ErrorCode.enum`, and `ERROR_TABLE` equals `x-seriatim-codes` (status, `retryable` and `replay_safe` for each code) | 25 |
 
@@ -910,7 +910,7 @@ A log line, one per request:
   - **`ppe/ppe up`.** Before anything starts, it checks the effective configuration
     (`docker compose config`) as SPEC §8.3 requires. In a local run it also checks the
     hostname against the gitignored `ppe/.allowed-host`. `--ci` is accepted only when
-    `GITHUB_ACTIONS=true`. It then pulls `qwen2.5:0.5b` and `qwen2.5:1.5b`, with no
+    `GITHUB_ACTIONS=true`. It then pulls `qwen2.5:0.5b`, `qwen2.5:1.5b` and `all-minilm:22m`, with no
     `ollama cp` aliases.
   - **Fixtures.** `tools/capture_fixtures.py` drives `ollama-a` directly. For each exchange
     it records:
