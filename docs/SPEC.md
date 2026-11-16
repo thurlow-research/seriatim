@@ -1,6 +1,6 @@
 # Seriatim — Specification
 
-**Status:** revision 2, for review (Phase 1). **Date:** 2026-11-16.
+**Status:** revision 3, for review (Phase 1). **Date:** 2026-11-16.
 
 **Companion documents:**
 - [ADR-001](adr/ADR-001-architecture.md): architecture, contract, threat model, slice plan.
@@ -11,8 +11,8 @@ Seriatim is a one-at-a-time GPU gate for [Ollama](https://ollama.com). It has tw
 - **A sidecar on each GPU machine.** It sits in front of Ollama and admits a limited number of
   inference requests at a time, one by default. A request that arrives while the GPU is busy
   gets an immediate HTTP 429 with `Retry-After`; it is never queued.
-- **A thin gateway.** It gives clients one address, routes each request to a machine by model
-  size, and combines the read-only Ollama views across machines.
+- **A thin gateway.** It gives clients one address, routes each request to a machine the model
+  fits on, judged from each machine's measured capacity, and combines the read-only Ollama views across machines.
 
 The words MUST, MUST NOT, SHOULD and MAY follow RFC 2119. Each requirement has an ID (`REQ-n`)
 and the tests that prove it. The test IDs for slice 1 are defined in TD-slice-1 §8; the tests
@@ -30,7 +30,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 | tag | defect found in the predecessor | addressed by |
 |---|---|---|
 | F1 | One global lock: while machine A was busy, a request for idle machine B also got 429 | One lock per machine, in the sidecar (REQ-2); busy state never couples machines (REQ-36) |
-| F2 | No routing by size: a 32B request went to the small machine | Routing by size (REQ-32, REQ-33) |
+| F2 | No routing by size: a 32B request went to a machine too small for it | Routing by size (REQ-32, REQ-33) |
 | F3 | `num_ctx` above an internal table was silently lowered (30000 → 24576), and on the OpenAI route it had no effect | `num_ctx` is never changed; an over-limit value is rejected (REQ-7 to REQ-9) |
 | F4 | `/api/tags`, `/api/ps` and `/api/version` showed only one machine | Combined across machines (REQ-38) |
 
@@ -70,8 +70,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
    - **Changing it is a configuration edit.** Growing, shrinking or resizing the fleet takes
      effect without a code change or a gateway restart (REQ-44 to REQ-46).
    - **No assumptions in the code.** Nothing assumes a machine count, a memory size, an
-     operating system or a GPU vendor. The first deployment happens to be one Windows NVIDIA
-     machine and one Apple Silicon Mac, and that is only an example.
+     operating system or a GPU vendor. Install scripts exist first for Windows and macOS,
+     but that is a packaging order, not a supported topology.
 5. **G5. Visible failure.** Every failure is an explicit, machine-readable error. A timeout,
    an unavailable dependency or an answer that cannot be parsed is never treated as success,
    and is never quietly downgraded.
@@ -96,8 +96,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 - **HTTP/2.** Seriatim speaks HTTP/1.1 only, at both ends.
 - **Managing TLS certificates.** TLS is optional in v1 (REQ-27).
 - **Install scripts for every platform in v1.** The sidecar runs on any platform with Python
-  3.12 and Ollama (REQ-46). The v1 install scripts cover Windows and macOS, the first
-  deployment's platforms. Elsewhere the sidecar is installed as an ordinary service by hand.
+  3.12 and Ollama (REQ-46). The v1 install scripts cover Windows and macOS. That is a
+  packaging order, not a supported topology. Elsewhere the sidecar is installed as an ordinary service by hand.
   Scripts for other platforms are welcome as contributions.
 - **The Rust version.** It is only a design constraint (G7).
 
@@ -194,7 +194,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   *Tests:* H1–H5, S1–S3, P1, P3, P5.
 - **REQ-7. Options unchanged.** Seriatim MUST NOT re-serialise a body, add or remove a field, or
   change any option. It MUST never lower `num_ctx`. A body is read only to apply REQ-8 and
-  REQ-9.
+  REQ-9, and on the gateway to read `model` and `options.num_ctx` for routing (REQ-32).
+  Reading never changes the bytes forwarded.
 
   *Tests:* H2, P1.
 - **REQ-8. `num_ctx` limit (ruling Q2: reject).**
@@ -312,21 +313,79 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 
 ### 4.3 Sidecar: status, health, memory and exposure (slice S4, unless noted)
 
-- **REQ-16. GPU memory, measured only.** `GET /seriatim/status` reports `memory`:
-  - **NVIDIA:** from `nvidia-smi`, the total, used and free memory of each device.
-  - **Apple Silicon:** the total from `hw.memsize`. `used_mb` and `free_mb` are `null`, because
-    unified memory has no measured "free GPU memory". The sum of `size_vram` from `/api/ps` is
-    reported separately, as `models_vram_mb`.
-  - **Any other platform** (AMD, Intel, CPU only, or a probe that is not yet written):
-    `source: unavailable`, with `error: "no memory probe for this platform"`. Nothing else
-    depends on memory figures. Routing uses configuration and Ollama's metadata, and
-    `/models/select` reports `fits_in_free_memory: null`.
-  - **Probes are pluggable.** Each probe is a small module behind one interface, so support
-    for another platform can be added without touching the gate or the router.
-  - Every figure names its source. A probe that fails or times out (2 s) gives
-    `source: unavailable` and an `error`. Figures are never invented.
+- **REQ-16. Capacity, measured and reported (slice S4).** `GET /seriatim/status` reports a
+  `capacity` object (contract schema `Capacity`), which the gateway uses for routing
+  (REQ-32). Every figure names its source, and none is ever estimated or invented.
+  - **NVIDIA** (`source: nvidia-smi`):
+    - **Two queries, one sample.** The probe runs, back to back:
+      - `nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.free --format=csv,noheader,nounits`;
+      - `nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits`.
 
-  *Tests:* M1–M8.
+      Figures are MiB, converted to bytes as × 1 048 576. If the two queries do not name the
+      same set of device UUIDs, the sample is discarded and the probe reports `unavailable`.
+    - **Which devices.** If `SERIATIM_NODE_CUDA_VISIBLE_DEVICES` is set, only those devices
+      are reported. It must equal the Ollama service's `CUDA_VISIBLE_DEVICES`, and the
+      local-only check (REQ-53) verifies that it does. Otherwise every device is reported.
+    - **Usable memory, per device.** `usable = free + ollama_used`. `ollama_used` is the sum
+      of `used_memory` of the compute processes on that device whose process name is in
+      `SERIATIM_NODE_OLLAMA_PROCESS_NAMES` (default: the names of Ollama's server and runner
+      executables on each OS). Ollama's own models can be evicted, so they don't reduce
+      capacity; memory used by any other process does (`basis: free_plus_ollama`).
+    - **When attribution is uncertain,** the device reports `usable = free`, with
+      `basis: free_only`. This happens when a process's `used_memory` is `[N/A]`, which is
+      common under the Windows WDDM driver, or when the compute-apps query fails. This is
+      conservative, because it assumes nothing Ollama holds can be freed.
+    - **More than one device.** Ollama's split of a model across GPUs is not exposed, so the
+      node's `usable_bytes` is the **largest single device's** `usable`. Every device's
+      figures are still listed. A node whose operator knows that splitting works for its
+      models can set `gpu_pool = "sum"` in the gateway config (REQ-44). The fit rule then
+      uses the sum of the devices' `usable`.
+  - **Apple Silicon** (`source: apple-metal`, `basis: recommended_working_set`):
+    - **The total** unified memory comes from `sysctl hw.memsize`, as `total_bytes`.
+    - **The GPU budget.** macOS limits how much unified memory the GPU should use. The
+      probe reads Metal's `MTLCreateSystemDefaultDevice().recommendedMaxWorkingSetSize`,
+      through the optional `pyobjc-framework-Metal` dependency, which the macOS install
+      script adds. That value is `usable_bytes`.
+      - **What it is.** It is Apple's *recommended* budget for keeping performance, not a
+        measurement of the memory free at that moment, and not a hard cap.
+    - **A raised limit.** `sysctl iogpu.wired_limit_mb` is reported as `wired_limit_mb`.
+      It is 0 when the operator has not set it, and `null` when it can't be read.
+      - **When it is above 0,** the operator has raised the GPU limit on purpose. Then
+        `usable_bytes = min(wired_limit_mb × 1 048 576, hw.memsize)`, with
+        `basis: wired_limit`. Metal's value may not reflect that setting.
+      - **Otherwise** Metal's value is used.
+      - S6 records both values on real hardware, before and after raising the limit.
+    - **Memory pressure.** `sysctl kern.memorystatus_vm_pressure_level` is reported as
+      `memory_pressure` (`normal`, `warn` or `critical`). At `critical`, the gateway treats
+      the node's capacity as unknown (REQ-32).
+    - **If the budget cannot be read** (no Metal binding, or the call fails): `usable_bytes:
+      null` with an `error`. There is no fallback to a fraction of RAM.
+    - **The limitation.** Memory that other programs use on a Mac is not subtracted, because
+      it cannot be attributed to the GPU. REQ-33's guarantee is therefore relative to this
+      budget (see REQ-33).
+  - **No GPU found** (`source: none`): no probe applies, for example a CPU-only machine or
+    AMD or Intel graphics. `usable_bytes: null`.
+  - **A probe that fails or times out** (2 s) gives `source: unavailable`, `usable_bytes:
+    null` and an `error`.
+  - **Context and cache settings.**
+    - **`default_num_ctx`** comes from `SERIATIM_NODE_OLLAMA_CONTEXT_LENGTH`, which must equal
+      the Ollama service's `OLLAMA_CONTEXT_LENGTH`. The local-only check (REQ-53) verifies
+      that it does. It is `null` when not set: recent Ollama versions then choose a default
+      from the hardware, which Seriatim does not try to predict.
+    - **`kv_cache_type` and `flash_attention`** come from `SERIATIM_NODE_OLLAMA_KV_CACHE_TYPE`
+      and `SERIATIM_NODE_OLLAMA_FLASH_ATTENTION`, checked the same way. They are reported for
+      the operator only. A quantised cache takes effect only when flash attention is on and
+      the model supports it, and Seriatim can't verify that per model. So the v1 fit rule
+      always assumes an `f16` cache (REQ-32).
+  - **Freshness.** The sidecar measures again on each status request, caching for at most
+    5 s. Every report carries `measured_at`.
+  - **Pluggable probes.** Each probe is a small module behind one interface, so support for
+    another platform can be added without touching the gate or the router.
+  - **Fixtures, not hardware.** In tests, and only in test mode, probes can replay recorded
+    output (`SERIATIM_NODE_PROBE_FIXTURE`, accepted only with `ALLOW_UNAUTHENTICATED`). No
+    test needs a real GPU.
+
+  *Tests:* M1–M12, with the recorded probe fixtures (§8.1).
 - **REQ-17. Loaded models and slots.** Status includes:
   - Ollama's `/api/ps` list, unchanged. If `/api/ps` fails or cannot be parsed, the field is
     `loaded_models: null` with `loaded_models_error`, never an empty list.
@@ -471,19 +530,112 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - The gateway authenticates to each node with that node's own keys (one `infer` key and one
     `admin` key), kept in its configuration.
   - A client's key is never forwarded.
-- **REQ-32. Routing by size.**
-  - **Candidates.** For a request that names a model, the candidates are the nodes that meet
-    all three of these, in configured priority order:
-    - healthy;
-    - the node's last discovery listed the model;
-    - their `max_params_b` is at least the model's size.
-  - **Model size.** The size comes from `size_overrides` in the gateway configuration, or
-    otherwise from `details.parameter_size` in `/api/tags`.
-  - **Size unknown.** A model can then go only to a node with no `max_params_b`. Otherwise it
-    gets 422 `MODEL_SIZE_UNKNOWN`.
-  - **Discovery** refreshes every 60 s, and immediately when a model is missing.
-- **REQ-33. Never too small.** The gateway MUST NOT send a model to a node whose `max_params_b`
-  is smaller than the model, even when every larger node is down (E3).
+- **REQ-32. Routing by fit.** For each request that names a model, the gateway decides which
+  nodes the model fits on. That decision uses measured capacity, unless the configuration
+  overrides it.
+  - **Reading the request.** The gateway reads `model` and `num_ctx` with the strict parser
+    of REQ-8. An ambiguous `num_ctx` (including one set both at the top level and in
+    `options`) gets 400 `NUM_CTX_AMBIGUOUS` before any node is tried. Only
+    `options.num_ctx` feeds the fit rule (below).
+  - **Each node is in exactly one capacity mode** (REQ-44), shown with its reason in
+    `/seriatim/nodes`:
+    1. **`capacity = "unlimited"` in the config.** There is no size check. This is for
+       CPU-only or unusual machines, by the operator's explicit choice.
+    2. **The `max_params_b` override.** The model's parameter count must be at most
+       `max_params_b`. The count comes from `size_overrides`, or else from
+       `details.parameter_size`. The node's measured capacity is ignored.
+    3. **Measured.** The node's reported `usable_bytes` (REQ-16) is used with the fit rule
+       below.
+    4. **Unknown.** There is no override, and no `usable_bytes` (no report, a failed probe,
+       or `source: none`). The node is **excluded** from routing. Seriatim never guesses.
+
+    Setting both `capacity = "unlimited"` and `max_params_b` on one node is a configuration
+    error.
+  - **The fit rule** (ADR-001 D14). The model fits a measured node when
+    `(weights_bytes + kv_bytes) × (1 + fit_margin) ≤ usable_bytes`.
+    - **`weights_bytes`** is the model's `size` in that node's `/api/tags`, in bytes. It is
+      preferred to the `parameter_size` label.
+    - **`kv_bytes`** is
+      `n_ctx_alloc × Σ over layers (head_count_kv × (key_length + value_length)) × 2 bytes`,
+      from `/api/show` `model_info`. The keys are prefixed with the architecture named in
+      `general.architecture` (for example `<arch>.block_count`).
+      - `head_count_kv` may be one number or one per layer, and falls back to `head_count`.
+      - `key_length` and `value_length` are read separately. Each falls back to
+        `embedding_length / head_count` only when it is absent.
+      - **`2 bytes`** is an `f16` cache, the largest of the cache types. The v1 rule always
+        uses it, because a quantised cache is not guaranteed to take effect (REQ-16).
+      - `n_ctx_alloc` is `n_ctx` rounded up to a multiple of 256, as llama.cpp pads it.
+      - **Only standard attention is estimated.** If `model_info` has keys of another cache
+        layout (latent attention such as `attention.kv_lora_rank`, or recurrent or
+        state-space keys such as `ssm.*`), the model's metadata is *unsupported*. It is then
+        treated as missing metadata (below), never estimated.
+    - **`n_ctx`**, the first of these that is known:
+      1. the request's `options.num_ctx` on a native route. A top-level `num_ctx` is ignored
+         there by Ollama, so it is ignored here too; `/v1` routes cannot carry `num_ctx`
+         at all (REQ-9);
+      2. the model's own `num_ctx` parameter. `/api/show` returns `parameters` as text, one
+         `name value` per line. A line matching `^\s*num_ctx\s+([0-9]+)\s*$` gives it. More
+         than one such line makes it ambiguous, and the next source is used;
+      3. the node's `default_num_ctx`;
+      4. the model's trained maximum, `<arch>.context_length`.
+
+      The value is used as given, never capped at the model's maximum.
+
+      **Set the node's default.** Without `default_num_ctx` and a Modelfile `num_ctx`, a
+      request that gives no `num_ctx`, such as every `/v1` request, is sized for the
+      model's full trained context. That can be many times what Ollama will actually
+      allocate, so the model may be refused. The operator guide therefore tells operators to
+      set `OLLAMA_CONTEXT_LENGTH` on each node, and `/seriatim/nodes` warns when it is unset.
+    - **`fit_margin`** is a gateway setting, relative only (default 0.25). It covers compute
+      buffers, the runtime's own allocations and estimation error. There is no absolute
+      byte reserve, because a fixed size would be a hardware assumption.
+    - **Being loaded proves nothing.** That a model is in `/api/ps` is not evidence that it
+      fits. Ollama may already have placed part of it on the CPU. Every request is checked by
+      the rule.
+  - **Freshness.** The gateway reads each node's `/seriatim/status` every 15 s. A capacity
+    report older than 45 s, a failed read, or `memory_pressure: critical` makes that node's
+    capacity unknown until the next good report.
+  - **Missing model metadata.** If `size` or the architecture fields are missing, the model
+    can't be checked on measured nodes. It can still go to an `unlimited` node, or to a
+    `max_params_b` node when its parameter count is known.
+  - **Candidates** are the healthy nodes whose last discovery listed the model and on which
+    the model fits (or which are `unlimited`), in configured priority order.
+  - **Per-node verdict.** Each healthy node that lists the model gets exactly one verdict:
+    `fits`; `too_small`; `capacity_unknown`; or `metadata_missing`, when the measured rule
+    is needed but the model's metadata is missing or unsupported, or when the
+    `max_params_b` rule is needed but no parameter count is known. A failed `/api/show`
+    *call* is not missing metadata: it leaves that node's discovery state unknown
+    (REQ-34).
+  - **Parameter counts** come from `size_overrides`, or else from `details.parameter_size`
+    parsed as `^([0-9]+(\.[0-9]+)?)([MB])$` (M = 10⁶, B = 10⁹). Any other form, such as
+    `8x7B`, is unknown unless `size_overrides` gives it.
+  - **When there are no candidates,** the first of these that applies is returned, so each
+    case has exactly one answer:
+    1. **`DISCOVERY_INCOMPLETE` (503, `Retry-After`).** No node lists the model, and at
+       least one node's discovery state is unknown (REQ-34).
+    2. **`MODEL_NOT_FOUND` (404).** No node lists the model, and every node answered.
+    3. **`GPU_OFFLINE` (503).** Nodes list the model, but none of them is healthy.
+    4. **`CAPACITY_UNKNOWN` (503, `Retry-After`).** A healthy node that lists the model has
+       unknown capacity (no report, a failed or stale probe, `source: none`, or critical
+       memory pressure). The model might fit there, so the error is retryable. Each such
+       node and its reason are in the body and in `/seriatim/nodes`.
+    5. **`MODEL_SIZE_UNKNOWN` (422).** Some node's verdict is `metadata_missing`.
+    6. **`MODEL_TOO_LARGE` (422).** Every node's verdict is `too_small`.
+       - The body gives `n_ctx` and `required_bytes` for the highest-priority node that used
+         the measured rule, or omits them when none did. The `hint` suggests a smaller
+         `num_ctx`.
+    - **The body lists every node's verdict** in `nodes`, each with its id, verdict and
+      reason (contract `ErrorEnvelope.nodes`).
+  - **Discovery** refreshes every 60 s, and immediately when a model is missing. `/api/show`
+    results are cached by model digest.
+- **REQ-33. Never too small.** The gateway MUST NOT send a model to a node where it does not
+  fit, or to a node of unknown capacity, even when every node where it fits is down or busy.
+  Ollama would then spill layers onto the CPU, which is the failure this rule exists to
+  prevent (E3).
+  - **What this guarantees, and what it does not.** The check compares the estimate with the
+    node's last report. It cannot see memory that another program takes after that report,
+    and on Apple it cannot see other programs' use at all. Running nothing else on a node's
+    GPU is the operator's responsibility, and the operator guide (S12) says so.
 - **REQ-34. Unknown model vs unknown state.**
   - 404 `MODEL_NOT_FOUND` only when **every** configured node answered its last discovery
     with a valid `/api/tags`, and none lists the model.
@@ -528,9 +680,13 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - The schemas are in the contract (F4).
 - **REQ-39. `/models/select`.**
   - It picks a model and a node for a `task`, from operator-configured preference lists, model
-    presence, routing (REQ-32) and measured free memory.
-  - `fits_in_free_memory` is `null` whenever memory is not measured (REQ-16). There is no
-    estimation in v1.
+    presence and the fit rule (REQ-32). `context_tokens` is used as the request's `num_ctx`
+    in that rule.
+  - When no preferred model has a candidate, it returns the error that REQ-32 would return
+    for the first preferred model.
+  - The chosen node always has `fits: true`. `fit_basis` names the capacity mode used, and
+    `required_bytes` is given when the measured rule was used. The `alternatives` list
+    carries the other nodes, each with its verdict.
   - An unknown task gets 400 `UNKNOWN_TASK`.
 - **REQ-40. Gateway passthrough.** The gateway meets REQ-6, REQ-7 and REQ-24 end to end.
 - **REQ-41. Admin requests through the gateway** (pull, push, create, copy, delete, blobs, and
@@ -538,18 +694,28 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   `NODE_REQUIRED`.
 - **REQ-42. Gateway health.**
   - `/seriatim/health` returns 200 when at least one node is healthy, otherwise 503.
-  - `/seriatim/nodes` (authenticated) returns each node's id, health, priority,
-    `max_params_b`, last check time and status.
+  - `/seriatim/nodes` (authenticated) returns each node's id, health, priority, capacity
+    mode and its reason (REQ-32), `usable_bytes` when measured, `max_params_b` when set,
+    last check time and status.
 - **REQ-43. Compatibility (ruling Q7).** The headers and fields existing clients read keep
   their names. §7.1 documents the full compatibility surface.
 - **REQ-44. The fleet is configuration.**
   - **One place.** The gateway's configuration file is the only description of the fleet. It
-    lists each node's `id`, `url`, keys, `priority` and optional `max_params_b`, plus the
-    fleet-wide `size_overrides` and task preferences.
-  - **Any size.** The gateway MUST work with any number of nodes from one upwards, and the
-    code MUST NOT contain a node count, a node name, a memory size, a platform or a vendor.
-  - **Tests** run the same routing suite against fleets of 1, 2 and 5 nodes, with differing
-    `max_params_b`, so no test depends on one particular fleet.
+    lists each node's `id`, `url`, keys and `priority`, plus optional per-node overrides:
+    `max_params_b`, `capacity = "unlimited"` and `gpu_pool = "sum"` (REQ-16). Fleet-wide, it holds `fit_margin`,
+    `size_overrides` and the task preferences.
+  - **Capacity is discovered, not configured.** By default a node's capacity comes from its
+    own report (REQ-16). The overrides exist for machines that cannot report, or where the
+    operator knows better, and each is visible in `/seriatim/nodes`.
+  - **Any size.** The gateway MUST work with any number of nodes from one upwards.
+  - **No hardware assumptions.** The code, its defaults and its tests MUST NOT contain a node
+    count, a node name, a GPU model, a memory size, an operating-system pairing or a role
+    such as "small machine" or "large machine". The defaults are relative (`fit_margin`) or
+    neutral.
+  - **Tests** run the same routing suite against fleets of 1, 2 and 5 nodes, built from the
+    recorded probe fixtures (NVIDIA, Apple, no GPU, probe failure) and from the overrides, so
+    no test depends on one particular fleet. Property tests generate capacities and model
+    sizes, and check the fit rule and REQ-33 for every combination.
 - **REQ-45. Changing the fleet without a restart.**
   - **When it reloads.** The gateway reloads its configuration when the file's content
     changes, checked every 10 s, and on `SIGHUP` where the platform has it.
@@ -567,8 +733,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       `DISCOVERY_INCOMPLETE`, not `MODEL_NOT_FOUND` (REQ-34).
     - **A node removed:** it stops being a candidate at once. Requests already running on it
       finish normally, and its cached health and models are dropped.
-    - **`priority`, `max_params_b` or `size_overrides` changed:** applies from the next
-      routing decision.
+    - **`priority`, `max_params_b`, `capacity`, `fit_margin` or `size_overrides` changed:**
+      applies from the next routing decision.
     - **A node's `url` or keys changed:** treated as removing the old node and adding a new
       one.
     - **Client keys** added or removed: apply from the next request. A gateway key can
@@ -623,12 +789,13 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 | Closing the upstream connection fails or times out | Slot *stuck*; health degraded; freed only by a restart (REQ-10) | Node unhealthy |
 | Unknown `/seriatim/*` path, or the wrong method on one | 404 `NOT_FOUND` / 405 `METHOD_NOT_ALLOWED` | The same |
 | `num_ctx` over its limit, ambiguous, or sent on `/v1` | 422 / 400; Ollama not contacted | Passed through |
-| GPU probe or `/api/ps` fails | `source: unavailable` / `loaded_models: null`, each with an error | `fits_in_free_memory: null` |
+| GPU probe fails / `/api/ps` fails | `source: unavailable`, with an error / `loaded_models: null`, with an error | A failed probe makes that node's capacity unknown, so it is excluded (REQ-32). `/api/ps` alone does not affect capacity |
 | Ollama reachable from the LAN | 503 `OLLAMA_EXPOSED` on gated routes; health degraded | Node unhealthy |
 | Exposure check uncertain | 503 `EXPOSURE_UNVERIFIED`; never treated as safe | Tries the next node |
 | Invalid or unknown config key | Exit code 2, naming the key | The same |
 | No keys configured | Refuses to start (REQ-15) | The same |
 | Model missing / node state unknown / no healthy node / size unknown | — | 404 `MODEL_NOT_FOUND` / 503 `DISCOVERY_INCOMPLETE` / 503 `GPU_OFFLINE` / 422 `MODEL_SIZE_UNKNOWN` |
+| Model fits nowhere / capacity unknown where it might fit | Capacity probe fails: `source: unavailable`, with an error | 422 `MODEL_TOO_LARGE` / 503 `CAPACITY_UNKNOWN`, in the order of REQ-32; never sent to a node it does not fit |
 | Some nodes unreachable in a combined view | — | Partial result, flagged |
 | A slot leaked through a bug | Health degraded, and status shows the holder's age; never force-freed (REQ-11) | Node unhealthy |
 
@@ -725,6 +892,9 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
   - port 11434 belongs to the sidecar process, and exactly one sidecar process is running;
   - Ollama's own auto-start (the tray app or login item) is disabled;
   - the Ollama service environment sets `OLLAMA_HOST` and `OLLAMA_NUM_PARALLEL=1`;
+  - the sidecar's copies of the Ollama settings it reports (REQ-16) equal the Ollama
+    service's own: `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_KV_CACHE_TYPE`, `OLLAMA_FLASH_ATTENTION`
+    and `CUDA_VISIBLE_DEVICES`. Each must be either unset on both sides or equal;
   - the firewall has no rule for 11435.
 
   It runs after install, after every model update, after every Ollama upgrade, and weekly.
@@ -740,8 +910,8 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
   - It then runs the local-only check.
 - **REQ-55. Weekly maintenance.**
   - It runs the model update, the local-only check and log rotation, and writes a summary.
-  - It does **not** update Seriatim (ruling Q10). Seriatim changes only through the `prod`
-    branch and the deployer (§7.6).
+  - It does **not** update Seriatim (ruling Q10). Seriatim changes only through a manual
+    install of a tagged release (§7.6).
 - **REQ-56. Ollama upgrades.** These steps run in order, and a failure stops the sequence:
   1. In the PPE, capture fixtures and the route probe with the new Ollama version.
   2. Run the contract, allowlist and behaviour tests against them, in CI.
@@ -755,8 +925,7 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
 ### 7.3 Windows (GPU node)
 
 - **REQ-57.** `deploy/windows/install.ps1` does the following:
-  - installs Python 3.12+, the deployer (REQ-66) and the commit at the head of `prod` into a
-    versioned venv under `%ProgramFiles%\seriatim`;
+  - installs Python 3.12+ and a tagged release into a venv under `%ProgramFiles%\seriatim`;
   - puts the config in `%ProgramData%\seriatim\`, with an ACL for the service account and
     Administrators;
   - registers two services with WinSW: `seriatim-ollama` (`ollama serve`, with `OLLAMA_HOST`,
@@ -765,15 +934,16 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
   - adds a firewall rule for inbound TCP 11434 on the Private profile;
   - runs the local-only check.
 
-  The weekly task and the deployer timer run from Task Scheduler. Seriatim is upgraded only
-  by the deployer, from `prod` (REQ-66).
+  The weekly task runs from Task Scheduler. To upgrade Seriatim: stop `seriatim-node`,
+  install the new tagged release, start the service, then run the local-only check.
 
 ### 7.4 macOS (Apple Silicon node)
 
 - **REQ-58.** `deploy/macos/install.sh` does the following:
-  - installs the deployer (REQ-66) and the head of `prod` into a versioned venv under
-    `/usr/local/seriatim`;
+  - installs a tagged release into a venv under `/usr/local/seriatim`;
   - puts the config in `/usr/local/etc/seriatim/` (mode 0600);
+  - installs the `macos` extra, which adds `pyobjc-framework-Metal` for the capacity probe
+    (REQ-16);
   - adds launchd plists `org.seriatim.ollama` and `org.seriatim.node`, with `KeepAlive`;
   - removes the Ollama.app login item;
   - adds an application-firewall rule;
@@ -785,106 +955,31 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
 ### 7.5 Gateway host
 
 - **REQ-59.** The gateway ships an OCI image and an example systemd unit. Its config lists
-  each node's id, URL, keys, priority and `max_params_b`, plus `size_overrides` (REQ-44), and
+  each node's id, URL, keys and priority, the optional overrides (`max_params_b`, `capacity`,
+  `gpu_pool`), plus `fit_margin` and `size_overrides` (REQ-44), and
   is reloaded live (REQ-45). Examples use placeholders only, such as `node-a.example`, and
   show fleets of more than one shape.
 
-### 7.6 Release branches: `ppe` and `prod`
+### 7.6 Deferred: automated promotion and deployment
 
-Seriatim is deployed from two long-lived branches besides `main`. A push to a branch updates
-the hosts that track it.
+Phase 1 covers the gate and CI. **Deploys are manual** until a later slice designs automated
+promotion and deployment. Until then, a node or the gateway is upgraded by installing a tagged
+release by hand (§7.3 to §7.5).
 
-- **REQ-64. Branches.**
-  - **`main`** is the integration branch. Changes arrive only by pull request, with CI green
-    and the maintainer's approval. Nobody pushes to it directly.
-  - **`ppe`** is the test deployment. A push to `ppe` updates the designated PPE host to that
-    commit. The host then runs the behaviour suite (§8.3) against its own PPE and records the
-    result.
-  - **`prod`** is production. A push to `prod` updates the GPU nodes and the gateway host.
-  - **Nobody commits to `ppe` or `prod`.** Both only ever fast-forward to a commit on
-    `main`. They may fall behind `main`, and `prod` normally sits at or behind `ppe`.
-- **REQ-65. Guardrails, enforced by GitHub, not by convention.**
-  - **Only from `main`.** `ppe` and `prod` move only by fast-forward to a commit that is
-    already on `main` and whose CI on `main` passed.
-  - **Who can move them.** Only the `promote` workflow does this. It is started by hand with
-    a target (`ppe` or `prod`) and a `main` commit SHA. It checks:
-    - `git merge-base --is-ancestor <sha> origin/main`;
-    - the commit's required checks (REQ-66 defines them);
-    - that the move is a fast-forward.
+That slice starts from these open problems, recorded as the revision-2 review stated them.
+They are not designed here.
 
-    Only then does it update the branch.
-  - **The promotion identity.** The workflow pushes with a dedicated GitHub App,
-    `seriatim-promote`, which has only `contents: write` on this repository. This is not the
-    agents' App.
-    - **Where its key is kept.** Its key is an *environment secret* of the `ppe` and `prod`
-      environments. A job receives it only after that environment's protection rules pass.
-    - **Branch policy.** Both environments accept deployments only from runs on `main`, so a
-      workflow on another branch, or one changed in a pull request, cannot get the key.
-    - **Rulesets.** `seriatim-promote` is the only bypass actor on the `ppe` and `prod`
-      rulesets.
-  - **PPE first.** A promotion to `prod` also requires the commit status `seriatim/ppe` to
-    be `success` on that exact SHA.
-    - **Who posts it.** The PPE host's deployer posts it after deploying that SHA and passing
-      the behaviour suite.
-    - **Its credential.** It posts with a second narrow App, `seriatim-ppe-reporter`, which
-      has only `statuses: write` and whose key lives only on the PPE host.
-  - **Approval.**
-    - A promotion to `prod` runs in the GitHub environment `prod`, which requires the
-      maintainer's approval.
-    - A promotion to `ppe` needs no approval. An agent may start one when asked, through the
-      project's GitHub App.
-    - No agent pushes to `prod` directly, and no agent approves the `prod` environment.
-    - The agents' App has no bypass on either ruleset, and cannot post `seriatim/ppe`.
-  - **The rulesets on `ppe` and `prod`.** They allow no force-push and no deletion. Only the
-    `promote` workflow's identity may push.
-- **REQ-66. Deployer (`seriatim-deploy`, pull-based).** Each deployed host runs it on a timer
-  (default every 60 s). It tracks one branch: `ppe` on the PPE host, `prod` everywhere else.
-  It needs no GitHub credentials, because the repository is public. The one exception is the
-  PPE host, which posts `seriatim/ppe` (REQ-65).
-  - **One deploy at a time.** Each run takes a host-wide deploy lock first. If another run
-    holds it, the new run exits without doing anything.
-  - **Interrupted runs.** The deployer records the commit it is moving to before it starts.
-    After an interruption, the next run finishes or rolls back that same commit. It never
-    takes a new one in the middle.
-  - **Fetch.** It fetches the tracked branch. If the head has not changed, it does nothing.
-  - **Verify before installing.**
-    - **Required checks.** The deployer config lists the required checks by name. Each one
-      must have a completed check run on that exact SHA, from the GitHub Actions app, in a
-      check suite for a `push` event whose `head_branch` is `main`, with the conclusion
-      `success`. The deployer reads every page of
-      results. Check runs it doesn't recognise are ignored, and can never stand in for a
-      missing required one.
-    - The commit must also be an ancestor of `origin/main`. The deployer checks this itself,
-      as a second line of defence behind REQ-65.
-    - **Definite failures.** A required check that concluded with anything other than
-      `success`, or a commit that is not an ancestor of `main`, is refused, logged and never
-      retried for that head.
-    - **Uncertain results.** A pending, missing or unreadable check is treated as uncertain,
-      not as a failure. So is a rate limit, an API error or a fetch error. The deployer
-      retries with backoff (up to 30 minutes between tries) and reports the host as
-      `deploy_pending`. Uncertain is never treated as a pass.
-  - **Jitter.** It waits a random 0–30 s before each poll, so hosts do not poll in step.
-  - **Install and switch.** It installs the commit into a new versioned venv, switches the
-    service to it and restarts the service. A restarted sidecar starts with its slots
-    draining (REQ-12a).
-  - **Check.** It then runs the local-only check (REQ-53) on GPU nodes, plus the health check,
-    within a time limit.
-  - **Roll back on failure.** If any step fails, it switches back to the previous venv,
-    restarts, and records the failure. It does not try that commit again until the branch
-    moves.
-  - **Rolling, health-gated.** Before it restarts, a prod node checks the public
-    `/seriatim/health` of every other node in its `deploy_peers` list. It restarts only if all
-    of them are healthy. Otherwise it waits and checks again on the next poll.
-    - **Order.** Each node has a distinct `deploy_slot` index (0, 1, 2…). It waits
-      `deploy_slot × deploy_spacing_s` (default 600 s) after first seeing a new head before
-      checking its peers. Two nodes therefore check at moments far apart.
-    - **Bounded wait.** After 30 minutes it deploys anyway, with a `WARNING`, so that a node
-      that has been down for a long time cannot block every update.
-    - **Best effort, not a guarantee.** If a deploy overruns its spacing, two nodes can still
-      be restarting together. Clients then briefly get 503 `GPU_OFFLINE`. Meanwhile the
-      gateway sends work to the nodes that are up (REQ-36, REQ-37).
-  - **Log.** One timestamped line per attempt: the old commit, the new commit and the
-    outcome.
+- **Blocking, PPE→prod bypass:** a single promotion App key in both `ppe` and `prod`, with
+  bypass on both rulesets, gives a compromised PPE job prod push authority. Use separate
+  identities; the prod credential is reachable only after prod approval.
+- **Blocking, unauthenticated PPE status:** `seriatim/ppe` is checked by name only. Bind it
+  to the reporter App (an expected source), and verify that identity during promotion.
+- **Should-fix:**
+  - bind the verified SHA to the installed bytes: an immutable checkout, frozen or
+    hash-pinned deps, and the same check on first install;
+  - verify rollback health, persist the last-good deployment and its config, and define a
+    rollback-failed state;
+  - either coordinate the one-node-at-a-time rollout or call it best effort.
 
 ## 8. Test plan
 
@@ -907,6 +1002,30 @@ command output, and never just says "tests pass".
   responses** (`tests/fixtures/ollama-0.40.16.json`, recorded in the PPE). Hand-written
   fixtures are used only for faults that cannot be captured: resets, stalls and malformed
   chunks.
+- **Probe fixtures, not hardware (REQ-16, REQ-32).** Capacity tests replay recorded probe
+  output under `tests/fixtures/probes/`, one directory per shape:
+  - `nvidia/`: `nvidia-smi` CSV for one and for two devices, with and without another process
+    using memory, plus the matching `/api/ps`;
+  - `apple/`: `sysctl` output with the Metal working-set value, and without it;
+  - `none/`: no probe applies;
+  - `failure/`: a non-zero exit, a timeout and malformed output;
+  - `override/`: node configs with `max_params_b` and with `capacity = "unlimited"`.
+
+  **What the fixtures contain.** They are recorded from real tools, then sanitised:
+  - device names become placeholders (`gpu-0`), and serials and UUIDs are removed;
+  - each shape is recorded at more than one memory size, so no size is special.
+
+  **Independent expectations.** Recorded figures and generated fleet sizes are allowed;
+  memory sizes written into the test code are not. The expected results do not come from
+  the rule under test:
+  - a golden table of `kv_bytes`, worked out by hand from published model cards, covers
+    equal and unequal key and value lengths, per-layer `head_count_kv`, and unsupported
+    layouts;
+  - calibration fixtures, recorded on real hardware in S5, S6 and S10, pair each estimate
+    with the `size_vram` Ollama actually used;
+  - fixtures also cover a model partly offloaded to the CPU, a hidden device, a stale
+    report and malformed samples. Every test runs in
+  CI on all three operating systems, and none needs a GPU.
 
 ### 8.2 Mutation testing
 
@@ -943,10 +1062,14 @@ command output, and never just says "tests pass".
   - a Docker context or `DOCKER_HOST` that is not the local socket.
 - **Models.** These are real micro-models with real, different `parameter_size` metadata:
   - `qwen2.5:0.5b` (0.5B) on every node;
-  - `qwen2.5:1.5b` (1.5B) on both nodes of the two-node PPE.
+  - `qwen2.5:1.5b` (1.5B) on both nodes of the two-node PPE. Two is the smallest fleet that
+    exercises spill-over; fleets of other sizes are covered by the component tests (REQ-44).
 
-  The gateway's thresholds are set between those sizes, so size routing is tested through
-  Ollama's real `details.parameter_size`. The PPE does not use `ollama cp` aliases, which keep
+  The PPE nodes have no GPU, so two things are tested there. Size routing goes through the
+  `max_params_b` override, set between those sizes and checked against Ollama's real
+  `details.parameter_size`. The fit rule goes through probe fixtures replayed by each
+  sidecar (REQ-16), against Ollama's real `/api/tags` sizes and `/api/show` architecture
+  fields. The PPE does not use `ollama cp` aliases, which keep
   the source model's metadata. `size_overrides` is tested separately. The models are cached
   between CI runs.
 - **Topology.**
@@ -963,29 +1086,86 @@ command output, and never just says "tests pass".
   - pytest with coverage;
   - mutmut;
   - the contract lint (`openapi-spec-validator`) and the allowlist-vs-route-list test;
-  - **security scanners**, each a required check:
-    - gitleaks (`secret-scan / gitleaks`, a pinned and checksum-verified binary);
-    - Bandit (Python SAST), failing on medium or high severity;
-    - pip-audit, on the locked dependencies (`uv export --frozen`), failing on any known
-      vulnerability;
-    - Trivy, scanning the repository's configuration and, from S10, the gateway image;
+  - **security scanners**, each a required check, under one failure policy:
+    - **Fail on findings and on errors.** Every scanner job exits non-zero on a finding at
+      or above its threshold. It also fails when the scanner could not run properly: a
+      crash, a timeout, a failed download of its vulnerability database, or missing or
+      unreadable output. A scanner that did not finish never counts as a pass.
+    - **Exceptions are explicit.** A finding may be ignored only through a committed ignore
+      file, where each entry gives a reason and an expiry date. CI fails on an entry without
+      both, and on an expired one. Inline suppressions such as `# nosec` need a reason on
+      the same line, and a lint checks for it.
+    - **Pinned tools.** Each scanner is pinned to an exact version and verified by checksum.
+    - **The scanners and their thresholds:**
+      - **gitleaks** (`secret-scan / gitleaks`): `--exit-code 1` on any finding.
+      - **Bandit** (Python SAST): fails on medium or high severity (`-ll`).
+      - **pip-audit**, on the locked third-party dependencies (`uv export --frozen
+        --no-emit-workspace --format requirements-txt`, then `pip-audit --strict --no-deps
+        --disable-pip -r` on that file): `--strict`, so a
+        package that cannot be audited fails too. Fails on any known vulnerability.
+      - **Trivy**: `trivy fs --scanners vuln,misconfig,secret` on the repository and, from
+        S10, `trivy image` on the gateway image. Each runs twice on the same cached
+        database:
+        - a full report at every severity, with `--exit-code 0`, written to the job summary;
+        - the gate, with `--severity HIGH,CRITICAL --exit-code 1`. A failed database download fails the job; the scan is
+        never run silently against a stale or empty database.
   - **the private-terms check.**
-    - **How it runs.** It runs under `pull_request_target` with the workflow from `main`. It
-      fetches the pull request's head as data only, and never checks it out for execution or
-      runs any of its code. It scans `git diff` and the changed files' text against the term
-      list held in a CI secret.
-    - **What it reports.** Only `file:line: private term matched`, never the term itself.
+    - **What it does.** It scans the pull request's changes against a list of private terms
+      (host names and personal names) held in a CI secret.
     - **Fork pull requests** get the same check, because the workflow and the secret come
-      from `main`.
-    - **If the secret is unavailable,** the check fails. It never passes in that case.
-    - **It also runs on every push to `main`,** scanning the whole tree, so that the deployer's
-      required checks (REQ-66) include a `push` run of it on `main`;
+      from `main`. If the secret is unavailable, the check fails; it never passes in that
+      case.
+    - **It also runs on every push to `main`,** scanning the whole tree.
+    - **Injection rules.** It runs under `pull_request_target`, so it must never let the
+      pull request control what runs:
+      - **Code from `main` only.** The workflow, the scanner script and its config come
+        from the tip of the base branch that the event runs on (`GITHUB_SHA`), never from
+        the pull request. `github.event.pull_request.base.sha` is used only as the start of
+        the range scanned.
+      - **Minimal token.** `permissions: contents: read` and nothing else; checkout with
+        `persist-credentials: false`. The term list is its only secret, and it reaches the
+        scanner through an environment variable, never on a command line or in the log.
+      - **A validated head SHA.** `github.event.pull_request.head.sha` must match
+        `^[0-9a-f]{40}$`. Exactly that object is fetched, never a branch name, and
+        `git cat-file -t` must say `commit`.
+      - **What is scanned.** The changed files' contents, their paths, and every commit in
+        `base.sha..head.sha`: its message and its author and committer names and emails.
+      - **The pull request is data.** It is never checked out into the working tree. Files
+        are read with `git diff -z` and `git show <sha>:<path>` as bytes, with hooks,
+        LFS smudging and submodules disabled.
+      - **No shell.** Subprocesses take argument arrays (`shell=False`). Nothing uses
+        `shell=True`, `os.system` or string-built commands.
+      - **No interpolation.** Values the pull request controls are never interpolated into
+        a `run:` script or a `${{ }}` expression inside one: the title, the body, the branch
+        name, labels, filenames and commit messages. Filenames are handled as NUL-separated
+        bytes.
+      - **No cache** is used, so it cannot be poisoned, and the job has a timeout.
+    - **What it reports.**
+      - **Publicly** (the check result, the job log and the summary): only "Private-terms
+        check failed. The maintainer has been notified." No file, line, count or term, and
+        the output is the same for one match as for many. Workflow logs and artifacts of a
+        public repository are readable by anyone, so they get nothing more.
+      - **For the maintainer:** the match locations are encrypted to the maintainer's
+        public key (an `age` recipient kept as a repository variable) and uploaded as an
+        artifact that only the maintainer can decrypt.
+        - **No size signal.** The artifact is uploaded on every run, pass or fail, under a
+          fixed name. Its plaintext is padded to a fixed 64 KiB before encryption; a
+          longer report is cut short, with a note that says so.
+        - **No plaintext leak.** The plaintext exists only in memory and is never written
+          to disk or to the log. If encryption or upload fails, the job fails with the same
+          generic message.
+    - **The accepted trade-off.** Pass or fail is still a one-bit signal. A contributor could
+      in principle learn whether one candidate name is on the list by opening a pull request
+      that contains it. That is accepted for three reasons:
+      - each probe costs a public pull request, which the maintainer sees;
+      - each probe tests one guess and reveals nothing else;
+      - hiding the result altogether would mean the check cannot block a leak.
   - an IP-literal check;
   - the PPE suite;
   - a PR-size check: ≤ 15 changed files (lock files excluded), and a diff of ≤ 150 KB, so
     that one reviewer can read the whole change.
 
-  CI runs on every pull request and on every push to `main`, `ppe` and `prod`. The security
+  CI runs on every pull request and on every push to `main`. The security
   scanners also run weekly on a schedule, to catch newly disclosed vulnerabilities in pinned
   dependencies. Actions are pinned by commit SHA, and dependencies are locked (`uv.lock`).
 
@@ -1009,7 +1189,7 @@ The maintainer ruled on the open questions of revision 1 as follows.
 | Q7 | Compatibility? | Keep the header names and fields existing clients use; document everything else | REQ-43, §7.1 |
 | Q8 | S0 without a TD? | Yes | ADR-001 §10 |
 | Q9 | PPE in CI? | Yes, as a required check. The host guard applies to local runs only; CI declares itself | §8.3 |
-| Q10 | Should maintenance update Seriatim? | No. Seriatim is updated only by the deployer, from `prod` (added 2026-11-16: the `ppe` and `prod` branch pattern) | REQ-55, §7.6 |
+| Q10 | Should maintenance update Seriatim? | No. Seriatim is updated by a manual install of a tagged release until automated deployment is designed (§7.6) | REQ-55, §7.6 |
 | Q11 | Publish the evaluation? | Yes, cleaned, as `docs/EVALUATION.md` | `docs/EVALUATION.md` |
 
 Two points were raised in review and decided without change. Ollama **0.40.16** is the real

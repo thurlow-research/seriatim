@@ -7,7 +7,7 @@
 - auth (S2);
 - the `num_ctx` policy (S3);
 - `/seriatim/status`, memory and the exposure check (S4);
-- deploy (S0c, S5, S6);
+- deploy (S5, S6); automated deployment is deferred (SPEC §7.6);
 - the gateway (S7 and later);
 - TLS (S11).
 
