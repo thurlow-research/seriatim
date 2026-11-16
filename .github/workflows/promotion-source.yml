@@ -1,0 +1,129 @@
+# Promotion source check for the interim ppe/prod branches (SPEC REQ-70, §7.9).
+# Required on the deploy-branches ruleset, bound to the GitHub Actions app.
+#   any base: the head repository is this repository (never a fork);
+#   prod:     the head branch is main;
+#   ppe:      the head branch is promote/ppe-<sha12>, made by deploy/promote-ppe.py: a
+#             two-parent commit whose tree equals its second parent's, and whose .github/
+#             equals main's, so workflow changes reach ppe only through main.
+#
+# pull_request_target runs this file from the default branch (main), never from the pull
+# request, so a pull request can't edit it to pass. It checks nothing out and never runs
+# pull request code: it reads only the event and the REST API, with contents: read.
+# Event values reach steps only through if: and env:, never inside run:.
+name: promotion-source
+
+on:
+  pull_request_target:
+    branches: [ppe, prod]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  promotion-source:
+    name: promotion-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Refuse if main is not the default branch
+        if: github.event.repository.default_branch != 'main'
+        run: |
+          echo "::error::the default branch must be main"
+          exit 1
+
+      - name: Refuse a fork
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::promotions must come from this repository, never a fork"
+          exit 1
+
+      - name: Refuse an unexpected base
+        if: github.event.pull_request.base.ref != 'ppe' && github.event.pull_request.base.ref != 'prod'
+        run: |
+          echo "::error::promotions target only ppe or prod"
+          exit 1
+
+      - name: Refuse a prod source other than main
+        if: github.event.pull_request.base.ref == 'prod' && github.event.pull_request.head.ref != 'main'
+        run: |
+          echo "::error::prod is promoted only from main"
+          exit 1
+
+      - name: Refuse a ppe source that is not a promotion branch
+        if: github.event.pull_request.base.ref == 'ppe' && !startsWith(github.event.pull_request.head.ref, 'promote/ppe-')
+        run: |
+          echo "::error::ppe is promoted only from a promote/ppe-* branch made by the promotion builder"
+          exit 1
+
+      - name: Check the ppe promotion commit and its .github tree
+        if: github.event.pull_request.base.ref == 'ppe'
+        env:
+          API: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json, os, re, sys, time, urllib.error, urllib.request
+          env = os.environ
+          token = env.get("GH_TOKEN", "")
+          if not token:
+              sys.exit("::error::empty token")
+
+          def get(path):
+              req = urllib.request.Request(
+                  f"{env['API']}/repos/{env['REPO']}/{path}",
+                  headers={"Authorization": f"Bearer {token}",
+                           "Accept": "application/vnd.github+json",
+                           "X-GitHub-Api-Version": "2022-11-28"})
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          return json.load(r)
+                  except (urllib.error.URLError, TimeoutError) as e:
+                      if attempt == 2:
+                          sys.exit(f"::error::API request failed: {path}: {e}")
+                      time.sleep(5)
+
+          head = env["HEAD_SHA"]
+          m = re.fullmatch(r"promote/ppe-([0-9a-f]{12})", env["HEAD_REF"])
+          if not m:
+              sys.exit("::error::head branch is not promote/ppe-<sha12>")
+          commit = get(f"git/commits/{head}")
+          parents = [p["sha"] for p in commit["parents"]]
+          if len(parents) != 2:
+              sys.exit("::error::the promotion commit must have exactly two parents")
+          source = parents[1]
+          if not source.startswith(m.group(1)):
+              sys.exit("::error::the branch name does not match the source commit")
+          if get(f"git/commits/{source}")["tree"]["sha"] != commit["tree"]["sha"]:
+              sys.exit("::error::the promotion commit's tree differs from its source's")
+          # The first parent must be the current ppe tip: only then is the merge's tree
+          # exactly the source's. A promotion built on an older tip is rebuilt instead.
+          if parents[0] != get("branches/ppe")["commit"]["sha"]:
+              sys.exit("::error::the promotion is built on an older ppe tip; rebuild it")
+
+          def github_tree(ref):
+              tree = get(f"git/trees/{ref}")
+              if tree.get("truncated"):
+                  sys.exit("::error::tree listing truncated")
+              found = [e["sha"] for e in tree["tree"] if e["path"] == ".github" and e["type"] == "tree"]
+              return found[0] if found else None
+
+          main_github = github_tree("main")
+          if main_github is None:
+              sys.exit("::error::main has no .github tree")
+          if github_tree(head) != main_github:
+              sys.exit("::error::.github/ differs from main's; workflow changes reach ppe only through main")
+          print(f"ppe promotion of {source} accepted")
+          PY
+
+      - name: Source accepted
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          echo "promotion source accepted: $HEAD_REF -> $BASE_REF"
