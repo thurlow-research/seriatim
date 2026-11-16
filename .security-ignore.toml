@@ -1,0 +1,9 @@
+# Security-scanner exceptions (SPEC REQ-63). Every exception is explicit, reasoned and dated:
+# tools/ci/security_ignore.py fails CI on an entry without a reason or an expiry date, and on an
+# expired one. No exceptions are needed today.
+#
+# [[ignore]]
+# tool = "pip-audit"          # bandit, pip-audit or trivy
+# id = "GHSA-xxxx-xxxx-xxxx"  # the finding's id, as the tool reports it
+# reason = "why it doesn't apply here, or what is being done about it"
+# expires = 2027-01-31        # a TOML date; the entry fails CI from the day after

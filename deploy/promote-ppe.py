@@ -37,6 +37,8 @@ class Fail(Exception):
 
 
 def call(token: str, method: str, path: str, body: dict | None = None):
+    if not API.startswith("https://"):  # urlopen would also accept file: and custom schemes
+        raise Fail("GITHUB_API_URL must be an https:// URL")
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(
         f"{API}{path}",
@@ -50,7 +52,7 @@ def call(token: str, method: str, path: str, body: dict | None = None):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=30) as r:  # nosec B310 # API is checked https
             raw = r.read()
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
