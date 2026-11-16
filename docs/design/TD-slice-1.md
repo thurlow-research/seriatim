@@ -891,6 +891,10 @@ A log line, one per request:
     console script `seriatim-node = seriatim_node.app:main`.
     `node/seriatim_node/__init__.py` holds `__version__`, and `__main__.py` calls `main()`.
   - **`.env.example`**, with the `SERIATIM_NODE_*` names from §6 as commented placeholders.
+    It lands in S0a part 2 (#8). S0a ships as several PRs: part 1 (#13: workspace, node
+    skeleton, `ci.yml`), part 1b (#16: `private-terms`, `td-test-ids`), part 2 (#8:
+    `security.yml`, Dependabot, the PR template, `.env.example`) and the release workflow
+    (#10).
   - **The CI workflow** `ci.yml`, with these jobs:
     - `lint`;
     - `test` (matrix: ubuntu, windows, macos);
@@ -919,7 +923,11 @@ A log line, one per request:
       tests would run the unmutated installed code.
     - It runs `mutmut run`, then `mutmut export-cicd-stats`.
     - It computes the score from the JSON export: (killed + timeout) ÷ (total − skipped).
-      Changed files with no mutable code (zero scored mutants) pass with a notice.
+    - **No mutants.** When the changed files have no mutable code (a version-only change),
+      mutmut generates no mutants, exits 1 and writes no export. The job reads mutmut's
+      per-file records (`mutants/<file>.meta`, an empty `exit_code_by_key` for every
+      changed file) and passes with a notice. A failed run that did generate mutants still
+      fails, so does new code no test covers.
     - It fails if the export is missing or malformed, has missing or unexpected keys or a
       non-integer field, reports an interrupted run, or has categories that don't add up to
       its total (unchecked mutants), or if the score is below 75 %.

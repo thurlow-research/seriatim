@@ -14,6 +14,11 @@ Per-mutant timeouts count as killed (ruled). Survivors, mutants with no covering
 suspicious mutants and segfaults count against the score. A missing, malformed or
 unknown-format export, or one whose categories don't add up to its total (unchecked
 mutants), fails the job.
+
+If the changed files have no mutable code (a version-only change, say), mutmut generates no
+mutants, exits non-zero and writes no export. The gate reads that from mutmut's per-file
+metadata (an empty `exit_code_by_key` for every changed file) and passes with a notice. A
+missing export or a failed run with mutants generated still fails.
 """
 
 from __future__ import annotations
@@ -145,16 +150,38 @@ def staged(pdir: Path, root: Path = Path(".")) -> Iterator[None]:
             shutil.rmtree(dst, ignore_errors=True)
 
 
+def generated_mutants(pdir: Path, files: list[str]) -> int:
+    """Count the mutants mutmut generated for files (relative to pdir, as by_package gives
+    them), from its mutants/<file>.meta records."""
+    total = 0
+    for f in files:
+        meta = pdir / "mutants" / f"{f}.meta"
+        try:
+            keys = json.loads(meta.read_text(encoding="utf-8"))["exit_code_by_key"]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise GateError(f"no usable mutmut record for {f} ({type(e).__name__})") from e
+        if not isinstance(keys, dict):
+            raise GateError(f"unexpected mutmut record format for {f}")
+        total += len(keys)
+    return total
+
+
 def run_package(pkg: str, files: list[str]) -> tuple[float, int]:
     pdir = Path(pkg)
     pyproject = pdir / "pyproject.toml"
     pyproject.write_text(set_only_mutate(pyproject.read_text(encoding="utf-8"), files))
     print(f"mutating in {pkg}/: {', '.join(files)}", flush=True)
     with staged(pdir):
-        for cmd in (["mutmut", "run"], ["mutmut", "export-cicd-stats"]):
-            r = subprocess.run(["uv", "run", "--frozen", *cmd], cwd=pdir, check=False)
-            if r.returncode:
-                raise GateError(f"`{' '.join(cmd)}` in {pkg}/ exited {r.returncode}")
+        r = subprocess.run(["uv", "run", "--frozen", "mutmut", "run"], cwd=pdir, check=False)
+        if generated_mutants(pdir, files) == 0:
+            return 0.0, 0  # nothing mutable: main() prints the notice
+        if r.returncode:
+            raise GateError(f"`mutmut run` in {pkg}/ exited {r.returncode}")
+        r = subprocess.run(
+            ["uv", "run", "--frozen", "mutmut", "export-cicd-stats"], cwd=pdir, check=False
+        )
+        if r.returncode:
+            raise GateError(f"`mutmut export-cicd-stats` in {pkg}/ exited {r.returncode}")
     return score_file(pdir / EXPORT)
 
 

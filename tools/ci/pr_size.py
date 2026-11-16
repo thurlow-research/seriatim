@@ -4,7 +4,11 @@
     pr_size.py --base <sha> --head <sha>
 
 At most 15 changed files and a diff of at most 150 KB (150,000 bytes), lock files excluded,
-so that one reviewer can read the whole change. Binary changes count at their full size.
+so that one reviewer can read the whole change.
+
+The size is the text diff plus, for every binary file, the full size of its new version (or
+of the old one, if the file is deleted). Git's binary patches are compressed, so a large but
+compressible binary would otherwise count at a fraction of its size.
 """
 
 from __future__ import annotations
@@ -31,6 +35,23 @@ def git(*args: str) -> bytes:
     return r.stdout
 
 
+def binary_paths(rng: str) -> list[str]:
+    """Paths whose change git treats as binary: numstat reports them as "-<TAB>-<TAB>path"."""
+    out = git("diff", "--numstat", "-z", "--no-renames", "--no-textconv", rng)
+    paths = []
+    for row in out.split(b"\0"):
+        added, _, rest = row.partition(b"\t")
+        deleted, _, path = rest.partition(b"\t")
+        if added == b"-" and deleted == b"-" and path:
+            paths.append(path.decode())
+    return paths
+
+
+def blob_size(rev: str, path: str) -> int:
+    r = subprocess.run(["git", "cat-file", "-s", f"{rev}:{path}"], capture_output=True, check=False)
+    return int(r.stdout) if r.returncode == 0 else 0
+
+
 def measure(base: str, head: str) -> tuple[list[str], int]:
     """Return (changed non-lock files, diff size in bytes) for base...head."""
     rng = f"{base}...{head}"
@@ -38,10 +59,14 @@ def measure(base: str, head: str) -> tuple[list[str], int]:
     files = [p for p in names if not is_lock(p)]
     excludes = [f":(exclude,glob)**/{n}" for n in sorted(LOCK_FILES)]
     patch = git(
-        "diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", rng, "--", ".",
+        "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", rng, "--", ".",
         *excludes,
     )  # fmt: skip
-    return files, len(patch)
+    merge_base = git("merge-base", base, head).decode().strip()
+    binaries = sum(
+        blob_size(head, p) or blob_size(merge_base, p) for p in binary_paths(rng) if not is_lock(p)
+    )
+    return files, len(patch) + binaries
 
 
 def main(argv: list[str] | None = None) -> int:

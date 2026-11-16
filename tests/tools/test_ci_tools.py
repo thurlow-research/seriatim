@@ -182,6 +182,12 @@ def v6(*groups: str) -> str:
         # IPv4-mapped in hex form has no dotted quad: judged by the address it maps to.
         (v6("", "", "ffff", "a00", "1"), v6("", "", "ffff", "a00", "1")),
         (f"[{v6('', '', 'ffff', 'a00', '1')}]:443", v6("", "", "ffff", "a00", "1")),
+        # Sentence punctuation after an address doesn't hide it.
+        (f"host {v6('fe80', '', '1')}.", v6("fe80", "", "1")),
+        (f"host {v6('fe80', '', '1')}, then", v6("fe80", "", "1")),
+        (f"(host {v6('fe80', '', '1')})", v6("fe80", "", "1")),
+        (f"host {v6('fe80', '', '1')}: up", v6("fe80", "", "1")),
+        (f"{v6('a', '', '')}.", v6("a", "", "")),
     ],
 )
 def test_ip_disallowed(text, literal):
@@ -255,6 +261,36 @@ def test_pr_size_limits(repo, monkeypatch, capsys):
     files, size = pr_size.measure(head, big)
     assert size > pr_size.MAX_BYTES
     assert pr_size.main(["--base", head, "--head", big]) == 1
+
+
+@needs_git
+def test_pr_size_counts_binaries_at_full_size(repo, monkeypatch):
+    monkeypatch.chdir(repo)
+    base = run_git(repo, "rev-parse", "HEAD")
+    (repo / "zeros.bin").write_bytes(b"\0" * 1_000_000)  # compresses to a few KB as a patch
+    head = commit(repo, {})
+    files, size = pr_size.measure(base, head)
+    assert files == ["zeros.bin"] and size >= 1_000_000
+    assert pr_size.main(["--base", base, "--head", head]) == 1
+    gone = commit(repo, {"zeros.bin": None})
+    assert pr_size.measure(head, gone)[1] >= 1_000_000  # a deleted binary counts too
+
+
+def test_mutation_counts_generated_mutants(tmp_path):
+    pdir = tmp_path / "node"
+    meta = pdir / "mutants" / "seriatim_node"
+    meta.mkdir(parents=True)
+    (meta / "__init__.py.meta").write_text('{"exit_code_by_key": {}}')
+    (meta / "app.py.meta").write_text('{"exit_code_by_key": {"a": null, "b": 1}}')
+    files = ["seriatim_node/__init__.py", "seriatim_node/app.py"]
+    assert mutation.by_package(["node/" + f for f in files]) == {"node": files}
+    assert mutation.generated_mutants(pdir, files[:1]) == 0
+    assert mutation.generated_mutants(pdir, files) == 2
+    with pytest.raises(mutation.GateError):
+        mutation.generated_mutants(pdir, ["seriatim_node/missing.py"])
+    (meta / "bad.py.meta").write_text('{"exit_code_by_key": []}')
+    with pytest.raises(mutation.GateError):
+        mutation.generated_mutants(pdir, ["seriatim_node/bad.py"])
 
 
 def test_pr_size_needs_shas():

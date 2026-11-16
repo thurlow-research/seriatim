@@ -1441,8 +1441,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     keys or tokens. The allowed addresses are loopback (`127.0.0.0/8` and `::1`), `0.0.0.0`
     and the RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`,
     `203.0.113.0/24`).
-    - An IPv4-mapped IPv6 address (`::ffff:` followed by an IPv4 address, written dotted or
-      in hex) is judged by the IPv4 address it maps to, so a hex form can't hide a private
+    - An IPv4-mapped IPv6 address (in `::ffff:0:0/96`, the IPv4 part written dotted or in
+      hex) is judged by the IPv4 address it maps to, so a hex form can't hide a private
       address.
     - Every other IPv6 address is refused, the IPv6 documentation prefix (RFC 3849)
       included. A bare `::` is punctuation, not an address.
@@ -2037,8 +2037,11 @@ command output, and never just says "tests pass".
     field, an interrupted run, or categories that don't add up to its total (unchecked
     mutants).
   - **Nothing to score.** A PR that changes no Python file under `node/` or `gateway/`, or
-    whose changed files have no mutable code (zero scored mutants, such as a version-only
-    change), passes with a visible notice. It never computes a score from zero mutants.
+    whose changed files have no mutable code (mutmut generates no mutants, such as for a
+    version-only change), passes with a visible notice. It never computes a score from zero
+    mutants. mutmut then exits non-zero and writes no export, so the gate decides "no
+    mutants" from mutmut's own per-file records; a failed run that did generate mutants,
+    or a missing export after a successful run, still fails.
   - **How it runs** (TD-slice-1 Appendix B): from each package directory, with `only_mutate`
     set to the changed files, and with `tests/` and `contract/` staged beside the mutated
     code, so every test result really comes from a mutant.
@@ -2252,7 +2255,8 @@ command output, and never just says "tests pass".
   - an IP-literal check (`ip-literals`), over every tracked file, enforcing REQ-51;
   - the PPE suite;
   - a PR-size check (`pr-size`): ≤ 15 changed files (`uv.lock` excluded), and a diff of
-    ≤ 150 KB (150,000 bytes, binary changes counted at full size, `git diff --binary`), so
+    ≤ 150 KB (150,000 bytes: the text diff, plus the full size of every changed binary
+    file, because git's binary patches are compressed), so
     that one reviewer can read the whole change.
   - **The contract lint until slice 1.** With no `contract/` directory, `contract-lint`
     passes with a visible notice. Once anything exists under `contract/`, `openapi.yaml`

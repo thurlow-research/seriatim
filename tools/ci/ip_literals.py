@@ -3,7 +3,7 @@
 
 Scans every tracked file for IPv4 and IPv6 address literals. The only addresses allowed are
 loopback (127.0.0.0/8 and ::1), 0.0.0.0, and the RFC 5737 documentation ranges
-(192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). An IPv4-mapped IPv6 address (::ffff:...,
+(192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). An IPv4-mapped IPv6 address (in ::ffff:0:0/96,
 dotted or hex) is judged by the IPv4 address it maps to. Every other IPv6 address fails,
 the IPv6 documentation prefix (RFC 3849) included. A bare "::" is not an address.
 """
@@ -45,11 +45,18 @@ def find(data: bytes) -> list[tuple[int, str]]:
         text = m.group(1).decode("ascii")
         if not re.search(r"[0-9A-Fa-f]", text):
             continue  # a bare "::" is punctuation, not an address
-        try:
-            addr = ipaddress.IPv6Address(text)
-        except ValueError:
+        addr = None
+        while text:
+            try:
+                addr = ipaddress.IPv6Address(text)
+                break
+            except ValueError:
+                if text[-1] not in ".:":
+                    break
+                text = text[:-1]  # sentence punctuation after an address
+        if addr is None:
             continue
-        v6_spans.append(m.span(1))
+        v6_spans.append((m.start(1), m.start(1) + len(text)))
         if not allowed(addr):
             found.append((data.count(b"\n", 0, m.start()) + 1, text))
     for m in V4_RE.finditer(data):
