@@ -98,7 +98,9 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" trivy
       - name: Download the vulnerability database (a failed download fails the job)
         run: |
-          "$RUNNER_TEMP/trivy" fs --cache-dir "$RUNNER_TEMP/trivy-cache" --download-db-only
+          # DEMO 6: a database repository that doesn't exist, so the download must fail.
+          "$RUNNER_TEMP/trivy" fs --cache-dir "$RUNNER_TEMP/trivy-cache" --download-db-only \
+            --db-repository ghcr.io/thurlow-research/seriatim-demo-missing-trivy-db
       - name: Full report, every severity, to the job summary
         run: |
           set -euo pipefail
