@@ -1,6 +1,6 @@
 # TD — Slice 1: contract, sidecar gate, 429 and passthrough
 
-**Status:** revision 3, for review. **Date:** 2026-11-16.
+**Status:** revision 4, for review. **Date:** 2026-11-16.
 **Implements:** SPEC REQ-1 to REQ-7, REQ-10 to REQ-12b, REQ-15 (pre-auth form), REQ-18
 (S1 form), REQ-20 to REQ-26. **Architecture:** ADR-001 D1 to D4, D7, D8, D10 to D12.
 **Not in this slice:**
@@ -631,6 +631,12 @@ column shows the lease result for a gated request.
 | Ollama non-2xx (including 429) | passed through unchanged | — | freed (clean end) | `ok` (with `status`) |
 | Closing the upstream connection timed out or raised | as above | as above | **stuck** | adds `slot_stuck` (`CRITICAL`) |
 | Any other `Exception` | 500 `INTERNAL` (generic message; the traceback is in the log only) | abort | drains if sent upstream, else freed | `internal_error` (`ERROR`) |
+
+**"Freed" means released at once, with no drain** (SPEC REQ-10). That covers two cases: a
+rejection before anything was sent to Ollama, and a clean end, where Ollama's response,
+2xx or not, was read in full. Only "drains" starts a drain. For the node metrics (S4d), a request that took a
+slot and then ends in a "freed" 400, 408 or 413, or with the client gone while sending the
+body, counts once, as `rejected`, never also as `acquired`.
 
 If the client has already gone, writing an error reply fails. That failure is caught and
 logged at `DEBUG`, and it never changes the slot result.

@@ -1,6 +1,6 @@
 # Seriatim — Specification
 
-**Status:** revision 5, for review (Phase 1). **Date:** 2026-11-16.
+**Status:** revision 6, for review (Phase 1). **Date:** 2026-11-16.
 
 **Companion documents:**
 - [ADR-001](adr/ADR-001-architecture.md): architecture, contract, threat model, slice plan.
@@ -253,7 +253,13 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - **Unproven closure.** If closing the upstream connection fails or times out, closure is
     unproven. The slot then stays *stuck* until the sidecar restarts, health reports it, and
     it is never freed by a timer (REQ-11).
-  - A request rejected before anything was sent (413, 408, `BAD_PATH`) frees its slot at once.
+  - **Rejected before Ollama.** A request rejected after taking its slot but before
+    anything was sent to Ollama frees the slot at once, with **no drain**, because nothing
+    ran: 400 (`BAD_REQUEST_BODY`, `NUM_CTX_AMBIGUOUS`, `NUM_CTX_UNSUPPORTED_ROUTE`), 408
+    `REQUEST_BODY_TIMEOUT`, 413 `BODY_TOO_LARGE` (a body that grows past the limit), 422
+    `NUM_CTX_EXCEEDS_LIMIT`, and a client that disconnects while its body is being read.
+    (`BAD_PATH`, and a 413 on `Content-Length`, are answered before any slot is taken.) A failed connect to Ollama (502 `UPSTREAM_UNAVAILABLE`) sent
+    nothing either, and also frees the slot with no drain.
   - While a slot drains, `/seriatim/status` reports it, and new gated requests get the
     admission 429.
 
@@ -491,8 +497,10 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 - **REQ-17. Loaded models and slots (slice S4a).** Status includes:
   - Ollama's `/api/ps` list, unchanged. If `/api/ps` fails or cannot be parsed, the field is
     `loaded_models: null` with `loaded_models_error`, never an empty list.
-  - Each slot's state (free, held, draining or stuck), and for each holder its path, its model (when
-    known), its start time, its elapsed time and any time left to drain.
+  - Each slot's `state` (`free`, `held`, `draining` or `stuck`), and for each holder its
+    `path`, its `model` (when known), its `request_id`, `started_at`, `elapsed_s` and
+    `drain_remaining_s` (contract `Slot`). `path`, `model` and `request_id` are `null` for
+    `infer` keys (REQ-5).
 
   *Tests:* G6 (S1); ST1–ST3 (S4a: the `/api/ps` error state, slot details, and redaction for `infer` keys).
 - **REQ-18. Health (slice S1, extended in S4a and S4c).** `GET /seriatim/health` requires no
@@ -551,9 +559,13 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       `changed_by` recording that change.
     - **After `init-state`** (below), every field but `offline: false`, `epoch` and
       `revision: 0` is `null`.
-    - **Idempotent.** Repeating the current state keeps `since`. A repeated `offline`
-      replaces the reason and `changed_by`. A call that changes nothing still increments
-      `revision` only if it changed a field.
+    - **Idempotent.** A call that would change no field is a **no-op**: nothing is
+      written, `revision` doesn't change, and the 200 carries the current state. That holds
+      only while the state is persisted: after a fail-closed start (below), whose state is
+      in memory only, every `offline` or `online` call writes a fresh file. So a
+      repeated `online` on an online node does nothing. A repeated `offline` with a
+      different reason or key replaces `reason` and `changed_by`, keeps `since`, and
+      increments `revision`.
   - **While offline:**
     - **A new gated request** gets 503 `NODE_OFFLINE` (`retryable: false`,
       `replay_safe: true`). Ollama is not contacted.
@@ -607,8 +619,9 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     - **Independent of slots.** The admin state is separate from slot state. `online` never
       shortens the startup quarantine, a drain or a held slot. `offline` never frees or
       aborts one.
-  - **Visible.** `/seriatim/status` reports `admin_state` (offline, reason, since,
-    revision, and the key id that changed it), and health reports `offline` (REQ-18).
+  - **Visible.** `/seriatim/status` reports `admin_state` (contract `AdminState`:
+    `offline`, `reason`, `since`, `changed_by`, the key id that changed it, `epoch` and
+    `revision`), and health reports `offline` (REQ-18).
     Health carries no reason text: it is unauthenticated, and the reason is operator
     text (T12). Every change is logged
     at `WARNING`, with the key id, the reason and the previous state.
@@ -658,13 +671,17 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 
       A missing file is never taken as a first start: only `init-state` makes one.
     - **Recovery.** An explicit `online` call writes a fresh file in the new epoch
-      (`revision: 1`), first recreating a missing state directory with the permissions or
-      ACL above, and the node returns to service. The gateway accepts it, because the
-      epoch is new (REQ-42a), whatever revision it held before.
+      (`revision: 1`), and the node returns to service. The gateway accepts it, because the
+      epoch is new (REQ-42a), whatever revision it held before. An explicit `offline` call
+      also writes a fresh file (`revision: 1`), keeping the node offline with the
+      operator's reason.
+    - **A missing state directory** is recreated by every write, `offline` and `online`
+      alike, with the ownership and permissions or ACL above, before the temporary file is
+      opened.
     - **A reboot during maintenance** therefore never brings a GPU back into service, even
       where the lock directory is on a tmpfs.
 
-  *Tests:* AS1–AS18:
+  *Tests:* AS1–AS20:
   - offline refuses new gated work with `NODE_OFFLINE`, while a request already admitted
     finishes;
   - **barrier tests:** an `offline` that commits while a request is between "read state"
@@ -687,7 +704,9 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     process kill between persisting and publishing, each leave memory and disk agreeing
     after restart;
   - **sidecar-side recovery:** after corruption, `online` recreates the directory if needed
-    and reports `revision: 1` in a new epoch (the gateway side is GA, in S8);
+    and reports `revision: 1` in a new epoch, and so does `offline`, staying offline (the
+    gateway side is GA, in S8);
+  - a repeated `online` on an online node writes nothing and keeps `revision`;
   - gated admin requests (`/api/create`, an unknown endpoint) get `NODE_OFFLINE`, while
     ungated admin requests are served;
   - state I/O never runs under the gate's lock: with an injected slow fsync during an
@@ -808,6 +827,10 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     It goes to the highest-priority healthy node that lists the model, and otherwise gets
     the first two errors below (`DISCOVERY_INCOMPLETE`, `MODEL_NOT_FOUND`) or
     `GPU_OFFLINE`. An operator can therefore inspect a model before writing a rule for it.
+    - **Named in `X-Seriatim-Node`,** it goes to that node even when the node is `offline`,
+      because an offline sidecar still serves ungated requests (REQ-19a), so a model can be
+      inspected during maintenance. It is not forwarded to an `unhealthy` node; that gets
+      `GPU_OFFLINE`.
   - **Reading the request.** The gateway reads only `model` from the body. It gets 400
     `BAD_REQUEST_BODY` from the gateway, before any node is contacted, if the body is not
     valid JSON, its top level is not an object, the top level has duplicate keys, or
@@ -884,13 +907,24 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     verdict:
     - `unknown` if its last discovery attempt failed, or none has succeeded yet;
     - otherwise `true` or `false`, from that discovery;
-    - **for an `offline` node,** the value from its last successful discovery, even if
-      later attempts failed. A node taken offline and rebooted for maintenance therefore
-      doesn't turn every unknown model into `DISCOVERY_INCOMPLETE`.
+    - **for an `offline` or `unhealthy` node** that has been discovered at least once, the
+      value from its last successful discovery, even if later attempts failed. A node taken
+      offline and rebooted, or one that crashed while it was the only holder of a model,
+      therefore gives `GPU_OFFLINE`, not `DISCOVERY_INCOMPLETE`. That retained value only
+      chooses the error; it never makes a node a candidate.
+    - **Back in service.** When an `offline` or `unhealthy` node becomes routable again, its
+      `lists_model` becomes `unknown` until its `/api/tags` is refreshed (REQ-42a), because
+      its models may have changed meanwhile.
 
     **The rules are also applied to `offline` and `unhealthy` nodes**, on their last known
     metadata, to give a `rule_verdict` (`eligible`, `not_eligible`, `no_size_policy` or
     `size_unknown`). It is never used to route, only to choose the error.
+    - **`rule_verdict` is `null`** unless `lists_model` is `true`: without the node's own
+      entry for the model there is no metadata to judge.
+    - **A node that could still be eligible.** A node with `lists_model: unknown` *could be
+      eligible* unless its rules exclude the model by name alone: it is not in the model's
+      eligible-nodes list, or it is `listed_only` and not named there. Otherwise (it is in the
+      list, `unlimited`, or `max_params_b` with the size not yet known) it could be eligible.
 
     The error order below is defined on `lists_model`, not on the verdict. So an
     unreachable node, whose verdict is `unhealthy` and whose `lists_model` is `unknown`,
@@ -910,14 +944,19 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
        could run there once the node is back. Existing clients already treat this code as
        fail-fast (ruling Q7), so it has `retryable: false` and **no** `Retry-After`. The verdicts in
        `nodes` tell an admin switch apart from a failure.
-    4. **`SIZE_POLICY_MISSING` (503, `retryable: false`).** Some node that lists the model
+    4. **`DISCOVERY_INCOMPLETE` (503, `Retry-After`)** again, when some node with
+       `lists_model: unknown` could be eligible (above). That node may hold the model and
+       take it soon, so a retryable answer comes before the operator errors below, which
+       another node's rules would otherwise give.
+    5. **`SIZE_POLICY_MISSING` (503, `retryable: false`).** Some node that lists the model
        has `no_size_policy` as its verdict or its `rule_verdict`. The operator has to add a rule; retrying won't help.
        The `hint` names the node and the four ways to fix it (an eligible-nodes list,
        `unlimited`, `listed_only`, `max_params_b`).
-    5. **`MODEL_SIZE_UNKNOWN` (422).** Some node that lists the model has `size_unknown` as
+    6. **`MODEL_SIZE_UNKNOWN` (422).** Some node that lists the model has `size_unknown` as
        its verdict or its `rule_verdict`. `size_overrides` fixes it.
-    6. **`MODEL_NOT_ELIGIBLE` (422).** Every node that lists the model has `not_eligible` as
-       its verdict or its `rule_verdict`. No node could run it, even with every node back.
+    7. **`MODEL_NOT_ELIGIBLE` (422).** Every node that lists the model has `not_eligible` as
+       its verdict or its `rule_verdict`, and no node with `lists_model: unknown` could be
+       eligible. No node could run it, even with every node back.
 
     **Every one of these lists every configured node's verdict** in `nodes`, each with its
     id, verdict and reason (contract `ErrorEnvelope.nodes`).
@@ -933,9 +972,11 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 - **REQ-34. Unknown model vs unknown state.**
   - 404 `MODEL_NOT_FOUND` only when **every** configured node answered its last discovery
     with a valid `/api/tags`, and none lists the model.
-  - If a node is unreachable, or answered with something that cannot be parsed, its state is
-    unknown. A model not found on the others then gets 503 `DISCOVERY_INCOMPLETE` with
-    `Retry-After`.
+  - If a node has **never** been discovered, or its last discovery failed or could not be
+    parsed while it is healthy and online, its state is unknown. A model not found on the
+    others then gets 503 `DISCOVERY_INCOMPLETE` with `Retry-After`.
+  - An `offline` or `unhealthy` node that was discovered before keeps its last successful
+    answer (REQ-32), so a model it listed gets `GPU_OFFLINE`, not `DISCOVERY_INCOMPLETE`.
 - **REQ-35. No healthy node.** If a node that lists the model and whose rules admit it
   is `unhealthy` or `offline`, and no node is a candidate (REQ-32, case 3), the request gets 503
   `GPU_OFFLINE` with `retryable: false`, its per-node verdicts, and no `Retry-After`. The
@@ -960,19 +1001,34 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     node id tried>` and `X-Reroute-Reason`, with the same values as the metric's `reason`.
     Nodes skipped without being tried are not reported there.
 - **REQ-37. Node failure.**
-  - **The gateway MUST try the next eligible candidate** at once, in priority order and once
-    each, after any of these replay-safe answers. In none of them was Ollama contacted:
-    - a failed connect to the node;
-    - `X-Seriatim-Gate: busy` (REQ-36);
-    - `X-Seriatim-Gate: refused`, with `NODE_OFFLINE`, `OLLAMA_EXPOSED`,
-      `EXPOSURE_UNVERIFIED`, `NODE_STARTING` or `NUM_CTX_EXCEEDS_LIMIT` (REQ-8: the nodes
-      may have different limits);
-    - `NODE_SATURATED`;
-    - the sidecar's own 502 `UPSTREAM_UNAVAILABLE`, which means its connect to Ollama
-      failed, so Ollama received nothing.
+  - **One failover rule.** The gateway MUST try the next eligible candidate at once, in
+    priority order and once each, exactly when one of these holds. In none of them was
+    Ollama contacted:
+    1. **The gateway's connect to the node failed.** The gateway records it as 502
+       `UPSTREAM_UNAVAILABLE` with `source: gateway`, `replay_safe: true` and the node's
+       id, and that is the answer the client gets if it is the one chosen below.
+    2. **The node answered with an `ErrorEnvelope`** whose `source` is `sidecar` and whose
+       `replay_safe` is `true`, and whose code and `X-Seriatim-Gate` value are one of these
+       pairs:
 
-    The decision is taken on the header together with an `ErrorEnvelope` whose
-    `source` is `sidecar`, never on the status code alone.
+       | `error_code` | `X-Seriatim-Gate` | reroute reason |
+       |---|---|---|
+       | `GPU_BUSY` (REQ-36) | `busy` | `busy` |
+       | `NODE_OFFLINE` | `refused` | `offline` |
+       | `OLLAMA_EXPOSED`, `EXPOSURE_UNVERIFIED` | `refused` | `exposure` |
+       | `NODE_STARTING` | `refused` | `starting` |
+       | `NUM_CTX_EXCEEDS_LIMIT` (REQ-8: the nodes may have different limits) | `refused` | `num_ctx_limit` |
+       | `NODE_SATURATED` | `ungated` | `saturated` |
+       | `UPSTREAM_UNAVAILABLE` (the sidecar's connect to Ollama failed) | `acquired` or `ungated` | `unreachable` |
+
+       A gateway connect failure (case 1) also has the reason `unreachable`.
+
+    Nothing else fails over: not the status code alone, not an envelope with another
+    `source`, and not another replay-safe sidecar code (such as `BAD_PATH`), which every
+    node would answer the same way.
+  - **Which reason is reported.** `X-Rerouted-From` names the first node tried, and
+    `X-Reroute-Reason` is that node's reason from the table. Each spill-over is counted
+    separately in `spillovers_total` with its own node and reason (REQ-67).
   - **When every candidate refuses,** the client gets one answer, the first that applies:
     1. if any candidate was busy, that 429, with the smallest `Retry-After`;
     2. if any refusal was retryable (`NODE_STARTING`, `EXPOSURE_UNVERIFIED`,
@@ -992,19 +1048,24 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     Those nodes are marked down or busy as appropriate.
   - A failure after the request reached Ollama is never retried; the client gets it as in
     REQ-24.
-  - A node that is down is checked again through `/seriatim/health` every 15 s.
+  - A node that is down is checked again through `/seriatim/health` every 15 s. When it
+    answers healthy again, its `lists_model` becomes `unknown`, its `/api/tags` is refreshed
+    at once, and it is not a candidate until that succeeds (REQ-42a).
 - **REQ-38. Merged views, in the standard shapes (maintainer decision).** A response on an
   Ollama-native (`/api/*`) or OpenAI-compatible (`/v1/*`) route has **exactly Ollama's
   schema**. Seriatim adds no body field there, not even in a merged view. Seriatim's own
   data lives on `/seriatim/*` paths and in `X-Seriatim-*` headers. Seriatim's own refusals
   are its `ErrorEnvelope`, marked by `X-Seriatim-*` headers, as before.
   - **`GET /api/tags`:** one entry per model name, so a client sees one model once.
-    - **The source node** for a name is the highest-priority node whose rules admit that
-      model (REQ-32), or, if none does, the highest-priority node that lists it. The entry
-      is that node's, unchanged, in Ollama's fields only. So the entry describes the model
-      that requests are actually routed to.
+    - **The source node** for a name is chosen among the nodes whose answer lists it, by
+      priority, in this order: first a node whose verdict is `eligible`; then one whose
+      `rule_verdict` is `eligible` (it is offline or unhealthy now); then any node that
+      answered. The entry is that node's, unchanged, in Ollama's fields only. So the entry
+      describes the model that requests are routed to first.
     - **Different models under one name** (the nodes' digests differ) still give one entry,
-      the source node's. Which node holds which digest is in `/seriatim/models`.
+      the source node's. That entry is **representative**: if the source node is busy, a
+      request may fail over to a node with a different digest under the same name. Which
+      node holds which digest is in `/seriatim/models`, with `digests_differ`.
     - **Order:** by `modified_at`, newest first, as Ollama orders its own list, then by
       name. `modified_at` is compared as a parsed instant, because each node writes it in
       its own time zone and precision.
@@ -1020,6 +1081,9 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - **`GET /v1/models`:** OpenAI's list shape exactly: one entry per model id, from the same
     source node as `/api/tags`, so `created` and `owned_by` agree with it. Ordered by
     `created`, newest first, then by id.
+    - **If the source node's `/v1/models` fails,** or doesn't list the id, the entry comes
+      from the next node in the same order whose `/v1/models` lists it, and the source node
+      is named in `X-Seriatim-Partial`. If no node's list has it, the id is left out.
   - **Partial results** are signalled only by the `X-Seriatim-Partial` header, which names
     the nodes that didn't answer, or whose answer didn't validate against the plain shape
     and was therefore left out. If no valid answer remains, the view gets 503
@@ -1057,6 +1121,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - `/seriatim/nodes` (scope `infer`, redacted for `infer` keys as REQ-5 says) returns, for
     each node:
     - its id, health, priority, last check time, Ollama version and status;
+    - its `admin_state`, and `reconciling` while the gateway reconciles a new epoch
+      (REQ-42a);
     - **its configured eligibility:** `size_policy` (`unlimited`, `listed_only`,
       `max_params_b` or `none`),
       `max_params_b` when set, and `eligible_for_models`: the models whose eligible-nodes
@@ -1092,7 +1158,9 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     - **Where it comes from:**
       - **authoritative:** the sidecar's `/seriatim/status`, read with the node's admin key
         every 15 s, including while health is degraded, and the `AdminState` returned by a
-        confirmed admin call, applied at once, so routing changes before the next read;
+        confirmed admin call. A confirmed call **in the held epoch** is applied at once, so
+        routing changes before the next read; one in a new epoch goes through
+        reconciliation (below);
       - **hints only:** health saying `offline`, and a `NODE_OFFLINE` answer. Neither
         carries an epoch or revision, so neither overwrites the observation. Each marks the
         node offline for routing and triggers an immediate status read. A hint whose
@@ -1108,24 +1176,51 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
         is fenced: its late answer, if one ever arrives, is discarded.
       - **Same epoch:** an observation with a lower `revision` than the one held is
         ignored.
-      - **A different epoch:** the gateway discards the held observation, and applies the
-        next status read it starts **after** seeing the new epoch. That fresh read decides,
-        so a recovered node is accepted whatever revision the gateway held, and no answer
-        from before the recovery can win.
-  - **Coming back online.** When a node's observation turns from offline to online, its
-    `lists_model` becomes `unknown` and the gateway refreshes its `/api/tags` before routing
-    to it, because models may have changed during maintenance. Until then the node is not a
-    candidate.
-    - **After a confirmed `online` call,** the gateway does that refresh before it returns
-      the 200, bounded by the discovery timeout, so a request sent right after the 200 can
-      be routed to the node. If the refresh fails, the 200 still stands, and the node waits
-      for the next discovery.
+      - **A different epoch: reconciliation.** Any authoritative answer, a status read or
+        a confirmed admin call, that carries an epoch other than the held one puts the node
+        in the **reconciling** state:
+        1. **Out of routing at once.** Its verdict is `unhealthy` with the reason
+           `admin_state_reconciling`, and health hints don't change that. The held
+           observation is kept for display only.
+        2. **One immediate fenced status read,** under the per-node lock, started after the
+           new epoch was seen. The answer that triggered reconciliation never decides on
+           its own.
+        3. **It decides.** If that read shows the same new epoch, its `AdminState` becomes
+           the held observation (any revision is accepted, because the epoch is new) and the
+           node leaves reconciling. If it shows yet another epoch, or fails, the read is
+           retried up to 3 times, 1 s apart.
+        4. **Not yet routable.** A new epoch means the sidecar restarted or recovered, so its
+           models may have changed. On leaving reconciling, its `lists_model` becomes
+           `unknown` and it is routed to only after its `/api/tags` is refreshed (below),
+           whatever its state was before.
+        5. **Bounded.** After those retries the node stays reconciling, out of routing, and
+           the regular 15 s status read tries again. No answer from before the new epoch can
+           end reconciliation, because every read in it was started after the epoch was
+           seen.
+  - **Coming back into service.** When a node's observation turns from offline to online,
+    or it leaves reconciling, or it turns from unhealthy to healthy, its `lists_model`
+    becomes `unknown` and the gateway refreshes its `/api/tags` before routing to it,
+    because models may have changed meanwhile. Until then the node is not a candidate. Two
+    gates must both be passed to route: a confirmed online state in the current epoch, and
+    a successful discovery after it.
+    - **After a confirmed `online` call,** the gateway does, in order and still holding
+      the per-node lock: reconciliation's status read, if the answer was in a new epoch;
+      then that refresh, bounded by the discovery timeout; then the 200. A request sent
+      right after the 200 can therefore be routed to the node.
+      - **When a new-epoch `online` takes effect:** when the reconciliation read shows that
+        epoch with `offline: false`. The node becomes routable when the discovery refresh
+        after it succeeds.
+      - **If the read or the refresh fails,** the 200 still stands, because the sidecar
+        committed. The node stays out of routing until reconciliation, then discovery,
+        succeeds in the background.
     - **After a status read** that shows the change, the refresh runs in the background.
   - **Routing.** An offline node is out of routing (verdict `offline`, REQ-32), so requests
     spill over to the other eligible nodes.
-  - **Visible.** `/seriatim/nodes` shows each node's `admin_state`: offline, reason, since.
+  - **Visible.** `/seriatim/nodes` shows each node's full `admin_state`: `offline`,
+    `reason`, `since`, `changed_by`, `epoch` and `revision` (redacted for `infer` keys, REQ-5),
+    and whether the gateway is reconciling it (below).
 
-  *Tests:* GA1–GA12:
+  *Tests:* GA1–GA14:
   - the gateway forwards the call and reports success only after the sidecar confirms;
   - an unreachable sidecar gives 502, and the node's state is unchanged in the view;
   - a timeout after the sidecar committed gives 502 with the outcome unknown, and the next
@@ -1134,8 +1229,12 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     `NODE_OFFLINE` never overwrite the observation;
   - **barrier tests for epochs:** a status read that snapshots the old epoch while a
     confirmed admin call reports the new one; a timed-out call whose answer arrives after
-    recovery (fenced); in each, the fresh read after the new epoch decides, and the node is
-    routed again after recovery although the gateway held a higher revision;
+    recovery (fenced); in each, the node is out of routing while reconciling, the
+    reconciliation read decides, and the node is routed again after recovery although the
+    gateway held a higher revision;
+  - **reconciliation bounds:** a reconciliation read that fails 3 times leaves the node out
+    of routing until a later read succeeds; a new-epoch `online` returns 200 only after its
+    reconciliation read and refresh, or with the node still reconciling if they failed;
   - after `online`, the node is not routed to until its discovery has been refreshed;
   - an unknown id gives 404;
   - requests fail over around an offline node;
@@ -1259,16 +1358,37 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     - `build_info{version}` and
       `metrics_timestamp_seconds`, which lets a stale file be alerted on;
     - `slots{state}`: the number of slots in each of `free`, `held`, `draining`, `stuck`;
-    - `admissions_total{result}`: `acquired`, `busy`, `refused`. `refused` covers a
-      request turned away by `NODE_STARTING`, `NODE_OFFLINE`, `OLLAMA_EXPOSED`,
-      `EXPOSURE_UNVERIFIED` or `NUM_CTX_EXCEEDS_LIMIT` (every answer with
-      `X-Seriatim-Gate: refused`);
+    - `admissions_total{result}`: each gated request is counted **once**, by its final
+      admission outcome:
+      - `acquired`: it took a slot and went on to Ollama, even if the connect to Ollama then
+        failed;
+      - `busy`: the admission 429;
+      - `refused`: every answer with `X-Seriatim-Gate: refused` (`NODE_STARTING`,
+        `NODE_OFFLINE`, `OLLAMA_EXPOSED`, `EXPOSURE_UNVERIFIED`, and
+        `NUM_CTX_EXCEEDS_LIMIT`, which is decided after the slot was taken);
+      - `rejected`: it took a slot and then ended before Ollama, with a 400, 408 or 413, or
+        because the client disconnected while its body was being read (REQ-10).
+
+      A request that took a slot and was then refused or rejected is never also counted as
+      `acquired`. A gated request turned away before the admission check (a bad path, or a
+      413 on its `Content-Length`) is not an admission, and is counted only in
+      `requests_total` and `errors_total`;
     - `requests_total{kind, status}`: `kind` is `gated`, `ungated` or `seriatim`;
       `status` is the HTTP status class (`2xx`, `4xx`, `5xx`);
-    - `errors_total{error_code}`, for every code in the contract;
+    - `errors_total{error_code}`, for every code the **sidecar** can produce (the codes
+      marked "sidecar" or "both" in ADR-001 §5.4), including in-stream
+      `UPSTREAM_STREAM_BROKEN` records. Gateway-only codes never appear in the sidecar's
+      file;
     - `hold_seconds`: a histogram of gated slot hold times, with buckets 1, 5, 15, 60,
       300, 900 and 3600 s;
-    - `drains_total{cause}`: `disconnect`, `deadline`, `upstream_error`, `cancel`;
+    - `drains_total{cause}`, one per abnormal end (REQ-10):
+      - `disconnect`: the client went away;
+      - `deadline`: the hold limit passed (`LOCK_HOLD_EXCEEDED`);
+      - `upstream_error`: Ollama failed after the request was sent
+        (`UPSTREAM_PROTOCOL_ERROR`, `UPSTREAM_STREAM_BROKEN`);
+      - `cancel`: an `INTERNAL` error after sending, or a shutdown that cut a request off.
+
+      A rejection before Ollama (REQ-10) has no drain, so it has no cause;
     - `admin_offline` (0 or 1), `starting` (0 or 1);
     - `exposure{state}`: 1 for the current state of `local_only`, `exposed` or
       `unverified`;
@@ -1572,43 +1692,93 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
     - **release:** `vX.Y.Z`, a full release, for production.
 
     The same commit can be tagged rc first, then released.
-  - **Who may publish:** tag rules allow only the maintainer to create `v*` tags, and the
-    release job runs in a `release` environment that the maintainer must approve
-    (Repository settings, §7.9).
-- **REQ-68a. Installers verify before installing.** The install scripts (REQ-57, REQ-58) and
-  the gateway deployment check each asset's checksum and its attestation
-  (`gh attestation verify`, against this repository's release workflow identity) before
-  installing. Any failure is a hard stop.
-- **REQ-68b. Dependency updates.** Dependabot proposes updates to `uv.lock` and to the
-  Actions SHAs, grouped weekly. They go through full CI, and are never auto-merged.
+  - **Who may publish.**
+    - **Tags:** only the maintainer may create a `v*` tag, and **no one** may move or delete
+      one, so a tag names one commit forever. The repository's immutable-releases setting
+      also stops a published release's assets from being replaced (§7.9).
+    - **Credentials:** only `release.yml`'s publish job holds write permissions
+      (`contents: write`, `packages: write`, `id-token: write`, `attestations: write`), and
+      it runs in the `release` environment, which the maintainer must approve and which
+      accepts only `v*` tags. That approval applies to every `v*` tag, rc included. Every
+      other workflow has no write permission to contents or packages, and no personal token
+      publishes anything.
+    - **Publishing order,** because immutable releases can't take assets once published:
+      `release.yml` creates the release as a draft, uploads every asset and its checksum
+      list, attests them, and only then publishes it (as a pre-release for an rc).
+- **REQ-68a. Installers verify before installing.** The install scripts (REQ-57, REQ-58),
+  the gateway deployment and the follower (REQ-69) install a release only after all of
+  these hold, for the **exact tag they expect**. Any failure is a hard stop.
+  - **The tag's commit.** The expected tag `vX.Y.Z[-rc.N]` is resolved to its commit in
+    this repository. Tags are immutable (REQ-68), so that commit is fixed.
+  - **The checksum:** each asset's SHA-256 matches the release's checksum list.
+  - **The attestation, bound to tag, commit and digest:** `gh attestation verify` on each
+    asset, and on the image as `oci://ghcr.io/…@sha256:<digest>`, with:
+    - `--repo` this repository;
+    - `--signer-workflow` this repository's `.github/workflows/release.yml`;
+    - `--source-ref refs/tags/<expected tag>`;
+    - `--source-digest <that commit>`;
+    - `--deny-self-hosted-runners`.
 
+    An older release, or an rc, therefore can't pass as a newer or full release, even
+    though the same workflow built it.
+  - **The version inside matches the tag.** For tag `vX.Y.Z` the package's own version is
+    `X.Y.Z`; for `vX.Y.Z-rc.N` it is the PEP 440 form `X.Y.ZrcN`. The image's
+    `org.opencontainers.image.version` label is the tag without its leading `v` (`X.Y.Z` or
+    `X.Y.Z-rc.N`).
+  - **The channel:** the release channel accepts only `vX.Y.Z` tags of full releases,
+    never an rc or a release marked as a pre-release.
 ### 7.7 The release follower (a slice right after S12)
 
 Releases are the only thing that will deploy. This replaces the deploy-branch design of
-revision 2, and with it both revision-2 blocking findings: there is no promotion App and no
-ruleset bypass for one.
+revision 2, and with it both revision-2 blocking findings: the follower needs no promotion App
+and no ruleset bypass. (The interim deployment, §7.8, uses an App only to open pull requests,
+with no bypass and no push to `ppe` or `prod`.)
 
 - **REQ-69. The follower.** A generic, config-driven host agent in `deploy/`. Its config
   sets the channel, the install path or image, the service name and the health URL. No host
   appears in the repository. It:
   - polls GitHub Releases for its channel;
-  - verifies the checksum and the attestation (REQ-68a);
+  - verifies each candidate exactly as REQ-68a requires;
   - installs side by side: a new venv, or the image by digest;
   - runs the health and local-only checks, then switches;
-  - **rolls back automatically** to the last-good version if a check fails, and holds the
-    failed version, so it doesn't loop;
-  - logs and reports the version it runs, in status and in metrics.
+  - **rolls back automatically** to the last-good version if a check fails;
+  - logs and reports the version, tag, commit and digest it runs, in status and in
+    metrics.
 
   It covers both the sidecar (Windows and macOS services) and the gateway container.
+  - **Channels and their order.**
+    - **Pre-release** accepts `vX.Y.Z-rc.N` and `vX.Y.Z`; **release** accepts only `vX.Y.Z`
+      (REQ-68a).
+    - Versions are ordered as semantic versions, an rc before its release. The follower
+      installs only a version **newer** than its last-good one.
+  - **Durable record.** In its own state directory (owned like REQ-19a's, written
+    atomically and durably), the follower keeps:
+    - the current and last-good versions, each with tag, commit and artifact digests;
+    - the held versions;
+    - the pin, if any.
+
+    A missing or unreadable record fails safe: the follower keeps running whatever is
+    installed, installs nothing, and reports the error until an operator repairs it.
+  - **Anti-downgrade.** A version older than the last-good one is refused, even if it
+    verifies, unless the operator **pins** it in the host's local follower config, by tag
+    and digest. A pin is never read from GitHub or from any release.
+  - **Cached, verified rollback.** The last-good version's artifacts stay on disk, with
+    their digests in the record. Rollback re-checks those digests and needs no network.
+  - **Held versions.** A version that failed its checks is held in the record and never
+    retried, until the operator clears the hold. A newer version is still considered.
+  - **Rollback that fails** leaves an explicit `rollback_failed` state, reported in status
+    and metrics, and the follower then does nothing more until an operator acts.
+  - **GitHub unavailable** (an outage, a rate limit, or an attestation lookup that fails):
+    the follower keeps running the current version, retries with backoff up to once an
+    hour, reports the condition, and never installs anything it could not fully verify.
   - **PPE follows the pre-release channel,** with the same follower, so every rc exercises
     the code path production uses before any full release exists. Production follows the
     release channel.
   - **Promotion is a human action.** The maintainer publishes `vX.Y.Z` only after the
     matching rc has passed PPE.
   - **Carried over from the old deferred list:** one captured version used throughout,
-    with immutable artifacts and frozen dependencies; verified rollback health, with an
-    explicit state when rollback fails; and honest wording for a multi-node rollout, which
-    is best effort, one node at a time, not coordinated.
+    with immutable artifacts and frozen dependencies; and honest wording for a multi-node
+    rollout, which is best effort, one node at a time, not coordinated.
   - **Still an open problem:** an automated check, before a full release is allowed, that
     the rc passed PPE. It needs a check whose source can be authenticated (the revision-2
     provenance finding), so it is not designed here.
@@ -1629,52 +1799,144 @@ before S12. It is temporary.
   - **Promotion is a pull request the maintainer approves.** Nobody pushes `ppe` or `prod`
     directly, and no App may bypass their ruleset. GitHub merges pull requests with a merge
     commit (it can't fast-forward), so each promotion adds one merge commit.
+  - **The flow, with the maintainer as the gate:**
+    1. a branch is deployed to `ppe` for testing;
+    2. it is merged to `main`, through the usual review;
+    3. `main` is deployed to `ppe`;
+    4. a smoke test runs on PPE;
+    5. `main` is deployed to `prod`.
+
+    Before approving the `prod` promotion, the maintainer checks that the same `main` commit
+    passed step 4; if `main` has moved since, steps 3 and 4 run again. Automating that
+    check stays deferred, because it needs a PPE result whose source can be authenticated
+    (§7.7).
   - **Sources:**
-    - **`ppe`:** any branch of this repository, so a branch can be tested on the PPE host
-      before it merges. **Never a fork.**
-    - **`prod`:** **only `main`.** So production always runs a `main` commit, which passed
-      every required check there.
+    - **`ppe`:** only a `promote/ppe-<sha12>` branch of this repository, made by the
+      promotion builder (below) from any branch of this repository. **Never a fork.**
+    - **`prod`:** **only `main`**, as a plain pull request. `prod` only ever merges `main`
+      commits, so its merged tree always equals the `main` commit's.
+  - **The promotion builder** (`deploy/promote-ppe.py`, a stdlib Python script using the
+    REST API). It exists because a merge into `ppe` would otherwise keep an abandoned
+    branch's changes, after which the tree check below fails forever, and the ruleset
+    forbids any reset.
+    - **What it does,** given a source branch:
+      1. reads the source head `S` and the `ppe` tip `T`, and refuses if `S`'s `.github/`
+         differs from `main`'s;
+      2. creates a commit `P` whose tree is **exactly `S`'s tree**, with `T` as its first
+         parent and `S` as its second (`git commit-tree S^{tree} -p T -p S`, done through
+         the git-data API);
+      3. pushes `promote/ppe-<first 12 hex of S>` at `P`;
+      4. opens the pull request into `ppe`, naming `S` and the source branch.
+      - **Repeated promotions.** If `promote/ppe-<sha12>` already exists, with an open pull
+        request whose commit still has the current `ppe` tip as its first parent, the
+        builder reports that pull request and stops. Otherwise it rebuilds the branch on the
+        current `ppe` tip, force-updates it (only the App may), and reuses or opens the pull
+        request. So promoting A, then B, then A again works.
+
+      While `T` is still the `ppe` tip, `T` is the merge base, so the merge's tree equals
+      `S`'s tree. If `ppe` has moved, the promotion is out of date: the ruleset blocks its
+      merge, `promotion-source` refuses it, and the builder rebuilds it on the new tip.
+    - **Who runs it, as whom.** The dev session runs it locally at the maintainer's request,
+      with a short-lived `seriatim-worker` App token from the environment (`GH_TOKEN`). No
+      App key sits in Actions secrets.
+      - It can't use a workflow's `GITHUB_TOKEN`: branches and pull requests made with it
+        trigger no workflows, so `promotion-source` would never run and its required check
+        would block the merge.
+      - The bot opens the pull request, so the maintainer, who must approve it, is never
+        its author.
+      - ADR-001 D16 records the choice, and T21 its threat.
   - **The `promotion-source` check** (`.github/workflows/promotion-source.yml`) is required
-    on both branches:
-    - it runs on `pull_request_target`, with `permissions: {}` and no checkout, so it never
-      runs code from the pull request. It must be `pull_request_target`: under
-      `pull_request` the workflow file would come from the pull request, which could edit it
-      to pass;
-    - for either base, it fails unless the head repository is this repository;
-    - for base `prod`, it also fails unless the head branch is `main`;
-    - GitHub runs a `pull_request_target` workflow from the repository's default branch,
-      so this file must be on `main` before the check is made required;
-    - binding the check to the GitHub Actions app keeps other integrations out, but any
-      workflow in this repository could report a check of the same name. So the deploy job
-      checks the source again itself, and changes to `.github/workflows/` need the code
-      owner's review;
-    - event values reach it only through `if:` or `env:`, never interpolated into `run:`.
+    on both branches.
+    - **How it runs:** on `pull_request_target`, with `permissions: contents: read` and no
+      checkout, so it never runs code from the pull request. It reads only the event and
+      the REST API.
+      - It must be `pull_request_target`: under `pull_request` the workflow file would come
+        from the pull request, which could edit it to pass.
+      - GitHub runs a `pull_request_target` workflow from the default branch. **`main` stays
+        the default branch,** a protected invariant (§7.9). The check fails if the event
+        reports another default branch.
+    - **What it refuses:**
+      - **any base:** a head repository other than this repository;
+      - **`prod`:** a head branch other than `main`;
+      - **`ppe`:**
+        - a head branch not named `promote/ppe-<sha12>`;
+        - a head commit that is not a two-parent commit whose tree equals its second
+          parent's, with that second parent's first 12 hex characters in the branch name,
+          and whose first parent is the **current `ppe` tip**. Only then is the merge's tree
+          exactly the source's; a promotion built on an older tip is refused and rebuilt;
+        - **a tree that differs from `main`'s under `.github/`.** Workflow changes reach
+          `ppe` only through `main`. It compares the `.github` subtree of the head commit with
+          `main`'s, through the git-trees API.
+    - **When it runs:** on `opened`, `synchronize`, `reopened` and `edited`, so a pull
+      request retargeted to another base is checked again.
+    - **Event values** reach it only through `if:` or `env:`, never interpolated into `run:`.
+    - **Its limits, and why a counterfeit check can't help.** Binding the check to the
+      GitHub Actions app keeps other integrations out, but any Actions job named
+      `promotion-source` would satisfy it. A pull request's `pull_request` workflows come from
+      its own tree, so a counterfeit needs a promotion tree whose `.github/` differs from
+      `main`'s. That can't be built:
+      - only the `seriatim-worker` App can create or update a `promote/**` branch (ruleset
+        `promote-branches`, §7.9), and `ppe` accepts only those branches;
+      - the builder refuses a source whose `.github/` differs from `main`'s, before it
+        creates anything.
+
+      So every workflow that can run on a `ppe` promotion pull request is one of `main`'s,
+      which passed code-owner review. A `prod` promotion's tree is a `main` commit's. Where
+      the organisation can require a workflow by rule (an organisation-required workflow),
+      that is stronger still, and §7.9 prefers it.
   - **The deploy workflow** (`.github/workflows/deploy.yml`) runs only on `push` to `ppe` or
     `prod`, which only a merged promotion can cause. It never runs on `pull_request`,
     `pull_request_target` or `workflow_run`.
-    - **Scope:** `permissions: contents: read`, no repository secrets; it declares the
+    - **Scope:** `permissions: contents: read`, no repository secrets. It declares the
       environment `ppe` or `prod`, and runs on `[self-hosted, seriatim-ppe]` or
       `[self-hosted, seriatim-prod]`.
     - **It checks out the pushed SHA,** and fails closed unless all of these hold:
-      - the pushed commit is a merge commit whose first parent is the branch's previous
+      - the pushed commit `M` is a merge commit whose first parent is the branch's previous
         tip;
-      - the merged tree equals the tree of the pull request's head commit (its second
-        parent), so the merge adds nothing of its own;
-      - the merged pull request, looked up by its merge commit, came from this repository,
-        with that head commit. The lookup (`GET /repos/{repo}/commits/{sha}/pulls`) needs no
-        `pull-requests` permission only while the repository is public; if it ever becomes
-        private, the lookup fails and the job fails closed;
+      - `M`'s tree equals its second parent's tree, so the merge adds nothing of its own;
+      - **the merged pull request**, looked up by its merge commit
+        (`GET /repos/{repo}/commits/{sha}/pulls`), came from this repository. Its head is
+        `M`'s second parent, and its **base equals the pushed branch**, so a pull request
+        retargeted after its check is refused. GitHub fills that lookup asynchronously, so
+        an empty answer is retried up to 6 times, 10 s apart. It needs no `pull-requests`
+        permission only while the repository is public; if it ever becomes private, the
+        lookup fails and the job fails closed;
+      - **for `ppe`:**
+        - the head branch is `promote/ppe-<sha12>`;
+        - the head commit `P` has two parents; its first parent is the previous `ppe` tip
+          (`M`'s first parent); its tree equals its second parent `S`'s; and `S` matches the
+          branch name;
+        - `M`'s `.github/` tree equals `origin/main`'s, so a promotion whose check went stale
+          while `main` changed its workflows is refused;
       - **for `prod`:** the head branch is `main`, and the head commit is on `origin/main`.
-    - **It logs the deployed head commit,** the pull request's head, not the merge commit.
+    - **These checks run from the pushed tree,** so they can't defend against a
+      `deploy.yml` that was itself changed. The `.github/` rule in `promotion-source`, and
+      review on `main`, are what keep that file trustworthy; the runner groups pin only its
+      path and ref, not its contents.
+    - **It logs the deployed source commit:** `S` for `ppe`, the `main` commit for `prod`.
+    - **Every `ppe` deployment is a clean wipe.** Before deploying, it tears down all of the
+      PPE project's own resources: its containers, volumes, networks and state, then
+      deploys from scratch, so nothing carries over between tests.
+      - **Scoped strictly to the PPE project.** The runner's environment names the project
+        (`SERIATIM_PPE_COMPOSE_PROJECT`, which must match `^seriatim-ppe(-[a-z0-9]+)*$`, or
+        the job fails). The job removes exactly the containers, then the networks, then the
+        volumes whose `com.docker.compose.project` label equals that name, and fails if any
+        remain. It never loads a Compose file for the wipe: a promoted file could name an
+        unrelated volume explicitly (`name:`), and `-p` does not namespace explicit names.
+      - **All PPE state lives in that project's volumes,** never in a host path, so the
+        wipe needs no file deletion on the host.
+      - **Never** anything else on the host, and never `docker system prune` or any other
+        prune.
+      - **`prod` is never wiped.**
     - **The deploy step** is a no-op until there is a service to deploy. From then on it
       installs with frozen dependencies (`uv sync --frozen`, or the image by digest), runs
-      the health and local-only checks, rolls back to the previous deployment if they fail,
-      and logs what it runs.
+      the health and local-only checks, rolls back to the previous deployment if they fail
+      (`prod`), and logs what it runs.
     - **No hosts in the repository.** The file is generic. Host-specific values come from
       the runner's own environment.
   - **CI is unchanged.** A `prod` deployment is always a `main` commit. A `ppe` deployment of
     another branch runs only after the maintainer has approved both the pull request and
-    the `ppe` environment.
+    the `ppe` environment, and only with `main`'s workflows.
   - **Retirement.** Each host leaves this mechanism as soon as the release follower has
     passed PPE on it. The follower is pull-based and needs no runner, so the runner is then
     removed.
@@ -1688,13 +1950,19 @@ The maintainer applies these settings; each slice's pull request says which rows
 | setting | value | from |
 |---|---|---|
 | Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks: `secret-scan` (now), then `ci`, `security`, `private-terms` (S0a) and `ppe` (S0b), each added by the slice that introduces it | now, extended per slice |
-| Ruleset `deploy-branches` (targets `ppe`, `prod`; already active) | changes by pull request only, with the code owner's approval after the last push (CODEOWNERS has a catch-all `*` entry for the maintainer, so every promotion needs that approval); stale approvals dismissed; threads resolved; merge commits only; no force push, no deletion; an empty bypass list, so no App, `seriatim-worker` included, can bypass it | interim deploy |
-| Required check `promotion-source` on `deploy-branches` | bound to the **GitHub Actions** app, so no other integration can report it | interim deploy |
+| Default branch | `main`, and it stays `main`: `pull_request_target` workflows run from it, so changing it would change which `promotion-source` runs. `promotion-source` fails if the event reports another default branch | now |
+| Ruleset `deploy-branches` (targets `ppe`, `prod`; already active) | required checks with **"require branches to be up to date before merging"**, so a promotion built on an older `ppe` tip can't merge (it is rebuilt instead); changes by pull request only, with the code owner's approval after the last push (CODEOWNERS has a catch-all `*` entry for the maintainer, so every promotion needs that approval); stale approvals dismissed; threads resolved; merge commits only; no force push, no deletion; an empty bypass list, so no App, `seriatim-worker` included, can bypass it | interim deploy |
+| Required check `promotion-source` on `deploy-branches` | bound to the **GitHub Actions** app, so no other integration can report it. Where the organisation supports it, also an organisation-required workflow pinned to `promotion-source.yml` on `main`, which no branch workflow can stand in for | interim deploy |
+| Ruleset `promote-branches` (targets `promote/**`) | creation, update and deletion restricted, with only the `seriatim-worker` App as bypass actor, so only the promotion builder makes promotion branches; force-push allowed for the App only, so it can rebuild one | interim deploy |
 | Environments `ppe`, `prod` | the maintainer as required reviewer; deployment branches limited to `ppe` and `prod` respectively; no secrets | interim deploy |
+| `seriatim-worker` App | `contents: write` and `pull-requests: write`. GitHub can't limit an App to a branch prefix, so its reach is bounded by the rulesets: it can't push `main`, `ppe`, `prod` or a `v*` tag. It is a bypass actor only on `promote-branches`, so that it alone makes promotion branches. It pushes working branches and `promote/ppe-*`, and opens pull requests. Its key never sits in Actions secrets; tokens are minted per use, outside the repository | interim deploy |
 | Fork pull request workflows | "Require approval for all external contributors". It does not cover members of the repository or organisation, so it adds to the runner-group limits and does not replace them | now |
-| Self-hosted runners | one per host. **Two organisation runner groups,** each limited to this repository: the PPE group only to `.github/workflows/deploy.yml@refs/heads/ppe`, the production group only to `.github/workflows/deploy.yml@refs/heads/prod`. One group allowing both refs would let a `ppe` promotion edit `deploy.yml` to select `seriatim-prod` and drop `environment:`, because labels route jobs but don't authorise them; labels `seriatim-ppe` and `seriatim-prod`; a non-administrator service account with no access to unrelated credentials or clones; ephemeral or just-in-time where practical; each registered only to this group | interim deploy |
-| Tag rules `v*` | only the maintainer may create, update or delete them | S0a |
-| Environment `release` | the maintainer as required reviewer; used by `release.yml` to publish, and required for a full release (`vX.Y.Z`) | S0a |
+| Self-hosted runners | one per host, labelled `seriatim-ppe` or `seriatim-prod`. **Two organisation runner groups**, each limited to this repository: the PPE group only to `thurlow-research/seriatim/.github/workflows/deploy.yml@refs/heads/ppe`, the production group only to `…/deploy.yml@refs/heads/prod`. Labels route jobs; groups authorise them. One group for both refs would let a `ppe` promotion run a job on the production runner. The groups are created once `deploy.yml` exists on those refs. Each runner: a non-administrator service account with no access to unrelated credentials or clones; ephemeral or just-in-time where practical; registered only to its group | interim deploy |
+| Tag ruleset `tags-create` (`refs/tags/v*`) | restrict creations; the maintainer is the only bypass actor. A ruleset's bypass list covers all its rules, so this ruleset holds only this rule | S0a |
+| Tag ruleset `tags-immutable` (`refs/tags/v*`) | restrict updates and deletions, block force pushes; an **empty** bypass list, so nobody, the maintainer included, can move or delete a published tag | S0a |
+| Immutable releases | on, so a published release's assets and tag can't be changed | S0a |
+| Environment `release` | the maintainer as required reviewer; deployment limited to `v*` tags; the only environment whose job holds publish permissions (REQ-68) | S0a |
+| GHCR package | linked to this repository; write access only from this repository's Actions (the `release` job); no personal access token | S10 |
 | Dependabot | `uv` and `github-actions` ecosystems, grouped weekly; never auto-merged | S0a |
 | Auto-merge, delete branch on merge | on | now |
 

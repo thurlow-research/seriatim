@@ -1,6 +1,6 @@
 # ADR-001: Seriatim architecture
 
-**Status:** revision 5, proposed. **Date:** 2026-11-16.
+**Status:** revision 6, proposed. **Date:** 2026-11-16.
 **Requirements:** [SPEC](../SPEC.md). **Evidence:** [EVALUATION](../EVALUATION.md).
 **First slice:** [TD-slice-1](../design/TD-slice-1.md).
 
@@ -30,7 +30,7 @@ defects (SPEC §1, F1 to F4). This ADR records how Seriatim is built instead.
 |---|---|
 | D1 | The lock lives in a **sidecar on each GPU machine**. The gateway has no lock. |
 | D2 | The sidecar **takes Ollama's port 11434**. Ollama moves to **`127.0.0.1:11435`**. |
-| D3 | Busy means an **immediate admission 429**, marked `X-Seriatim-Gate: busy`. There is no queue. The gateway spills over **only on Seriatim's markers**: `busy`, and `refused` for its other pre-admission refusals. |
+| D3 | Busy means an **immediate admission 429**, marked `X-Seriatim-Gate: busy`. There is no queue. The gateway fails over by **one rule**: its own connect failure, or a replay-safe sidecar envelope whose code and gate value are in SPEC REQ-37's table. |
 | D4 | **Byte-for-byte passthrough.** `num_ctx` is never changed; an over-limit value is rejected. |
 | D5 | The gateway is a **thin router**: it routes by the operator's eligibility rules, and merges the read-only views **in Ollama's own shapes**; Seriatim's data lives on `/seriatim/*`. |
 | D6 | **Bearer keys** with `infer` and `admin` scopes. Nodes store hashes. Each node has its own keys. |
@@ -86,7 +86,7 @@ Clients and tools that default to `:11434` reach the sidecar without changes.
 **Consequence.** Ollama upgrades can reset its bind address or turn its own auto-start back
 on. The local-only check (REQ-53) and the fail-closed exposure check (REQ-19) cover this.
 
-### D3. Busy means an immediate admission 429; spill-over only on Seriatim's markers
+### D3. Busy means an immediate admission 429; failover by one rule
 
 **Decision.**
 - A gated request with no free slot gets 429 at once, decided from the method and raw path
@@ -98,15 +98,25 @@ on. The local-only check (REQ-53) and the fail-closed exposure check (REQ-19) co
 - **Other refusals.** Seriatim's other answers given before Ollama is contacted (offline,
   exposure, starting, a `num_ctx` limit) carry `X-Seriatim-Gate: refused`. They too are
   answered before the body is read, except the `num_ctx` check, which needs it.
-- The gateway spills over only on those markers, with a sidecar envelope (SPEC REQ-36,
-  REQ-37). It tries each eligible node once, in priority order, and never waits (ruling Q1).
-  An Ollama 429 is passed through untouched.
+- **One failover rule** (SPEC REQ-37). The gateway tries the next eligible node exactly
+  when its own connect failed (recorded as 502 `UPSTREAM_UNAVAILABLE`, `source: gateway`), or
+  the node answered with an envelope whose `source` is `sidecar`, whose `replay_safe` is
+  true, and whose code and `X-Seriatim-Gate` value are one of the listed pairs: `GPU_BUSY`
+  with `busy`; the refusals with `refused`; `NODE_SATURATED` with `ungated`; the sidecar's
+  connect-stage `UPSTREAM_UNAVAILABLE` with `acquired` or `ungated`. The gate header alone,
+  or the status code alone, never decides.
+- It tries each eligible node once, in priority order, and never waits (ruling Q1). An
+  Ollama 429 is passed through untouched. `X-Reroute-Reason` is the first tried node's
+  reason.
 
 **Alternatives rejected.**
 - **A short wait-and-retry queue.** This is the hidden wait the evaluation measured against
   LiteLLM (30 s) and Olla (28 s).
 - **Spilling over on any 429.** An Ollama 429 or 503 may mean Ollama *did* receive the request,
   so retrying it elsewhere could run it twice.
+- **Marking every failover answer `refused`.** `NODE_SATURATED` and the sidecar's
+  connect-stage `UPSTREAM_UNAVAILABLE` would then lie about the gate (`ungated`, `acquired`).
+  The code-and-gate table keeps the header's meaning and still names every case.
 - **503 without `Retry-After`** (ollama_load_balancer). It doesn't say when to retry, and it
   means "down", not "busy".
 - **An estimated `Retry-After`.** Generation lengths can't be predicted. The value is static
@@ -448,24 +458,42 @@ route but health authenticated, and an exposure check (D2, D6, D12).
 **Decision.**
 - **Releases are the deployable unit** (SPEC §7.6): built by CI from commits on `main`, with
   checksums and attestations, verified by every installer, images by digest.
-- **A release follower deploys them** (SPEC §7.7). It is pull-based, so no credential that can
-  push code or bypass a ruleset exists anywhere.
+- **A release follower deploys them** (SPEC §7.7). It is pull-based, so it needs no credential
+  that can push code or bypass a ruleset.
 - **Until the follower has passed PPE**, each host follows a `ppe` or `prod` branch through a
   self-hosted runner (SPEC §7.8). Those branches change only by a pull request the
-  maintainer approves: `ppe` from any branch of this repository, `prod` only from `main`, and
-  never from a fork. A required `promotion-source` check, bound to GitHub Actions, enforces
-  the sources.
+  maintainer approves, never from a fork. The flow is branch → `ppe` → `main` → `ppe` →
+  smoke test → `prod`, with the maintainer as the gate.
+  - **`ppe` from a promotion builder.** Any branch of this repository reaches `ppe` through a
+    `promote/ppe-*` branch whose commit has exactly the source's tree, so `ppe` never keeps an
+    abandoned branch's changes. Every `ppe` deployment wipes the PPE project's own resources.
+  - **`prod` from `main` only,** by plain pull request.
+  - **Workflows only from `main`.** A `ppe` promotion whose `.github/` differs from `main`'s is
+    refused.
+  - **A required `promotion-source` check,** bound to GitHub Actions, enforces all of it.
+- **The builder runs locally, as the `seriatim-worker` App.** The dev session runs
+  `deploy/promote-ppe.py` at the maintainer's request, with a short-lived App token. The bot
+  authors each promotion pull request, so the maintainer can approve it.
 
 **Alternatives rejected.**
 - **A promotion App with ruleset bypass** (revision 2). Its key, reachable from PPE, would
   have prod push authority, and PPE status could not be authenticated. Both were blocking.
 - **Waiting for the follower before any real-host deployment.** It would leave the gateway
   and sidecars untested on real hosts until after S12.
+- **Merging branches straight into `ppe`.** After a tested branch is abandoned, the next merge
+  keeps its changes, the tree check fails forever, and the ruleset forbids a reset.
+- **A `workflow_dispatch` builder.** It would need the App's private key in Actions secrets,
+  where any workflow change reviewed onto `main` could read it. `GITHUB_TOKEN` is no
+  substitute, because what it creates triggers no workflows, so `promotion-source` would never
+  run. The local script keeps the key off GitHub entirely.
 
 **Consequences.**
 - **A public repository with self-hosted runners** is the main interim risk (T17). Its
   controls are all required, and the mechanism is retired host by host.
-- **An automated "rc passed PPE" gate** stays an open problem (SPEC §7.7).
+- **An automated "rc passed PPE" gate**, and an automated "this `main` commit passed PPE"
+  gate for `prod`, stay open problems (SPEC §7.7, §7.8). The maintainer checks both by hand.
+- **Promotion needs the dev session,** or anyone holding an App token, to run the builder.
+  That is deliberate: the maintainer asks for each one.
 
 ## 4. Components
 
@@ -620,10 +648,11 @@ The details are in TD-slice-1 §3.
 | T13 | Elevation: two sidecars on one Ollama | A second instance on another port, or with another lock directory | The host-wide OS lock in a fixed directory (D11); the local-only check's one-process check | Containers with separate filesystems (D11) |
 | T14 | Supply chain | A malicious dependency or Action | `uv.lock`; Actions pinned by SHA; gitleaks verified by checksum; releases are built only by CI from commits on `main`, with SHA-256 checksums and build-provenance attestations, and installers and the follower verify both before installing; images are deployed by digest, never by tag; Dependabot updates are never auto-merged (SPEC §7.6, REQ-68) | A compromise between pinned updates |
 | T16 | DoS: the admin switch takes nodes out of service | A stolen admin key calls `offline` on every node | The switch is `admin` scope on the sidecar and the gateway; each change is logged with the key id; read-only routes stay available, so the state is visible; `online` reverses it, including after lost state, which starts a new epoch (SPEC REQ-19a, §6.1a); routing errors never show the operator's reason | Admin key holders are trusted; they can already delete models |
-| T17 | Elevation: untrusted code reaches a self-hosted runner (interim deployment) | A pull request adds a workflow with `runs-on: self-hosted` and no `environment:` key, which deployment approval never sees; a fork, or an unreviewed branch, is promoted | Separate PPE and production runner groups, each limited to this repository and to `deploy.yml` on its own ref only, so a `ppe` promotion can't reach the production runner; fork workflows need approval for all external contributors; `ppe`/`prod` change only by a pull request the code owner approves, with no bypass; `promotion-source` (on `pull_request_target`, no permissions, no checkout, bound to GitHub Actions) refuses any fork, and any `prod` source but `main`; `deploy.yml` runs only on `push` to `ppe`/`prod`, with `contents: read`, no secrets, an approved environment and the pushed SHA, and fails closed unless the merge adds nothing to the head commit's tree, the pull request came from this repository, and, for `prod`, the head is a `main` commit; a non-administrator, preferably ephemeral runner (SPEC §7.8, §7.9) | A branch deployed to `ppe` runs on the PPE host, but only after the maintainer approves both the pull request and the environment; forks can never be promoted; `prod` always runs a `main` commit, which passed every required check; retired with the follower |
-| T18 | Tampering: a compromised release asset (follower) | A replaced wheel or image | The follower verifies the checksum and the attestation against the release workflow's identity, and installs images by digest (SPEC REQ-68a, REQ-69) | A compromise of the release workflow itself |
-| T19 | Tampering: a downgrade or rollback attack (follower) | An attacker offers an older, vulnerable release | The follower refuses any version older than its last-good one unless the operator explicitly pins it | A pinned old version is the operator's choice |
-| T20 | DoS: the GitHub API is unavailable (follower) | An outage or rate limit | The follower keeps running the current version, and never fails open into installing something unverified | No updates during the outage |
+| T17 | Elevation: untrusted code reaches a self-hosted runner (interim deployment) | A pull request adds a workflow with `runs-on: self-hosted` and no `environment:` key, which deployment approval never sees; a fork, an unreviewed branch, or a branch that rewrites `deploy.yml`, is promoted | Two runner groups, PPE only `deploy.yml@refs/heads/ppe` and production only `deploy.yml@refs/heads/prod`, so a `ppe` promotion can't reach the production runner; fork workflows need approval for all external contributors; `ppe`/`prod` change only by a pull request the code owner approves, with no bypass; `promotion-source` (on `pull_request_target`, `contents: read`, no checkout, bound to GitHub Actions, run from `main`, the protected default branch) refuses any fork, any `ppe` source but a `promote/ppe-*` commit with exactly its source's tree, **any `ppe` tree whose `.github/` differs from `main`'s**, and any `prod` source but `main`; `deploy.yml` runs only on `push` to `ppe`/`prod`, with `contents: read`, no secrets, an approved environment and the pushed SHA, and fails closed unless the merge adds nothing, the pull request came from this repository with its base equal to the pushed branch, and, for `prod`, the head is a `main` commit; a non-administrator, preferably ephemeral runner (SPEC §7.8, §7.9) | A branch deployed to `ppe` runs on the PPE host, but only after the maintainer approves both the pull request and the environment, and only with `main`'s workflows; forks can never be promoted; `prod` always runs a `main` commit, which passed every required check; retired with the follower |
+| T18 | Tampering: a compromised, substituted or relabelled release asset (installers, follower) | A replaced wheel or image; an older release or an rc offered under a newer or full-release name | Installers and the follower verify the checksum and an attestation bound to this repository, `release.yml`, `refs/tags/<expected tag>`, that tag's commit and the artifact digest, with self-hosted runners denied; the package and image versions must equal the tag; the release channel takes only full `vX.Y.Z` releases; tags are immutable and releases immutable; only the `release` job holds publish permissions (SPEC REQ-68, REQ-68a) | A compromise of the release workflow itself, or of the maintainer's approval |
+| T19 | Tampering: a downgrade or rollback attack (follower) | An attacker offers an older, vulnerable release | SPEC REQ-69: the follower installs only versions newer than its durable last-good record, in semantic-version order per channel; an older one only by an operator pin, by tag and digest, in the host's local config, never read from GitHub; held versions are never retried | A pinned old version is the operator's choice |
+| T20 | DoS: the GitHub API is unavailable (follower) | An outage, a rate limit, or a failed attestation lookup | SPEC REQ-69: the follower keeps running the current version, retries with backoff, reports the condition, and never installs anything it could not fully verify; rollback uses the cached, digest-checked last-good artifacts, with no network | No updates during the outage |
+| T21 | Elevation: misuse of the promotion builder's App identity (interim deployment) | A leaked `seriatim-worker` token pushes a `promote/ppe-*` branch or opens a promotion pull request | The token is short-lived, minted per use outside the repository, and never stored in Actions secrets; the App bypasses no ruleset but `promote-branches`, so it can't push `main`, `ppe`, `prod` or a `v*` tag; only it can create `promote/**` branches, and the builder refuses any whose `.github/` differs from `main`'s, so no counterfeit `promotion-source` job can ride on a promotion; a promotion still needs the maintainer's approval of the pull request and of the `ppe` environment, `promotion-source`, and `deploy.yml`'s checks (SPEC REQ-70, D16) | A leaked token can open pull requests and push working branches until it expires; nothing merges without the maintainer |
 | T15 | Repudiation | "Who used the GPU?" | A request log with key id, request id, path, model and timings (REQ-22) | Logs are local and not tamper-proof |
 
 ## 8. Residual risks
@@ -689,17 +718,17 @@ The evidence is in [EVALUATION.md](../EVALUATION.md). In short:
 | **S3** `num_ctx` policy | strict body inspection (duplicate keys, types, conflicts); limits by pattern with an overlap check; `/v1` rule; the holder's model in status | N1–N10, with wire-capture proof in the PPE that the bytes are unchanged | TD-slice-3 |
 | **S4a** Exposure and status | `/seriatim/status` (REQ-17) with the redaction for `infer` keys (REQ-5). Until S4b and S4c land, status reports `capacity` as `source: unavailable` with the error `capacity probe not built`, and `admin_state` as online in epoch `000…0` (32 zeros), revision 0, both valid against the contract; the exposure refusals with `X-Seriatim-Gate: refused`; `/api/ps` error state; the fail-closed exposure check (REQ-19); health extensions for exposure (REQ-18); non-loopback listen enabled | X1–X6 (exposed, unverifiable, timeout, incomplete, first-check gating, recovery); ST1–ST3 (`/api/ps` error state, slot details, redaction for `infer` keys); the staged `capacity` and `admin_state` placeholders validate | TD-slice-4a |
 | **S4b** Capacity reporting | `capacity` in `/seriatim/status` (REQ-16), for information (depends on S4a); pluggable probes: NVIDIA (inventory A, compute apps, `/api/ps`, inventory B; the service's process tree via `psutil`), Apple (`hw.memsize`, the wired limit, Metal `recommendedMaxWorkingSetSize`, pressure), `none` and `unavailable`; the fixture-replay probe for tests; `default_num_ctx`, `kv_cache_type` and `flash_attention` | M1–M16 from recorded probe fixtures, with no hardware: an idle GPU (no process rows), one and two devices, Ollama's tree vs another process, a PID outside the tree with an Ollama name, WDDM `[N/A]` with `/api/ps` crediting (`free_plus_ps`) and without, multi-device `[N/A]`, a succeeded-empty vs failed vs malformed process query, a transition with retry and without recovery, Windows full-path mixed-case names, `CUDA_VISIBLE_DEVICES` as indices, UUIDs, unmatched and MIG; Apple with Metal (limit unset and raised), without Metal (limit raised: `wired_limit`; unset: `unavailable`), pressure 1/2/4 and unmapped, a Mac without unified memory; no GPU (`none`); failure, timeout and malformed output (`unavailable`); every report validated against `Capacity`, plus K-CAP's arithmetic (free and usable at most total; the top-level figure equals the largest device's) and the tie rule for `basis`; the service-tree lookup failing and denied descendants; mixed numeric and `[N/A]` rows; CUDA order (indices with and without `PCI_BUS_ID`, full UUIDs, a rejected prefix, an empty value); expectations written by hand; a lint that no probe default contains a memory size | TD-slice-4b |
-| **S4c** Durable admin state | the admin offline/online switch (REQ-19a): the persistent state directory per OS, separate from the runtime lock directory; `init-state`; epoch and revision; persistence outside the gate's lock and publication synchronous with admission, shielded from cancellation; extends the refusal handling of S1 and S4a with `NODE_OFFLINE` (`X-Seriatim-Gate: refused`, the refusal precedence, answered before the body); health `offline`. Depends on S4a | AS1–AS18 (offline refuses new gated work while in-flight work finishes; ungated and admin still served; admission/offline and offline/online barrier tests; refusal precedence with startup and drain; persists across restart, a kill mid-write, and failures before and after the rename; unreadable, missing file and missing directory each start offline in a new epoch; Linux state survives an emptied tmpfs lock directory; sidecar-side recovery by `online` into a new epoch (the gateway side is GA, S8); cancellation and a crash between persisting and publishing; `init-state` won't overwrite; gated admin routes refused and ungated admin served; slow fsync never blocks admission; reason validation; online restores; non-admin 403) | TD-slice-4c |
+| **S4c** Durable admin state | the admin offline/online switch (REQ-19a): the persistent state directory per OS, separate from the runtime lock directory; `init-state`; epoch and revision; persistence outside the gate's lock and publication synchronous with admission, shielded from cancellation; extends the refusal handling of S1 and S4a with `NODE_OFFLINE` (`X-Seriatim-Gate: refused`, the refusal precedence, answered before the body); health `offline`. Depends on S4a | AS1–AS20 (offline refuses new gated work while in-flight work finishes; ungated and admin still served; admission/offline and offline/online barrier tests; refusal precedence with startup and drain; persists across restart, a kill mid-write, and failures before and after the rename; unreadable, missing file and missing directory each start offline in a new epoch; Linux state survives an emptied tmpfs lock directory; sidecar-side recovery by `online` into a new epoch (the gateway side is GA, S8); cancellation and a crash between persisting and publishing; `init-state` won't overwrite; gated admin routes refused and ungated admin served; slow fsync never blocks admission; reason validation; online restores; non-admin 403) | TD-slice-4c |
 | **S4d** Node metrics | the node metrics file (REQ-67): one writer, atomic writes, inherited ACLs on Windows. Depends on S4a–S4c, whose state it exports | MX1–MX9 against the node writer ( `promtool`, names and labels, atomic write, write failure isolated, null figures omitted, no secrets, unset directory, a second writer refused) | TD-slice-4d |
 | **S5** Deploy: Windows | install, WinSW templates, `check-local-only`, `update-models` (through the sidecar), weekly maintenance | Pester with stubbed system commands; a manual node run, output pasted | TD-slice-5 |
 | **S6** Deploy: macOS | install, launchd plists, the same scripts; the Metal-under-LaunchDaemon result recorded | bats with stubbed `lsof`, `launchctl` and `curl`; a manual node run | TD-slice-6 |
-| **S7** Gateway core | node config (any number of nodes) with live reload (REQ-44, REQ-45), discovery with unknown states, eligibility routing (REQ-32: per-model eligible-nodes lists, `capacity = "unlimited"`, `capacity = "listed_only"`, `max_params_b`, and `size_overrides` only where a node's own size can't be parsed, by name or name and digest; no rule → `no_size_policy`; duplicate normalised model keys rejected), the verdict order with `lists_model` and `rule_verdict` (an offline node keeps its last discovery), a pinned node evaluated alone, `POST /api/show` routed without rules, every node's verdict in routing errors, `SIZE_POLICY_MISSING` and `MODEL_NOT_ELIGIBLE`, `BAD_REQUEST_BODY` on an unreadable `model`, passthrough, spill-over and failover on `busy` and `refused` (REQ-36, REQ-37: MUST try the next candidate; the all-refused answer, including the largest `num_ctx` limit), client auth, `NODE_REQUIRED`, compatibility headers | R-GW1–R-GW20, run against fleets of 1, 2 and 5 nodes that mix the four rules and nodes with none; the rule order (a list wins over `unlimited` and `max_params_b`), `:latest` matching, `max_params_b` with any `capacity` value (`unlimited` or `listed_only`) on one node (a config error), a list naming an unknown node (a config error), an unparseable `parameter_size` (`size_unknown`), an override that never touches a node with a parseable size, a digest key winning over a name key, `listed_only` (the README's example), `[models."m"]` with `[models."m:latest"]` (a config error, on startup and reload), a pinned `X-Seriatim-Node` request checked against its node's rules, the REQ-32 error order with every node's verdict listed, `GPU_OFFLINE` included; failover on each refusal code and on differing `num_ctx` limits; property tests of REQ-32 and REQ-33 over generated fleets, rules and models; reload cases (a valid swap, an invalid file kept out, a node added or removed while a request is running, a changed rule), using `/api/tags` captured in the PPE from real micro-models; upstream-429 vs admission-429 cases; every-candidate-once with 3 nodes | TD-slice-7 |
-| **S8** Gateway merged views and admin switch | `/api/tags` (one entry per name, the highest-priority node's), `/api/ps`, `/api/version` and `/v1/models` merged in Ollama's and OpenAI's own shapes, with no added fields; partial results only through `X-Seriatim-Partial`; `FLEET_UNAVAILABLE`; `/seriatim/models` (per-node detail); scopes and redaction on `/seriatim/nodes` and `/seriatim/models`; `/seriatim/nodes` with each node's rules, measured capacity, loaded models' `size_vram`, `admin_state` and warnings (REQ-42); the admin switch routes (REQ-42a) and the `offline` verdict; status as the authoritative source, health and `NODE_OFFLINE` as hints; epoch-and-revision ordering; discovery refreshed before an online node is routed to; the gateway metrics file (REQ-67); health | V1–V8, each merged body validated against the plain shape with no extra keys; MX1–MX9 again against the gateway writer, and MX10–MX12 (per-instance files and labels, series only for configured nodes); GA1–GA12 (forward and confirm, per-node serialised status reads and admin calls, fenced timeouts, epoch barrier tests, unreachable sidecar 502, unknown id 404, timeout with unknown outcome answered at once and reconciled, older revision ignored, a new epoch accepted, hints never overwrite, discovery refreshed after online, fail over around an offline node, online restores, non-admin 403) | TD-slice-8 |
+| **S7** Gateway core | node config (any number of nodes) with live reload (REQ-44, REQ-45), discovery with unknown states, eligibility routing (REQ-32: per-model eligible-nodes lists, `capacity = "unlimited"`, `capacity = "listed_only"`, `max_params_b`, and `size_overrides` only where a node's own size can't be parsed, by name or name and digest; no rule → `no_size_policy`; duplicate normalised model keys rejected), the verdict order with `lists_model` and `rule_verdict` (an offline or unhealthy node keeps its last discovery, and an unknown node that could be eligible gives `DISCOVERY_INCOMPLETE` before any operator error), a pinned node evaluated alone, `POST /api/show` routed without rules, every node's verdict in routing errors, `SIZE_POLICY_MISSING` and `MODEL_NOT_ELIGIBLE`, `BAD_REQUEST_BODY` on an unreadable `model`, passthrough, spill-over and failover by REQ-37's one rule (a gateway connect failure, or a replay-safe sidecar envelope whose code and gate value are in its table: `busy`, the `refused` codes, `NODE_SATURATED` with `ungated`, connect-stage `UPSTREAM_UNAVAILABLE`; the all-refused answer, including the largest `num_ctx` limit), client auth, `NODE_REQUIRED`, compatibility headers | R-GW1–R-GW20, run against fleets of 1, 2 and 5 nodes that mix the four rules and nodes with none; the rule order (a list wins over `unlimited` and `max_params_b`), `:latest` matching, `max_params_b` with any `capacity` value (`unlimited` or `listed_only`) on one node (a config error), a list naming an unknown node (a config error), an unparseable `parameter_size` (`size_unknown`), an override that never touches a node with a parseable size, a digest key winning over a name key, `listed_only` (the README's example), `[models."m"]` with `[models."m:latest"]` (a config error, on startup and reload), a pinned `X-Seriatim-Node` request checked against its node's rules, the REQ-32 error order with every node's verdict listed, `GPU_OFFLINE` included; failover on each code-and-gate pair in REQ-37's table, on a gateway connect failure, and on differing `num_ctx` limits; no failover on any other replay-safe sidecar code; property tests of REQ-32 and REQ-33 over generated fleets, rules and models; reload cases (a valid swap, an invalid file kept out, a node added or removed while a request is running, a changed rule), using `/api/tags` captured in the PPE from real micro-models; upstream-429 vs admission-429 cases; every-candidate-once with 3 nodes | TD-slice-7 |
+| **S8** Gateway merged views and admin switch | `/api/tags` (one entry per name, from the source node chosen by verdict, then `rule_verdict`, then any answering node; representative when digests differ), `/api/ps`, `/api/version` and `/v1/models` merged in Ollama's and OpenAI's own shapes, with no added fields; partial results only through `X-Seriatim-Partial`; `FLEET_UNAVAILABLE`; `/seriatim/models` (per-node detail); scopes and redaction on `/seriatim/nodes` and `/seriatim/models`; `/seriatim/nodes` with each node's rules, measured capacity, loaded models' `size_vram`, `admin_state` and warnings (REQ-42); the admin switch routes (REQ-42a) and the `offline` verdict; status as the authoritative source, health and `NODE_OFFLINE` as hints; epoch-and-revision ordering, with the reconciling state for a new epoch; discovery refreshed before an online node is routed to; the gateway metrics file (REQ-67); health | V1–V8, each merged body validated against the plain shape with no extra keys; MX1–MX9 again against the gateway writer, and MX10–MX12 (per-instance files and labels, series only for configured nodes); GA1–GA14 (forward and confirm, reconciliation bounds, per-node serialised status reads and admin calls, fenced timeouts, epoch barrier tests, unreachable sidecar 502, unknown id 404, timeout with unknown outcome answered at once and reconciled, older revision ignored, a new epoch accepted, hints never overwrite, discovery refreshed after online, fail over around an offline node, online restores, non-admin 403) | TD-slice-8 |
 | **S9** `/models/select` | task preferences, eligibility routing (REQ-32), `eligibility_basis`, every other node in `alternatives` with its verdict, routing errors as in REQ-32 | SEL1–SEL8 | TD-slice-9 |
 | **S10** Gateway deploy + two-node PPE | Dockerfile, systemd example, a two-node PPE with real size metadata; the client-compatibility suite (REQ-62a) with pinned `ollama` and `openai` clients, and the README's verified-versions line; the gateway image added to `release.yml`, pushed to GHCR and deployed by digest | P-GW1–P-GW7 (routing, never-too-small, busy isolation between nodes (F1), spill-over, merged views, streaming end to end, failover); CC1–CC18 (both clients against plain Ollama, a sidecar and the gateway: chat, generate, completions and embeddings, streamed and not; errors raise the client's exception with retries off; listing against a sidecar and the gateway's merge; baseline repeatability; every standard response validated against the plain shape with no extra keys; `NODE_OFFLINE` and the PPE trigger for `MODEL_NOT_ELIGIBLE`) | TD-slice-10 |
 | **S11** TLS (optional) | certificate and key settings for the sidecar and the gateway; PPE TLS smoke test | T1–T4 | TD-slice-11 |
 | *Deferred* Measured fit | Admission from measured capacity (D14). Starts after S4b has run on real NVIDIA and Apple nodes, calibrated against their capacity recordings and the actual `size_vram`. It starts from D14's open problems | — | its own TD |
-| **Interim deploy** (now, a small PR after this one) | `.github/workflows/deploy.yml` and `.github/workflows/promotion-source.yml` (SPEC §7.8): the source rules (`ppe` from any branch of this repository, `prod` from `main` only, never a fork), the merge-commit and tree checks, a no-op deploy step until there is a service; the settings in §7.9 | each fail-closed check shown on a deliberate bad pull request or push, recorded in the PR | none |
+| **Interim deploy** (now, a small PR after this one) | `.github/workflows/deploy.yml`, `.github/workflows/promotion-source.yml` and `deploy/promote-ppe.py` (SPEC §7.8): the promotion flow; the source rules (`ppe` only from `promote/ppe-*` built from a branch of this repository, `prod` from `main` only, never a fork); the `.github/`-equals-`main` rule; the merge-commit, tree, base and pull-request lookup checks (with retry); the clean wipe of the PPE project; a no-op deploy step until there is a service; the settings in §7.9 | each fail-closed check shown on a deliberate bad pull request or push, recorded in the PR; a wipe that leaves another project's containers and volumes untouched | none |
 | **S12** Release candidate 0.1.0-rc.1 | operator guide, supported Ollama versions, changelog; the first rc, `v0.1.0-rc.1`, through `release.yml` (`v0.1.0` follows in the release-follower slice, once the rc has passed PPE) | a full PPE run in CI, plus each node's local-only output; checksum and attestation verified by the installers | none |
 | **Release follower** (right after S12) | `deploy/` follower for the sidecar (Windows, macOS) and the gateway container (SPEC §7.7, REQ-69): channel polling, verification, side-by-side install, health and local-only checks, automatic rollback with the failed version held; PPE on the pre-release channel; ends with the maintainer publishing `v0.1.0` once the PPE follower has run the rc; retires the interim deployment host by host | verification failures, a failed health check rolling back, a held failed version, downgrade refused, GitHub unavailable (T18–T20) | its own TD |
 
@@ -826,9 +855,13 @@ components:
               id: { type: string }
               verdict: { type: string, enum: [eligible, not_eligible, no_size_policy, size_unknown, model_absent, discovery_unknown, offline, unhealthy] }
               lists_model: { type: [boolean, 'null'], description: null means unknown (SPEC REQ-32) }
-              rule_verdict: { type: [string, 'null'], enum: [eligible, not_eligible, no_size_policy, size_unknown, null], description: the rules applied to last known metadata; set for offline and unhealthy nodes }
-              reason: { type: string }
+              rule_verdict: { type: [string, 'null'], enum: [eligible, not_eligible, no_size_policy, size_unknown, null], description: the rules applied to last known metadata; set for offline and unhealthy nodes; null unless lists_model is true (SPEC REQ-32) }
+              reason: { type: string, description: a fixed reason such as listed_only, offline_admin or admin_state_reconciling; never operator text or a key id }
             additionalProperties: false
+            if:
+              not: { required: [lists_model], properties: { lists_model: { const: true } } }
+            then:
+              properties: { rule_verdict: { const: null } }
       additionalProperties: false
       allOf:
         - if:
@@ -1130,19 +1163,34 @@ components:
       content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
     Passthrough:
       description: >
-        Ollama's response: status and body bytes unchanged, including Ollama's own errors
-        (UpstreamError). Streams are forwarded incrementally; a mid-stream failure ends with a
-        StreamErrorRecord when framing is safe, then an aborted connection.
+        Ollama's response: status and body bytes unchanged. Its JSON is arbitrary and is not
+        constrained here; Ollama's own errors usually have the shape of UpstreamError, shown
+        for client authors only. Streams are forwarded incrementally; a mid-stream failure
+        ends with a StreamErrorRecord when framing is safe, then an aborted connection.
       headers:
         X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
         X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
         X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
       content:
-        application/json: { schema: { $ref: '#/components/schemas/UpstreamError' } }
+        application/json: {}
         application/x-ndjson: {}
         text/event-stream: {}
         text/plain: {}
         application/octet-stream: {}
+    MergedView:
+      description: >
+        A gateway merged view (SPEC REQ-38): exactly Ollama's or OpenAI's response shape, with
+        no added fields, validated against the shape S0b recorded from the pinned Ollama
+        version. A partial result is flagged only by X-Seriatim-Partial. At the sidecar the
+        same route is a plain Passthrough, with X-Seriatim-Node naming the node; the gateway
+        sends no X-Seriatim-Node on a merged view, which has no single node.
+      headers:
+        X-Seriatim-Partial: { $ref: '#/components/headers/X-Seriatim-Partial' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content:
+        application/json: {}
 
   x-seriatim-gated-operation: &gated
     x-seriatim-gate: gated
@@ -1173,6 +1221,22 @@ components:
     x-seriatim-scope: infer
     responses:
       '200': { $ref: '#/components/responses/Passthrough' }
+      '400': { $ref: '#/components/responses/Error' }
+      '401': { $ref: '#/components/responses/Unauthorized' }
+      '403': { $ref: '#/components/responses/Error' }
+      '404': { $ref: '#/components/responses/Error' }
+      '408': { $ref: '#/components/responses/Error' }
+      '413': { $ref: '#/components/responses/Error' }
+      '502': { $ref: '#/components/responses/Error' }
+      '503': { $ref: '#/components/responses/Unavailable' }
+      '505': { $ref: '#/components/responses/Error' }
+      default: { $ref: '#/components/responses/Passthrough' }
+  x-seriatim-merged-operation: &merged
+    x-seriatim-gate: ungated
+    x-seriatim-scope: infer
+    x-seriatim-gateway-merge: REQ-38
+    responses:
+      '200': { $ref: '#/components/responses/MergedView' }
       '400': { $ref: '#/components/responses/Error' }
       '401': { $ref: '#/components/responses/Unauthorized' }
       '403': { $ref: '#/components/responses/Error' }
@@ -1311,7 +1375,7 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [id, healthy, admin_state, priority, size_policy, eligible_for_models, capacity, loaded, ollama_version, warnings, last_check, status]
+                      required: [id, healthy, admin_state, reconciling, priority, size_policy, eligible_for_models, capacity, loaded, ollama_version, warnings, last_check, status]
                       properties:
                         id: { type: string }
                         healthy: { type: boolean }
@@ -1342,6 +1406,7 @@ paths:
                               size: { type: integer, minimum: 0 }
                               size_vram: { type: integer, minimum: 0 }
                         warnings: { type: array, items: { type: string } }
+                        reconciling: { type: boolean, description: true while the gateway reconciles a new epoch; the node is out of routing (SPEC REQ-42a) }
                         last_check: { type: [string, 'null'], format: date-time, description: null until the first check of a new node }
                         status:
                           description: The node's last status, fetched with its admin key and redacted for infer keys; null if never read.
@@ -1382,6 +1447,7 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Unavailable' }
+        '505': { $ref: '#/components/responses/Error' }
     post:
       x-seriatim-roles: [gateway]
       x-seriatim-scope: infer
@@ -1391,8 +1457,11 @@ paths:
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Unavailable' }
+        '505': { $ref: '#/components/responses/Error' }
 
   # Ungated, infer scope. At the sidecar these are raw passthrough. At the gateway,
   # /api/tags, /api/ps, /api/version and /v1/models are merged (SPEC REQ-38), but each body
@@ -1401,11 +1470,11 @@ paths:
   # /seriatim/nodes.
   # At the gateway, / answers 200 "Ollama is running" if at least one node is healthy, else 503.
   /:            { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] }, head: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
-  /api/tags:    { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-gateway-merge: REQ-38 } }
-  /api/ps:      { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-gateway-merge: REQ-38 } }
-  /api/version: { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-gateway-merge: REQ-38 } }
+  /api/tags:    { get: { <<: *merged, x-seriatim-roles: [sidecar, gateway] } }
+  /api/ps:      { get: { <<: *merged, x-seriatim-roles: [sidecar, gateway] } }
+  /api/version: { get: { <<: *merged, x-seriatim-roles: [sidecar, gateway] } }
   /api/show:    { post: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
-  /v1/models:   { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-gateway-merge: REQ-38 } }
+  /v1/models:   { get: { <<: *merged, x-seriatim-roles: [sidecar, gateway] } }
 
   # Gated inference, infer scope (REQ-5).
   /api/generate:        { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }

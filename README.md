@@ -168,7 +168,8 @@ format, with no extra fields.** Bodies Seriatim forwards pass through unchanged.
 exception is Seriatim's own refusals, such as "busy", which use its error format and are
 marked by `X-Seriatim-*` headers. For the
 lists that cover the whole fleet, the gateway merges the machines' answers within that same
-format: one `/api/tags` entry per model name, every machine's loaded models in `/api/ps`,
+format: one `/api/tags` entry per model name (if machines hold different builds under one
+name, the entry stands for all of them), every machine's loaded models in `/api/ps`,
 and the lowest machine's version in `/api/version`. A list missing some machines is flagged
 only by the `X-Seriatim-Partial` header. Which machine holds what is on Seriatim's own
 paths, `/seriatim/models` and `/seriatim/nodes`. That will be checked by a test suite that runs the official `ollama`
