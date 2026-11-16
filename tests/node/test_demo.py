@@ -1,5 +1,5 @@
-from seriatim_node._demo import clamp
+from seriatim_node._demo import add
 
 
-def test_clamp_low():
-    assert clamp(-1) == 0
+def test_add_runs():
+    add(1, 2)  # no assertion: every mutant survives
