@@ -134,6 +134,11 @@ on. The local-only check (REQ-53) and the fail-closed exposure check (REQ-19) co
   priority order.
 - **Discovery.** A node whose discovery failed is in an *unknown* state, never treated as "has
   no models". So 404 is given only when every node answered (REQ-34).
+- **The fleet is configuration.** The gateway knows only the nodes its config lists, with
+  their URLs, keys, priorities and size limits. Nothing in the code names a node, a count, a
+  platform or a memory size. A changed file is validated and swapped in atomically without a
+  restart (SPEC REQ-44, REQ-45). A home lab's machines change, so a fixed topology would go
+  stale.
 - **Combined views and `/models/select`.** It combines the read-only views and serves
   `/models/select` from configuration and measured memory.
 
@@ -144,6 +149,10 @@ on. The local-only check (REQ-53) and the fail-closed exposure check (REQ-19) co
   choose a machine by.
 - **Discovery alone.** It can't keep a 32B model off the smaller card when both machines have
   it.
+- **A fixed topology**, such as a built-in "small node" and "large node". A third machine,
+  or one that replaces another, would then need a code change.
+- **Config changes only on restart.** A restart drops every open stream through the gateway,
+  so a routine edit would interrupt clients.
 - **The predecessor's built-in model knowledge base.** It goes stale, it is tied to specific
   hardware, and it is a non-goal.
 - **LiteLLM as the router.** It has no native API (E1a, E6 ❌).
@@ -576,7 +585,7 @@ The evidence is in [EVALUATION.md](../EVALUATION.md). In short:
 | **S0c** Release branches | `.github/workflows/promote.yml` (manual, target `ppe` or `prod`; the `prod` environment for `prod`; ancestry and check verification; fast-forward only); `deploy/common/seriatim_deploy.py` (poll, verify, versioned venv, switch, check, roll back, stagger); a systemd timer example for the PPE host; the `ppe` and `prod` ruleset settings, documented for the maintainer to apply | `tests/deploy/test_deployer.py` (refuses non-ancestor or red commits on `prod`; rolls back on a failed restart or a failed check; does not retry a refused head; stagger); a promote dry run on a fork | TD-slice-0c |
 | **S5** Deploy: Windows | install (including the deployer and its Task Scheduler timer), WinSW templates, `check-local-only`, `update-models` (through the sidecar), weekly maintenance | Pester with stubbed system commands; a manual node run, output pasted | TD-slice-5 |
 | **S6** Deploy: macOS | install (including the deployer and its launchd timer), launchd plists, the same scripts; the Metal-under-LaunchDaemon result recorded | bats with stubbed `lsof`, `launchctl` and `curl`; a manual node run | TD-slice-6 |
-| **S7** Gateway core | node config, discovery with unknown states, size routing with `size_overrides`, passthrough, spill-over on the admission marker only, replay-safe failover, client auth, `NODE_REQUIRED`, compatibility headers | R-GW1–R-GW16, using `/api/tags` captured in the PPE from real micro-models; upstream-429 vs admission-429 cases; every-candidate-once with 3 nodes | TD-slice-7 |
+| **S7** Gateway core | node config (any number of nodes) with live reload (REQ-44, REQ-45), discovery with unknown states, size routing with `size_overrides`, passthrough, spill-over on the admission marker only, replay-safe failover, client auth, `NODE_REQUIRED`, compatibility headers | R-GW1–R-GW20, run against fleets of 1, 2 and 5 nodes; reload cases (a valid swap, an invalid file kept out, a node added or removed while a request is running, a changed `max_params_b`), using `/api/tags` captured in the PPE from real micro-models; upstream-429 vs admission-429 cases; every-candidate-once with 3 nodes | TD-slice-7 |
 | **S8** Gateway combined views | `/api/tags`, `/api/ps` and `/api/version` merges with schemas; partial flags; `/seriatim/nodes`; health | V1–V8 | TD-slice-8 |
 | **S9** `/models/select` | task preferences, routing, measured-memory fit (null when not measured) | SEL1–SEL8 | TD-slice-9 |
 | **S10** Gateway deploy + two-node PPE | Dockerfile, systemd example, a two-node PPE with real size metadata | P-GW1–P-GW7 (routing, never-too-small, busy isolation between nodes (F1), spill-over, combined views, streaming end to end, failover) | TD-slice-10 |
@@ -967,8 +976,16 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [nodes]
+                required: [nodes, config]
                 properties:
+                  config:
+                    description: Live-reload state (SPEC REQ-45)
+                    type: object
+                    required: [loaded_at]
+                    properties:
+                      loaded_at: { type: string, format: date-time }
+                      last_error: { type: [string, 'null'] }
+                      last_error_at: { type: [string, 'null'], format: date-time }
                   nodes:
                     type: array
                     items:

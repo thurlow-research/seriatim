@@ -64,6 +64,14 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
    the base URL and a Bearer key.
 4. **G4. One address.** Clients use one gateway. It sends each request to a machine suited to
    the model's size and shows a combined view of every machine.
+5. **G4a. Any fleet, defined by configuration.** The set of machines is whatever the
+   gateway's configuration lists. Its size and makeup are not fixed: any number of machines,
+   each with any amount of memory, on any platform that runs Python and Ollama.
+   - **Changing it is a configuration edit.** Growing, shrinking or resizing the fleet takes
+     effect without a code change or a gateway restart (REQ-44 to REQ-46).
+   - **No assumptions in the code.** Nothing assumes a machine count, a memory size, an
+     operating system or a GPU vendor. The first deployment happens to be one Windows NVIDIA
+     machine and one Apple Silicon Mac, and that is only an example.
 5. **G5. Visible failure.** Every failure is an explicit, machine-readable error. A timeout,
    an unavailable dependency or an answer that cannot be parsed is never treated as success,
    and is never quietly downgraded.
@@ -87,8 +95,10 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 - **A web UI, cookie sessions or CORS support.**
 - **HTTP/2.** Seriatim speaks HTTP/1.1 only, at both ends.
 - **Managing TLS certificates.** TLS is optional in v1 (REQ-27).
-- **Deploy scripts for Linux GPU machines.** The sidecar code is portable, but the scripts
-  cover Windows and macOS only.
+- **Install scripts for every platform in v1.** The sidecar runs on any platform with Python
+  3.12 and Ollama (REQ-46). The v1 install scripts cover Windows and macOS, the first
+  deployment's platforms. Elsewhere the sidecar is installed as an ordinary service by hand.
+  Scripts for other platforms are welcome as contributions.
 - **The Rust version.** It is only a design constraint (G7).
 
 ## 3. Terms
@@ -307,6 +317,12 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - **Apple Silicon:** the total from `hw.memsize`. `used_mb` and `free_mb` are `null`, because
     unified memory has no measured "free GPU memory". The sum of `size_vram` from `/api/ps` is
     reported separately, as `models_vram_mb`.
+  - **Any other platform** (AMD, Intel, CPU only, or a probe that is not yet written):
+    `source: unavailable`, with `error: "no memory probe for this platform"`. Nothing else
+    depends on memory figures. Routing uses configuration and Ollama's metadata, and
+    `/models/select` reports `fits_in_free_memory: null`.
+  - **Probes are pluggable.** Each probe is a small module behind one interface, so support
+    for another platform can be added without touching the gate or the router.
   - Every figure names its source. A probe that fails or times out (2 s) gives
     `source: unavailable` and an `error`. Figures are never invented.
 
@@ -526,6 +542,47 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     `max_params_b`, last check time and status.
 - **REQ-43. Compatibility (ruling Q7).** The headers and fields existing clients read keep
   their names. §7.1 documents the full compatibility surface.
+- **REQ-44. The fleet is configuration.**
+  - **One place.** The gateway's configuration file is the only description of the fleet. It
+    lists each node's `id`, `url`, keys, `priority` and optional `max_params_b`, plus the
+    fleet-wide `size_overrides` and task preferences.
+  - **Any size.** The gateway MUST work with any number of nodes from one upwards, and the
+    code MUST NOT contain a node count, a node name, a memory size, a platform or a vendor.
+  - **Tests** run the same routing suite against fleets of 1, 2 and 5 nodes, with differing
+    `max_params_b`, so no test depends on one particular fleet.
+- **REQ-45. Changing the fleet without a restart.**
+  - **When it reloads.** The gateway reloads its configuration when the file's content
+    changes, checked every 10 s, and on `SIGHUP` where the platform has it.
+  - **Validation first.** The new file is validated exactly as at startup.
+    - If it is invalid, the gateway keeps the configuration it has and logs an `ERROR` that
+      names the key.
+    - `/seriatim/nodes` then shows the error and when it happened.
+    - A bad edit never takes the gateway down, and never leaves it half-applied.
+  - **Atomic swap.** A valid file replaces the routing table in one step. A request that is
+    already running keeps the node it was sent to. Each request sees either the old table or
+    the new one, never a mix.
+  - **Effects:**
+    - **A node added:** its state is *unknown* until its first health check and discovery
+      have succeeded. Until then it is not a candidate, and a model not found elsewhere gets
+      `DISCOVERY_INCOMPLETE`, not `MODEL_NOT_FOUND` (REQ-34).
+    - **A node removed:** it stops being a candidate at once. Requests already running on it
+      finish normally, and its cached health and models are dropped.
+    - **`priority`, `max_params_b` or `size_overrides` changed:** applies from the next
+      routing decision.
+    - **A node's `url` or keys changed:** treated as removing the old node and adding a new
+      one.
+    - **Client keys** added or removed: apply from the next request. A gateway key can
+      therefore be rotated without a restart.
+  - **The sidecar is different.** Its configuration changes need a restart, because a
+    restart is what safely resets its lock state (REQ-12a).
+- **REQ-46. Platform independence.**
+  - **The sidecar** MUST run on Linux, Windows and macOS, and its unit and component tests run
+    on all three in CI (REQ-60).
+  - **Nothing depends on a GPU vendor except the memory probes** (REQ-16). The gate, the
+    passthrough and the routing never do.
+  - **Deploying** a node needs only Python 3.12, Ollama bound to loopback, the sidecar as a
+    service, and the firewall rule (§6.1). The install scripts (§7.3, §7.4) automate this for
+    their platforms. The local-only check (REQ-53) states what must hold on any platform.
 
 ### 4.6 Repository and process
 
@@ -612,7 +669,8 @@ Four independent layers protect the bind:
     mode 0600 elsewhere.
   - Client keys are stored as hashes.
 - **Rotation and revocation.** Several keys can be valid at once. To rotate one, add the new
-  hash, move the client over, then remove the old hash and restart. A key's id appears in
+  hash, move the client over, then remove the old hash. That takes a configuration reload on
+  the gateway (REQ-45) and a restart on a node. A key's id appears in
   logs; the key itself never does.
 - **Transport.** Plain HTTP on a trusted LAN by default, which is a residual risk (ADR-001 §8).
   TLS is optional (REQ-27).
@@ -727,8 +785,9 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
 ### 7.5 Gateway host
 
 - **REQ-59.** The gateway ships an OCI image and an example systemd unit. Its config lists
-  each node's id, URL, keys, priority and `max_params_b`, plus `size_overrides`. Examples use
-  placeholders only, such as `node-a.example`.
+  each node's id, URL, keys, priority and `max_params_b`, plus `size_overrides` (REQ-44), and
+  is reloaded live (REQ-45). Examples use placeholders only, such as `node-a.example`, and
+  show fleets of more than one shape.
 
 ### 7.6 Release branches: `ppe` and `prod`
 
