@@ -1,25 +1,24 @@
 # ADR-001: Seriatim architecture
 
-**Status:** proposed (Phase 1, for review). **Date:** 2026-11-16.
-**Requirements:** [SPEC](../SPEC.md). **First slice design:** [TD-slice-1](../design/TD-slice-1.md).
+**Status:** revision 2, proposed. **Date:** 2026-11-16.
+**Requirements:** [SPEC](../SPEC.md). **Evidence:** [EVALUATION](../EVALUATION.md).
+**First slice:** [TD-slice-1](../design/TD-slice-1.md).
 
 ## 1. Context
 
-Several clients share a few GPU machines that run Ollama. When two inference requests land
-on one GPU at the same time, they compete for VRAM. Ollama then either queues the second one
-out of sight (and client timeouts fire) or offloads layers to the CPU, which makes both slow.
-The operators want each machine to run one request at a time. A busy machine should say so at
-once, and clients should see a single address that sends each request to the right machine.
+Several clients share a few GPU machines that run Ollama. When two inference requests land on
+one GPU, they compete for VRAM. Ollama then queues the second one out of sight, so client
+timeouts fire, or it offloads layers to the CPU, which makes both requests slow. The
+operators want three things:
+- each machine runs one request at a time;
+- a busy machine says so at once;
+- clients see a single address that sends each request to a suitable machine.
 
-The **evaluation** (2026-11-15; summarised in §9 and cited by test number `E1a` to `E6`)
-compared a predecessor gateway with LiteLLM, Olla, lollms_hub and ollama_load_balancer. No
-candidate met *busy → immediate 429* (E2) and *Bearer auth* (E4) together without custom code.
-The predecessor met the most requirements, but it had four defects (SPEC §1, F1 to F4). The
-recommendation was to keep a small in-house gate and fix those defects. This ADR records how.
+The [evaluation](../EVALUATION.md) found that no existing gateway meets *busy → immediate
+429* (E2) together with *Bearer auth* (E4), and that the in-house predecessor had four
+defects (SPEC §1, F1 to F4). This ADR records how Seriatim is built instead.
 
 ## 2. Decision summary
-
-Seriatim has two layers.
 
 ```
  client ──Bearer──▶ gateway ──node key──▶ sidecar :11434 ──loopback──▶ Ollama 127.0.0.1:11435
@@ -29,207 +28,350 @@ Seriatim has two layers.
 
 | # | decision |
 |---|---|
-| D1 | The **lock lives in a sidecar on each GPU machine**. There is no lock in the gateway. |
+| D1 | The lock lives in a **sidecar on each GPU machine**. The gateway has no lock. |
 | D2 | The sidecar **takes Ollama's port 11434**. Ollama moves to **`127.0.0.1:11435`**. |
-| D3 | When busy, the answer is an **immediate 429 with `Retry-After`**. There is no queue. A 429 means Ollama never saw the request. |
-| D4 | **Byte-for-byte passthrough** with no body rewriting. `num_ctx` is never lowered; it is rejected or flagged. |
-| D5 | The gateway is a **thin router**: it routes by size using Ollama's own metadata, combines the read-only views, and serves `/models/select` from config. |
-| D6 | **Bearer keys at both layers.** Hashes are stored on nodes. Each node has its own key, and client keys are never forwarded. |
-| D7 | **Python 3.12, Starlette, uvicorn and httpx.** Config through pydantic-settings. Services through WinSW and launchd. |
-| D8 | **The contract comes first.** `contract/openapi.yaml` (Appendix A) and a black-box behaviour suite define the interface, so another implementation can drop in. |
-| D9 | **Config-driven deploy scripts**, with a local-only check after every Ollama upgrade. |
+| D3 | Busy means an **immediate admission 429**, marked `X-Seriatim-Gate: busy`. There is no queue. The gateway spills over **only on that marker**. |
+| D4 | **Byte-for-byte passthrough.** `num_ctx` is never changed; an over-limit value is rejected. |
+| D5 | The gateway is a **thin router**: it routes by size from Ollama's metadata, and combines the read-only views. |
+| D6 | **Bearer keys** with `infer` and `admin` scopes. Nodes store hashes. Each node has its own keys. |
+| D7 | **Python 3.12, Starlette, uvicorn (h11), httpx, anyio and pydantic-settings.** A 30-line OS lock (`fcntl.flock` / `msvcrt.locking`) for the singleton. WinSW and launchd run the services. |
+| D8 | **The contract comes first** (Appendix A), plus a black-box behaviour suite, so another implementation can drop in. |
+| D9 | **Config-driven deploy scripts.** The local-only check runs after every Ollama upgrade. Maintenance goes through the sidecar. |
+| D10 | **Abnormal ends and restarts drain.** A slot is freed only after the upstream connection is closed and a bounded drain has passed. |
+| D11 | **One sidecar per Ollama**, enforced by a host-wide file lock. |
+| D12 | **Exact classification.** Only verified method and path pairs are ungated. Everything unknown is gated and needs `admin`. Unsafe raw paths are rejected before matching. |
+| D13 | **Deploy from branches.** A push to `ppe` updates the test host; a push to `prod` updates production. Both move only by fast-forward to a verified `main` commit; `prod` also needs the maintainer's approval. Hosts pull; nothing pushes into them. |
 
 ## 3. Decisions and the alternatives rejected
 
 ### D1. The lock lives at the GPU machine
 
-**Decision.** Each GPU machine runs a sidecar that holds that machine's slots. It is the only
-process that can admit a request to its Ollama.
+**Decision.** Each GPU machine runs a sidecar that holds that machine's slots. Only it admits
+requests to its Ollama.
 
 **Why at the machine.**
-- **Correct by construction.** Only something sitting in front of Ollama on that machine can
-  see every request to it. A central lock misses any client that talks to the machine some
-  other way: a maintenance script, a developer, or a second gateway. Each of those reaches
-  Ollama without being counted.
-- **One machine per lock (F1).** The predecessor's single global lock in the gateway returned
-  429 for idle machine B while A was busy (E2). A lock on each machine cannot couple machines.
-- **The gateway becomes stateless.** It can restart, or be duplicated, without losing or
-  splitting the lock state. With the lock in the gateway, two gateway replicas mean two locks.
-- **Fails locally.** If the gateway is down, clients can still use a sidecar directly, with the
-  same guarantees.
+- **Correct by construction.** Only a process in front of Ollama on that machine sees every
+  network request to it. A central lock misses any client that reaches the machine some other
+  way, such as a script, a developer or a second gateway.
+- **One machine per lock (F1).** The predecessor's single global lock returned 429 for idle
+  machine B while A was busy (E2). Locks on separate machines can't couple them.
+- **A stateless gateway.** The gateway can restart, or run as several copies, without losing
+  or splitting the lock state.
+- **Fails locally.** If the gateway is down, clients can use a sidecar directly, with the same
+  guarantees.
 
-**Alternatives rejected.**
-
-| alternative | why rejected |
+| alternative | why rejected (evaluation evidence) |
 |---|---|
-| A lock in the central gateway (the predecessor's design, fixed to one lock per backend) | Leaves every non-gateway path to Ollama ungated. The state lives in one process that is also the router, so restarts and replicas break the guarantee. The evaluation's "~30 lines" estimate was for one lock per backend inside that process, and it does not fix the bypass. |
-| LiteLLM with a `CustomLogger` gate hook (the evaluation's extension path) | Worked in the evaluation's PPE (429 in 30 ms). But a dead backend leaks the slot until a reaper releases it, because failure events in v1.108.9 carry no deployment id. It has no native `/api/chat` (E1a ❌), so it needs a ~100-line translation layer. It is a 1.8 GB, fast-moving dependency. Total ~250 lines against ~150 here. |
-| Olla with a layer in front of it | Olla routes best (E3 ✅) and passes options through (E1a ✅). But it has no concurrency cap and no auth (E2 ❌, E4 ❌). The layer we would put in front *is* this design. It stays the runner-up for discovery and health later. |
-| A per-endpoint `max_concurrency` patch to Olla | A Go PR of 150 to 250 lines, with an uncertain merge. It would still need an auth layer. |
-| lollms_hub or ollama_load_balancer | Stale projects. They failed routing (E3) and busy semantics (E2). lollms_hub ships a default secret that also works as an admin token. ollama_load_balancer returns 503 without `Retry-After` and spills over instead of rejecting. |
-| Ollama's own `OLLAMA_NUM_PARALLEL=1` alone | Ollama queues the excess request instead of rejecting it, which is the behaviour this project exists to remove. It is kept as a second line of defence (SPEC REQ-4). |
-| A distributed lock (Redis or etcd) shared by gateways | Adds infrastructure, and still leaves direct access to Ollama ungated. |
+| A lock in the central gateway, fixed to one lock per backend | Every path to Ollama that skips the gateway is ungated. The state lives in the router process, so a restart or a second copy breaks the guarantee |
+| LiteLLM plus a `CustomLogger` gate hook | Worked in the PPE (a 429 in 30 ms). But a dead backend leaks its slot until a reaper frees it, because failure events in v1.108.9 carry no deployment id. It has no native `/api/chat` (E1a ❌), so it needs a ~100-line translation layer. It is a 1.8 GB, fast-moving dependency, about 250 lines against about 150 |
+| Olla plus a layer in front | Olla routes best (E3 ✅) and passes options through (E1a ✅), but has no concurrency cap and no auth (E2 ❌, E4 ❌). The layer we would put in front *is* this design. Olla stays the runner-up for discovery later |
+| A per-endpoint `max_concurrency` patch to Olla | A 150–250-line Go PR with an uncertain merge, and it still needs auth |
+| lollms_hub or ollama_load_balancer | Stale projects that failed E2 and E3. lollms_hub ships a default secret that works as an admin token. ollama_load_balancer returns 503 without `Retry-After`, and spills over instead of rejecting |
+| Ollama's `OLLAMA_NUM_PARALLEL=1` alone | It queues instead of rejecting. Kept only as a second line of defence (REQ-4) |
+| A distributed lock (Redis or etcd) | Extra infrastructure, and direct access to Ollama would still be ungated |
 
 ### D2. The sidecar takes port 11434; Ollama moves to 127.0.0.1:11435
 
-**Decision.** Clients and tools that default to `:11434` reach the sidecar without changes.
-Ollama is configured with `OLLAMA_HOST=127.0.0.1:11435`.
+Clients and tools that default to `:11434` reach the sidecar without changes.
 
 **Alternatives rejected.**
-- **Sidecar on another port, Ollama left on 11434.** Ollama stays on its well-known port, and
-  any client left on the default skips the gate.
-- **Ollama on a Unix socket.** Ollama does not support it on Windows, and that is not portable.
-- **The predecessor's own layout** (gateway on 11435, Ollama on 11434). Same flaw as the first.
+- **The sidecar on another port, Ollama left on 11434.** Any client left on the default port
+  skips the gate.
+- **A Unix socket for Ollama.** Not available on Windows.
+- **The predecessor's layout** (the gateway on 11435, Ollama on 11434). It has the same flaw
+  as the first alternative.
 
-**Consequences.** Ollama upgrades can reset its bind or turn its own auto-start back on, so a
-local-only check after upgrades is mandatory (D9, SPEC §6.1). The sidecar also probes for
-exposure at runtime (SPEC REQ-19).
+**Consequence.** Ollama upgrades can reset its bind address or turn its own auto-start back
+on. The local-only check (REQ-53) and the fail-closed exposure check (REQ-19) cover this.
 
-### D3. Busy means an immediate 429; no queue anywhere
+### D3. Busy means an immediate admission 429; spill-over only on that marker
 
-**Decision.** A gated request with no free slot gets 429 right away, with `Retry-After`. The
-sidecar decides from the method and path alone, before it reads the body (SPEC REQ-3). A 429
-means Ollama never saw the request, so a client or the gateway can retry it safely anywhere.
-
-**Alternatives rejected.**
-- **A short wait and retry queue,** as an earlier routing design proposed. A hidden wait is the
-  failure mode the evaluation measured against LiteLLM (30 s queued) and Olla (28 s queued).
-  It also makes latency unpredictable for the client.
-- **503 without `Retry-After`** (ollama_load_balancer). This does not tell the client when to
-  retry. Also, 503 means "service down", which is not what busy is.
-- **An estimated `Retry-After`** based on the work in flight. Generation lengths can't be
-  predicted. A static, configurable value (default 15 s) is honest. The 429 body also includes
-  `busy_for_s`.
-
-### D4. Byte-for-byte passthrough; `num_ctx` is never lowered
-
-**Decision.** Request and response bodies are forwarded as raw bytes (`aiter_raw`, no
-re-serialisation). The sidecar may *read* a body to enforce limits, but never rewrites it. An
-over-limit `num_ctx` is rejected (422) or flagged (`X-Seriatim-Ctx`), depending on the open
-question Q2. `num_ctx` on `/v1` is rejected by default (Q3).
+**Decision.**
+- A gated request with no free slot gets 429 at once, decided from the method and raw path
+  alone, before the body is read.
+- The admission 429 carries `X-Seriatim-Gate: busy` and an envelope with `error_code:
+  GPU_BUSY`, `source: sidecar` and `replay_safe: true`.
+- The sidecar **strips every `X-Seriatim-*` header from Ollama's responses**, so Ollama cannot
+  forge the marker.
+- The gateway spills over only on that marker. It tries each eligible node once, in priority
+  order, and never waits (ruling Q1). An Ollama 429 is passed through untouched.
 
 **Alternatives rejected.**
-- **Clamping `num_ctx` to a "safe" table** (the predecessor; also lollms_hub's hard-coded
-  crop). This silently changes what the caller asked for (E1a: 30000 → 24576), and the table
-  goes stale with every new model (F3).
-- **Translating `/v1` to `/api/chat`** (LiteLLM). LiteLLM's own translation lost nested
-  `options.num_ctx` (E1b). It is a translation layer, which is a non-goal, and it changes bytes.
-- **Parsing and re-serialising JSON for every request.** This changes key order, whitespace and
-  number formatting, so it is not byte-for-byte and can't be audited on the wire.
+- **A short wait-and-retry queue.** This is the hidden wait the evaluation measured against
+  LiteLLM (30 s) and Olla (28 s).
+- **Spilling over on any 429.** An Ollama 429 or 503 may mean Ollama *did* receive the request,
+  so retrying it elsewhere could run it twice.
+- **503 without `Retry-After`** (ollama_load_balancer). It doesn't say when to retry, and it
+  means "down", not "busy".
+- **An estimated `Retry-After`.** Generation lengths can't be predicted. The value is static
+  and configurable (default 15 s), and is extended to cover any drain still in progress.
+
+### D4. Byte-for-byte passthrough; `num_ctx` rejected, never changed
+
+**Decision.**
+- Bodies are forwarded as the exact bytes received, and responses as raw bytes, without
+  decoding.
+- A body is parsed only to check `num_ctx` (S3), and the parse is strict: duplicate keys, wrong
+  types and conflicting placements are rejected as ambiguous.
+- An over-limit value gets 422. `num_ctx` on `/v1` gets 400 with a hint (rulings Q2 and Q3).
+
+**Alternatives rejected.**
+- **Clamping to a "safe" table** (the predecessor, and lollms_hub's crop). It silently changes
+  what the caller asked for (E1a: 30000 → 24576), and the table goes stale.
+- **A flag mode that forwards unchanged and sets a header.** The flag is easy to ignore, and an
+  over-limit context can spill layers to the CPU and hold the GPU for minutes (ruled out, Q2).
+- **Translating `/v1` to `/api/chat`** (LiteLLM). It lost a nested `options.num_ctx` (E1b),
+  it is a translation layer, which is a non-goal, and it changes the bytes.
+- **Re-serialising JSON.** It changes key order, whitespace and number formatting, and the
+  result can't be audited on the wire.
 
 ### D5. The gateway is a thin router
 
-**Decision.** The gateway does four things:
-- authenticates clients;
-- routes each model-bearing request to a node by priority, filtered by whether the node has
-  the model (from that node's `/api/tags`) and by its `max_params_b`, compared with the model's
-  `details.parameter_size`;
-- passes a node's 429 through (or spills over once, per Q1);
-- combines `/api/tags`, `/api/ps` and `/api/version`, and serves `/models/select` from
-  operator-configured task preferences and each node's live memory.
+**Decision.**
+- **Routing.** Candidates are the nodes that are healthy, list the model, and have
+  `max_params_b` ≥ the model's size. The size comes from `size_overrides` in the
+  configuration, or else from Ollama's `details.parameter_size`. Candidates are tried in
+  priority order.
+- **Discovery.** A node whose discovery failed is in an *unknown* state, never treated as "has
+  no models". So 404 is given only when every node answered (REQ-34).
+- **Combined views and `/models/select`.** It combines the read-only views and serves
+  `/models/select` from configuration and measured memory.
 
 **Alternatives rejected.**
-- **Routing by parsing the model name** (`:32b`). Names are free text. `parameter_size` from
-  Ollama is authoritative. The name is not used at all; a model with no known size needs an
-  explicit override (SPEC REQ-32).
-- **Routing by an estimated token count** (an earlier design's `len(prompt)/4`). Too inaccurate
-  to decide a machine on. Context size is handled by REQ-8 limits at the node instead.
-- **Discovery only,** without size limits. When a 32B model is present on both machines,
-  discovery alone can't keep it off the 24 GB card. Olla's priority-plus-discovery approach
-  (E3 ✅) is what the design follows, plus the size cap.
-- **The predecessor's built-in model knowledge base** (hard-coded profiles, speeds and "safe
-  context" tables). It goes stale, is specific to particular hardware, and is a non-goal.
-  `/models/select` uses configuration plus live data instead.
+- **Parsing the model name** (`:32b`). Names are free text, and Ollama's metadata is the
+  authority.
+- **An estimated token count**, as an earlier design used (`len(prompt)/4`). Too inaccurate to
+  choose a machine by.
+- **Discovery alone.** It can't keep a 32B model off the smaller card when both machines have
+  it.
+- **The predecessor's built-in model knowledge base.** It goes stale, it is tied to specific
+  hardware, and it is a non-goal.
 - **LiteLLM as the router.** It has no native API (E1a, E6 ❌).
 
-### D6. Bearer keys at both layers
-
-**Decision.** Keys are 256-bit random values. Nodes store SHA-256 hashes and compare them in
-constant time. Keys carry scopes (`infer`, `admin`; Q5). The gateway holds a separate key for
-each node. Client credentials are stripped before forwarding.
-
-**Alternatives rejected.**
-- **No auth on the sidecar,** relying on the gateway. That breaks the property that a direct
-  client gets the same guarantees as the gateway, and a LAN host could use the GPU.
-- **Forwarding client `Authorization` to Ollama.** ollama_load_balancer does this. It leaks
-  keys to a process that does not need them.
-- **Accepting keys in query strings.** They leak into logs and `Referer` headers.
-- **A slow password hash (bcrypt or argon2) for keys.** Unnecessary for 256-bit random keys,
-  and it would add latency to every request.
-- **mTLS between gateway and nodes.** Stronger, but it brings the certificate-management cost
-  of Q6 without removing the need for client keys. It is deferred.
-- **Shipping a default secret.** lollms_hub's default `SECRET_KEY` was accepted as an admin
-  token (E4 ⚠). Seriatim refuses to start without configured keys (REQ-15).
-
-### D7. Python 3.12 with Starlette, uvicorn and httpx; WinSW and launchd
+### D6. Bearer keys with scopes, at both layers
 
 **Decision.**
-- Starlette routes the `/seriatim/*` endpoints and runs the lifespan.
-- The proxy itself is a plain ASGI callable. That gives it full control over when disconnects
-  are noticed and when the slot is released (TD-slice-1 §3).
-- httpx (async) is the upstream client, with streaming raw bytes. uvicorn serves, with one
-  worker.
-- pydantic-settings reads the env and TOML config.
-- WinSW wraps the Windows services and launchd runs the macOS ones.
-- uv manages the workspace and lock file.
+- **Keys.** 256-bit random keys. Nodes store SHA-256 hashes, compared in constant time against
+  every configured hash.
+- **Scopes.** `infer` or `admin` (ruling Q5). The scope a route needs comes from the same
+  `classify()` that decides admission, so authorisation and the gate can't disagree. Unknown
+  endpoints need `admin`.
+- **Ambiguous credentials are rejected.** That covers more than one `Authorization` header, or
+  a scheme other than Bearer.
+- **Gateway keys.** The gateway holds an `infer` key and an `admin` key for each node. Client
+  credentials are stripped before forwarding.
 
 **Alternatives rejected.**
-- **FastAPI.** It adds a framework layer over Starlette, mainly for its generated OpenAPI. This
-  project is contract-first: the OpenAPI file is written by hand and is what gets tested.
-- **aiohttp.** A good library, but httpx with Starlette is what the predecessor proved in
-  production, and httpx has a cleaner streaming and timeout model.
-- **Writing a raw asyncio HTTP server.** Rebuilds what exists.
-- **Go or Rust now.** Python is what the operators run and review. The contract (D8) keeps a
-  later port possible.
-- **NSSM.** Widely used, but not maintained since 2017. **AlwaysUp** is commercial. **pywin32
-  services** mean code that needs its own tests.
-- **Ollama's macOS app** for running Ollama. It can't be configured reliably as a service
-  (`launchctl setenv` doesn't survive a reboot), and it starts on login with its own bind.
+- **No auth on the sidecar.** A LAN host could use the GPU, and a direct client would lose the
+  gateway's guarantees.
+- **Forwarding the client's `Authorization` header.** ollama_load_balancer does this, and it
+  leaks keys to Ollama.
+- **Keys in query strings.** They leak into logs and `Referer` headers.
+- **Accepting `X-API-Key` as well.** No existing client uses it (ruling Q7), and a second
+  header creates ambiguity.
+- **Slow password hashes.** Unneeded for random 256-bit keys, and they would add latency.
+- **mTLS between the gateway and the nodes.** It brings certificate management without
+  removing the need for client keys. Deferred.
+- **A default secret.** This was lollms_hub's bypass (E4 ⚠). Seriatim refuses to start without
+  keys.
 
-### D8. The contract comes first, so another implementation can drop in
+### D7. Libraries
 
-**Decision.** `contract/openapi.yaml` (OpenAPI 3.1; the draft is Appendix A) is the source of
-truth for every Seriatim-owned endpoint, header, status and error code.
+**Decision.**
+- **Starlette** for the `/seriatim/*` routes and the lifespan.
+- **A plain ASGI callable** for the proxy, for exact control over disconnects and over when a
+  slot is freed.
+- **httpx** (async, HTTP/1.1, raw streaming) for upstream.
+- **uvicorn with h11**, one worker.
+- **anyio** for cancellation scopes.
+- **pydantic-settings** for the env and TOML config.
+- **A small OS lock** for the singleton (D11): `fcntl.flock` on POSIX and `msvcrt.locking` on
+  Windows. It is about 30 lines and never deletes the lock file.
+- **WinSW and launchd** for the services; **uv** for the workspace and lock file.
+
+**Alternatives rejected.**
+- **FastAPI.** It adds a layer mainly for a generated OpenAPI, and this project is
+  contract-first.
+- **aiohttp.** httpx with Starlette is what the predecessor proved, with a cleaner streaming
+  and timeout model.
+- **A hand-rolled HTTP server.** That would rebuild what already exists.
+- **The `filelock` library.** Its Windows release deletes the lock file. A sidecar that is
+  exiting can delete the file while a new one has it open, and a third can then create and
+  lock a fresh file at the same path. Two live sidecars would then hold locks on different
+  files. The singleton needs a lock file that is never deleted, and the OS calls give that
+  directly.
+- **Go or Rust now.** The contract (D8) keeps a later port possible.
+- **NSSM.** Unmaintained since 2017. **AlwaysUp** is commercial. **pywin32 services** would be
+  code needing its own tests.
+- **Ollama.app on macOS.** Its configuration doesn't survive a reboot, and it auto-starts with
+  its own bind address.
+
+### D8. The contract comes first
+
+**Decision.** `contract/openapi.yaml` (Appendix A) is the source of truth for every
+Seriatim-owned endpoint, header, status and error code.
 - CI lints it.
-- The unit tests check every error body Seriatim produces against `ErrorEnvelope`.
-- The enum of error codes in the code is checked for equality with the contract's.
-- `tests/behaviour/` is a black-box suite parametrised by base URL.
-
-A Rust (or other) sidecar is a drop-in when it passes that suite in the PPE.
+- Tests check every Seriatim error body against `ErrorEnvelope`.
+- The code's error table must equal `x-seriatim-codes`.
+- The allowlist must match the route probe recorded against the supported Ollama version.
+- `tests/behaviour/` is a black-box suite parametrised by base URL. Another implementation is
+  a drop-in when it passes that suite in the PPE.
 
 **Alternatives rejected.**
-- **Generating the spec from the code.** The spec then follows the implementation instead of
+- **Generating the spec from the code.** The spec would then follow the code instead of
   constraining it.
-- **JSON Schema only.** It can't express paths, headers or status codes.
+- **JSON Schema alone.** It has no paths, headers or status codes.
 
-### D9. Config-driven deploy scripts with a local-only check
+### D9. Deploy scripts; maintenance goes through the sidecar
 
 **Decision.**
-- `deploy/windows/*.ps1` and `deploy/macos/*.sh` cover install, the services, model update, the
-  weekly maintenance and `check-local-only`.
-- They read everything from a config file. They check every native exit code and exit non-zero
-  on any failure.
-- The local-only check runs after install, after every model update, after every Ollama upgrade
-  and weekly.
-- Scripts are tested with Pester and bats, with system commands stubbed.
+- **Scripts.** `deploy/windows/*.ps1` and `deploy/macos/*.sh` are driven by configuration,
+  check every native exit code, and are tested with Pester and bats.
+- **Model updates** use the sidecar's admin route, `POST /api/pull`, never 11435 directly. No
+  Seriatim component therefore bypasses the gate.
+- **The local-only check** runs after install, after every model update, after every Ollama
+  upgrade, and weekly.
 
 **Alternatives rejected.**
-- **Copying the predecessor's scripts.** They are machine-specific: fixed paths, a fixed
-  repository, and a Docker rebuild. They also wrap native commands in `try/catch`, which never
-  fires in PowerShell, so a failed `ollama pull` is counted as "updated". This is a
-  fail-silent defect.
-- **A configuration-management tool** (Ansible, Salt, or similar) for two or three machines.
-  Too heavy for this fleet. The scripts stay simple enough to translate into one later.
+- **Copying the predecessor's scripts.** They are tied to one machine. They also wrap native
+  commands in `try/catch`, which never fires in PowerShell, so a failed `ollama pull` was
+  counted as updated.
+- **Pulling through 11435 directly.** That is the bypass review item 7 found.
+- **Ansible or a similar tool** for two or three machines. Too heavy for the fleet.
 
-## 4. Component overview
+### D10. Abnormal ends and restarts drain; Ollama is not restarted with the sidecar
+
+**Decision.** Closing the upstream connection makes Ollama cancel the generation, but it does
+not prove the GPU is idle. So after any abnormal end the slot *drains* for
+`SERIATIM_NODE_DRAIN_S` (default 10 s) before it is free. Abnormal ends are a client
+disconnect, an upstream failure, the hold limit, or an internal error after the request was
+sent. New gated requests meanwhile get the admission 429.
+
+A restarted sidecar starts with **every slot draining**, and answers 503 `NODE_STARTING`.
+- **Why this covers a crash.** When a sidecar process dies, by crash or kill, the operating
+  system closes its sockets. Ollama sees the same disconnect as a cancellation, so the drain
+  window covers it.
+- **The default.** It is checked against the cancellation latency measured in the PPE (P6),
+  and again on each GPU node in S5 and S6.
+- **What it does not prove.** The drain is a time window. Ollama exposes no signal that a
+  cancelled generation has stopped. A generation slower to stop than `DRAIN_S` is caught by
+  Ollama's own `OLLAMA_NUM_PARALLEL=1` queue. The next request then waits; the two never run
+  together. SPEC G1 states this scope.
+- **Closure must be proven before the drain starts.** Each gated request uses its own
+  one-connection httpx client. The drain starts only after that client's `aclose()` has
+  returned. If that call fails or times out, the slot is *stuck* until a restart, which
+  closes the socket for certain (TD-slice-1 §3.3).
+
+**Alternatives rejected.**
+- **Freeing the slot as soon as the connection is closed** (revision 1). It assumes the GPU
+  stops instantly.
+- **Waiting for `/api/ps` to change.** `/api/ps` lists *loaded* models, not *active*
+  requests, so it can't show that a cancelled request has stopped. S4 may adopt a positive
+  signal only if the PPE shows one is reliable.
+- **Restarting Ollama together with the sidecar.** It unloads every model (minutes to reload
+  a 32B model), it needs the sidecar to control the Ollama service, and it gives nothing the
+  drain does not.
+- **Persisting lock state to disk.** The state that matters is in Ollama, not in the sidecar.
+  A stale on-disk lock would be a new failure mode.
+
+### D11. One sidecar per Ollama
+
+**Decision.** At startup the sidecar takes an exclusive OS lock on
+`<lock dir>/upstream-<port>.lock`.
+- **The name.** The upstream is always a loopback address, so its port identifies it on the
+  host.
+- **The directory** is fixed and system-wide, not per user. It can be changed only in PPE and
+  test mode (REQ-12b).
+- **Holding it.** The lock is held by a module-level reference for the life of the process.
+  It is never released or deleted explicitly; the OS releases it when the process exits.
+- **Failure.** If the lock is held, or cannot be taken, the sidecar exits with code 3.
+
+**Alternatives rejected.**
+- **Relying on the listen port.** Two sidecars on different ports can still front one Ollama.
+- **A PID file.** Stale PID files and PID reuse make it unreliable. An OS lock is released when
+  the process dies.
+
+**Residual risk.** The lock covers one filesystem. Two containers with separate filesystems
+that share one Ollama are not detected. That is a deploy error, which the local-only check
+also catches, because port 11434 must belong to *the* sidecar, and the check verifies that
+exactly one sidecar process runs on the host.
+
+### D12. Exact classification; unknown endpoints are gated and need admin
+
+**Decision.**
+- **Unsafe paths are rejected first.** The raw path (ASGI `raw_path`, never the decoded path)
+  is checked for unsafe content (REQ-20a). Anything unsafe gets 400 `BAD_PATH`.
+- **Exact matching.** The path is then matched exactly against `/seriatim/*`, the ungated
+  allowlist, and the known inference routes. No trailing-slash folding, no case folding and no
+  segment collapsing.
+- **Everything else** is gated and needs `admin` (SPEC REQ-5).
+- **The allowlist** is checked against a route probe recorded against the supported Ollama
+  version.
+
+**Alternatives rejected.**
+- **Ungating every `GET`, `HEAD` and `OPTIONS`** (revision 1). Ungated methods on unknown paths
+  are a gate bypass (review item 1).
+- **Normalising before matching** (revision 1). A path such as `/api/chat/../show` would
+  collapse to an ungated route (review item 2).
+- **A deny-by-default 404 for unknown endpoints.** It would break new Ollama features until
+  Seriatim is updated. Gating them and requiring `admin` is just as safe and keeps them usable.
+
+### D13. Deploy from the `ppe` and `prod` branches; hosts pull
+
+**Decision.**
+- **Branches** (SPEC §7.6):
+  - a push to `ppe` updates the designated PPE host, which then runs the behaviour suite;
+  - a push to `prod` updates the GPU nodes and the gateway host.
+- **Promotion.** `ppe` and `prod` move only through the `promote` workflow, which
+  fast-forwards the target to a `main` commit whose required checks passed.
+  - **`prod` needs two more things:** the maintainer's approval of the `prod` environment, and
+    a `seriatim/ppe` success status on that exact SHA (SPEC REQ-65).
+  - **The identity.** The workflow pushes as a dedicated App, `seriatim-promote`. Its key is
+    an environment secret, released only to runs on `main` after the environment's rules
+    pass. It is the only bypass actor on the rulesets, which allow no force-push and no
+    deletion.
+- **The deployer.** Each host runs a small deployer (`seriatim-deploy`, Python, on every OS),
+  on a timer with random jitter. It polls its branch, and verifies the commit: CI green, and
+  an ancestor of `main`. It then installs the commit into a new venv, restarts, checks, and
+  rolls back on any failure.
+- **Where the pattern comes from.** The maintainer's existing services use the same
+  branches, with a polling deploy timer on each host. Seriatim adds three things: the
+  verification before installing, the rollback, and enforcement through the workflow instead
+  of by convention.
+
+**Alternatives rejected.**
+- **A self-hosted GitHub runner on each host, triggered by the push.** On a public
+  repository, a self-hosted runner can be made to run code from untrusted pull requests. It
+  also puts a credentialed agent with outbound control on every GPU machine. Polling a public
+  branch needs no credentials and no inbound access. It updates within one interval (default
+  60 s), which is close enough to "on push".
+- **Pushing to the hosts from a GitHub-hosted workflow** (SSH or WinRM). The nodes would need
+  inbound access from the internet, and GitHub would hold credentials for them.
+- **Deploying tagged releases by hand** (revision 1). It is slower, and nothing enforces that
+  production runs code from `main`.
+- **Pushing `ppe` and `prod` by hand** (`git push` of a fast-forward). That is the existing
+  convention elsewhere, but nothing on GitHub enforces it. A mistaken push of an unmerged
+  commit would deploy it. The workflow and the deployer's own ancestry check are both kept.
+
+**Consequences.**
+- Weekly maintenance still never updates Seriatim (ruling Q10). Only the deployer does.
+- **Two extra Apps for the maintainer to create:** `seriatim-promote` (`contents: write`)
+  and `seriatim-ppe-reporter` (`statuses: write`). Neither is the agents' App.
+- **Check filtering.** CI also runs on pushes to `ppe` and `prod`. The deployer accepts only
+  check runs from the `push` event on `main`, so the fresh runs that a promotion triggers
+  are ignored. They do not hold up the deploy.
+- A restart drains the node (D10). The health-gated, slotted rollout makes it unlikely that
+  two nodes restart at once, but does not guarantee it (SPEC REQ-66).
+
+## 4. Components
 
 | component | package | runs on | state |
 |---|---|---|---|
-| sidecar | `node/seriatim_node` | every GPU node (Windows, macOS) | slots (in memory), config |
-| gateway | `gateway/seriatim_gateway` | one central host (container or systemd) | node health and model cache (in memory, rebuilt from the nodes) |
+| sidecar | `node/seriatim_node` | each GPU node (Windows, macOS) | slots (in memory), the singleton lock file, config |
+| gateway | `gateway/seriatim_gateway` | one central host (container or systemd) | node health and discovery cache (in memory, rebuilt from the nodes) |
 | contract | `contract/openapi.yaml` | — | — |
-| deploy | `deploy/windows`, `deploy/macos` | GPU nodes | config files, logs |
-| PPE | `ppe/` | the PPE host only | containers, volumes |
+| deploy | `deploy/windows`, `deploy/macos` | GPU nodes | config, logs |
+| PPE | `ppe/` | CI, and the designated local host | containers, model cache |
 
 ## 5. Interface contract
 
@@ -237,254 +379,309 @@ A Rust (or other) sidecar is a drop-in when it passes that suite in the PPE.
 
 | from → to | transport | auth | what |
 |---|---|---|---|
-| client → gateway | HTTP(S), port configurable | `Authorization: Bearer <client key>` (or `X-API-Key`) | Ollama native API, `/v1/*`, `/models/select`, `/seriatim/*` |
-| client → sidecar (directly) | HTTP(S) :11434 | Bearer (client key known to that node) | Ollama native API, `/v1/*`, `/seriatim/*` |
-| gateway → sidecar | HTTP(S) :11434 | Bearer (the node's key) | the same as a direct client, plus `X-Request-Id` |
-| sidecar → Ollama | HTTP over loopback :11435 | none (loopback only) | raw passthrough |
+| client → gateway | HTTP/1.1 (TLS optional) | `Authorization: Bearer` (client key) | the Ollama native API, `/v1/*`, `/models/select`, `/seriatim/*` |
+| client → sidecar | HTTP/1.1 :11434 | Bearer (a key known to that node) | the Ollama native API, `/v1/*`, `/seriatim/*` |
+| gateway → sidecar | HTTP/1.1 :11434 | Bearer (the node's `infer` or `admin` key) | as a direct client, plus `X-Request-Id` |
+| sidecar → Ollama | HTTP/1.1 over loopback :11435 | none | raw passthrough |
 
 ### 5.2 Headers that Seriatim adds or reads
 
-| header | direction | meaning |
+| header | where | meaning |
 |---|---|---|
-| `Retry-After` | response (429, 503) | whole seconds |
-| `X-Seriatim-Node` | response (gateway); request (admin calls through the gateway, REQ-41) | the node id that served the request, or the node to target |
-| `X-Seriatim-Gate` | response (sidecar) | `acquired` (the request held a slot) or `ungated` |
-| `X-Seriatim-Ctx` | response | `exceeds-limit; requested=<n>; limit=<m>` (REQ-8, `flag` mode only) |
-| `X-Seriatim-Partial` | response (gateway combined views) | comma-separated ids of nodes that did not answer |
-| `X-Request-Id` | both | echoed if the client sends it (≤ 128 characters, `[A-Za-z0-9._-]`), otherwise generated; it appears in logs |
+| `Retry-After` | 429, and 503 except `OLLAMA_EXPOSED` | whole seconds |
+| `X-Seriatim-Gate` | every sidecar response | `acquired` (the request held a slot), `ungated`, or `busy` (the admission 429) |
+| `X-Seriatim-Node` | gateway responses; also a request header for admin calls | the node that served the request, or the node to target |
+| `X-Seriatim-Partial` | gateway combined views | comma-separated ids of nodes that didn't answer |
+| `X-Request-Id` | both directions | echoed if valid (≤ 128 characters, `[A-Za-z0-9._-]`), otherwise generated |
+| `X-Resolved-Model`, `X-Model-Digest`, `X-Execution-Device`, `X-Rerouted-From`, `X-Reroute-Reason` | gateway responses | kept for compatibility (SPEC §7.1) |
 
 ### 5.3 Header handling in the passthrough
 
-- **Request to Ollama.** The sidecar removes the hop-by-hop headers (`Connection`, and every
-  header it names, `Keep-Alive`, `Proxy-*`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`),
-  plus `Authorization`, `X-API-Key` and `X-Seriatim-*`.
-  - `Host` is set to the upstream. `Content-Length` is set from the exact body bytes.
-  - httpx's own default headers are suppressed, so Ollama sees `Accept-Encoding` only if the
-    client sent it.
-- **Response to the client.** The sidecar removes the hop-by-hop headers and keeps everything
-  else, including `Content-Encoding` and `Content-Length`. The bytes are raw, so the length is
-  still valid. Then it adds the headers in §5.2.
+**Request to Ollama.**
+- **Removed:**
+  - the hop-by-hop headers: `Connection` and every header it names, `Keep-Alive`, `Proxy-*`,
+    `TE`, `Trailer`, `Transfer-Encoding` and `Upgrade`;
+  - `Authorization`, `Cookie`, `X-API-Key` and `X-Seriatim-*`;
+  - the forwarding headers `Forwarded`, `X-Forwarded-*` and `X-Real-IP`;
+  - `Accept-Encoding`, so Ollama never compresses and in-stream error records stay safe to
+    frame.
+- **Set:** `Host` to the upstream; `Content-Length` from the exact bytes of the body.
+- **httpx's own defaults** (`accept`, `accept-encoding`, `user-agent`) are deleted *after*
+  `build_request`, unless the client sent them. This is because httpx fills them in when the
+  request is built.
 
-### 5.4 Error envelope and codes
+**Response to the client.**
+- **Removed:**
+  - the hop-by-hop headers;
+  - every `Access-Control-*` header, because Seriatim serves no CORS;
+  - every `X-Seriatim-*` header, and the compatibility headers in §5.2, so Ollama can't forge
+    Seriatim's own;
+  - `Set-Cookie`.
+- **Kept, unchanged:** `Content-Type`, `Content-Length` and `Content-Encoding`. The bytes are
+  raw, so the values stay valid.
+- **Then** Seriatim adds its own headers.
 
-All errors that Seriatim produces use this body (Ollama's own errors pass through unchanged):
+### 5.4 Error envelope, codes and replay safety
+
+Every error Seriatim produces has this form (Ollama's own errors pass through as
+`UpstreamError`):
 
 ```json
 {"error": "GPU busy: another request is running on this node",
- "error_code": "GPU_BUSY", "retryable": true, "retry_after": 15,
- "source": "sidecar", "busy_for_s": 12.4}
+ "error_code": "GPU_BUSY", "retryable": true, "replay_safe": true, "retry_after": 15,
+ "source": "sidecar", "node": "node-a", "busy_for_s": 12.4}
 ```
 
-| code | HTTP | retryable | produced by |
-|---|---|---|---|
-| `GPU_BUSY` | 429 | yes | sidecar |
-| `AUTH_MISSING`, `AUTH_INVALID` | 401 | no | both |
-| `FORBIDDEN_SCOPE` | 403 | no | both |
-| `BAD_REQUEST_BODY` | 400 | no | both (only when a check needs the body and it can't be parsed) |
-| `NUM_CTX_UNSUPPORTED_ROUTE` | 400 | no | sidecar |
-| `NODE_REQUIRED`, `UNKNOWN_TASK` | 400 | no | gateway |
-| `MODEL_NOT_FOUND` | 404 | no | gateway |
-| `REQUEST_BODY_TIMEOUT` | 408 | yes | both |
-| `BODY_TOO_LARGE` | 413 | no | both |
-| `NUM_CTX_EXCEEDS_LIMIT`, `MODEL_SIZE_UNKNOWN` | 422 | no | sidecar / gateway |
-| `INTERNAL` | 500 | yes | both |
-| `UPSTREAM_UNAVAILABLE`, `UPSTREAM_PROTOCOL_ERROR` | 502 | yes | both |
-| `OLLAMA_EXPOSED`, `NO_HEALTHY_NODE` | 503 | yes | sidecar / gateway |
-| `LOCK_HOLD_EXCEEDED` | 504 | yes | sidecar |
-| `UPSTREAM_STREAM_BROKEN` | — (in-stream record) | yes | both |
+- `retryable` means that retrying later can succeed.
+- `replay_safe` means that Ollama provably never received this request, so it may be resent
+  anywhere. The gateway retries on another node only when `replay_safe` is true.
+
+| code | HTTP | retryable | replay_safe | by |
+|---|---|---|---|---|
+| `GPU_BUSY` | 429 | yes | yes | sidecar |
+| `BAD_PATH` | 400 | no | yes | both |
+| `AUTH_AMBIGUOUS` | 400 | no | yes | both |
+| `BAD_REQUEST_BODY`, `NUM_CTX_AMBIGUOUS`, `NUM_CTX_UNSUPPORTED_ROUTE` | 400 | no | yes | sidecar |
+| `NODE_REQUIRED`, `UNKNOWN_TASK` | 400 | no | yes | gateway |
+| `AUTH_MISSING`, `AUTH_INVALID` | 401 | no | yes | both |
+| `FORBIDDEN_SCOPE` | 403 | no | yes | both |
+| `NOT_FOUND` (a reserved `/seriatim/*` path) | 404 | no | yes | both |
+| `MODEL_NOT_FOUND` | 404 | no | yes | gateway |
+| `METHOD_NOT_ALLOWED` | 405 | no | yes | both |
+| `REQUEST_BODY_TIMEOUT` | 408 | yes | yes | both |
+| `UPLOAD_INTERRUPTED` (a streamed blob upload, after bytes were forwarded) | 408 | yes | **no** | both |
+| `BODY_TOO_LARGE` | 413 | no | yes | both |
+| `NUM_CTX_EXCEEDS_LIMIT` | 422 | no | yes | sidecar |
+| `MODEL_SIZE_UNKNOWN` | 422 | no | yes | gateway |
+| `INTERNAL` | 500 | yes | **no** | both |
+| `UPSTREAM_UNAVAILABLE` | 502 | yes | yes (the connect failed) | both |
+| `UPSTREAM_PROTOCOL_ERROR` | 502 | yes | **no** | both |
+| `NODE_STARTING` | 503 | yes | yes | sidecar |
+| `EXPOSURE_UNVERIFIED` | 503 | yes | yes | sidecar |
+| `OLLAMA_EXPOSED` | 503 | **no** | yes | sidecar |
+| `NODE_SATURATED` (the ungated connection pool is full) | 503 | yes | yes | sidecar |
+| `DISCOVERY_INCOMPLETE` | 503 | yes | yes | gateway |
+| `GPU_OFFLINE` (no healthy node can serve the model) | 503 | **no** | yes | gateway |
+| `LOCK_HOLD_EXCEEDED` | 504 | yes | **no** | sidecar |
+| `HTTP_VERSION_UNSUPPORTED` | 505 | no | yes | both |
+| `UPSTREAM_STREAM_BROKEN` (an in-stream record only) | — | yes | **no** | both |
 
 ## 6. Concurrency model (summary)
 
 The details are in TD-slice-1 §3.
-- **One process, one event loop.** The gate is a counter with no `await` between the check and
-  the increment, so admission is atomic under asyncio.
-- **Admission happens before the body is read,** so a 429 costs microseconds.
-- **The lease is owned by the proxy's ASGI call.** The call runs the upstream exchange and a
-  disconnect watcher in one task group, under a deadline. Every way out (finishing, the client
-  leaving, upstream failing, the deadline, a bug) goes through one `finally`. That block closes
-  the upstream response, then releases the lease.
-- **No background task ever releases a lease** (SPEC REQ-11).
+- **One process, one event loop.** Admission is a synchronous counter check, with no `await`
+  inside, so it is atomic.
+- **Admission happens before the body is read.**
+- **The lease belongs to the proxy's ASGI call.** The call runs the upstream exchange inside
+  anyio cancel scopes: an outer deadline scope for the hold limit, and a task group with a
+  disconnect watcher.
+- **One way out.** Every exit passes through a single `finally`. Inside a **shielded** cancel
+  scope it closes the upstream response, then frees the slot or starts its drain.
+- **No background task ever frees a slot.**
 
 ## 7. Threat model
 
-**Assets.**
+**Assets:**
 - GPU time;
-- the models on disk;
-- prompts and outputs, which can be confidential;
+- models on disk;
+- prompts and outputs;
 - keys;
-- Ollama's admin API (pull, push, create, copy, delete);
-- the integrity of the "one at a time" guarantee.
+- Ollama's admin API (pull, push, create, copy and delete);
+- the one-at-a-time guarantee itself.
 
-**Actors.**
-- **Trusted:** the operator (holds admin keys) and local users of the node.
-- **Semi-trusted:** clients with `infer` keys.
-- **Untrusted:** any host on the LAN, and web pages in a LAN browser.
+**Actors:**
+- **Trusted:** the maintainer and operator, who hold the admin keys; local users of a node.
+- **Semi-trusted:** holders of `infer` keys.
+- **Untrusted:** any host on the LAN; web pages in a LAN browser.
 
 | # | threat (STRIDE) | vector | mitigation | residual |
 |---|---|---|---|---|
-| T1 | Elevation / DoS: bypassing the gate | A LAN host connects to Ollama directly | Ollama binds to loopback (D2); firewall; deploy check; runtime self-check refuses gated traffic (REQ-19) | Local users on the node can still reach 11435 (trusted by assumption) |
-| T2 | Information disclosure: key or prompt sniffing | Plain HTTP on the LAN | Optional TLS (REQ-27, Q6) | **Open** while TLS is off |
-| T3 | Information disclosure: key leakage at rest or in logs | Repository, logs, config files | Hashes on nodes; credentials never logged; keys never accepted in queries; gitleaks plus the private-terms check; config ACL / 0600 | The gateway holds node keys in plain text (it must) |
-| T4 | Spoofing: forged client | Guessing a key | 256-bit keys; constant-time compare; 401 with no hint about which part was wrong | — |
-| T5 | DoS: holding the GPU | A long generation, a slow reader, a slow uploader | Maximum hold (REQ-12); body timeout and size limit (REQ-20); disconnect closes the upstream | An `infer` key holder can keep a node busy up to the maximum hold, repeatedly (there are no quotas, a non-goal) |
-| T6 | Tampering / elevation: abuse of the admin API | Delete models, pull huge models, push to a registry, SSRF through `/api/pull` to any registry URL | The `admin` scope (REQ-14, Q5) | An admin key holder is trusted |
-| T7 | Tampering: request smuggling or header injection through the passthrough | Crafted `Transfer-Encoding`, `Connection` or `Host` | h11 parsing (uvicorn) and httpx; hop-by-hop headers removed; `Host` rewritten; body length from bytes (§5.3) | Depends on h11 and httpx being correct (they are pinned and updated) |
-| T8 | Spoofing: a rogue or compromised node lies to the gateway | Fake 429, `/api/tags` or status | Nodes are configured explicitly (no discovery); the gateway authenticates to them | Responses from nodes are not authenticated without TLS |
-| T9 | Cross-site attack from a LAN browser | A web page calling `http://node:11434` | Bearer only (no cookies), so CSRF has no ambient credential; no CORS headers are sent, so pages can't read responses | A page can still send blind requests, which are rejected with 401 |
-| T10 | Information disclosure through status and errors | `/seriatim/health`, the 429 body | Health returns only a status and reasons; the 429 shows only `busy_for_s` (not the other tenant's model or client); status needs a key | Key holders see which models are loaded |
-| T11 | Supply chain | A malicious dependency or Action | Locked dependencies (`uv.lock`); Actions pinned by SHA; Dependabot; gitleaks binary verified by checksum; nodes install tagged releases only (Q10) | Upstream compromise between pinned updates |
-| T12 | Repudiation | "Who used the GPU?" | Request log with client key id, request id, path, model and timings (REQ-22) | Logs are local to each node and not tamper-proof |
+| T1 | Elevation / DoS: bypassing the gate | A LAN host reaches Ollama directly; a node-local process uses 11435 | Loopback bind (D2); firewall; local-only check; the fail-closed exposure check (REQ-19); Seriatim's own scripts use the sidecar (D9) | Node-local processes can reach 11435. Local users are trusted, and the guarantee says so (SPEC §6.1) |
+| T2 | Information disclosure and tampering: sniffing keys or prompts; forging a node's admission 429 so that the gateway runs a request twice | Plain HTTP on the LAN | Optional TLS (REQ-27); required where the LAN is not trusted (SPEC §6.2) | **Open** while TLS is off. Active network attackers are outside the threat model in that mode |
+| T3 | Information disclosure: keys at rest or in logs | The repository, logs, config files | Hashes on nodes; credentials never logged or accepted in query strings; gitleaks; config ACLs | The gateway holds node keys in plain text (it must) |
+| T4 | Spoofing: forging a client | Guessing, or a timing attack | 256-bit keys; constant-time comparison against every hash | — |
+| T5 | DoS: holding the GPU | A long generation, a slow reader, a slow uploader | The maximum hold (REQ-12); body limits (REQ-20); disconnects drain | An `infer` key can keep a node busy up to the maximum hold, repeatedly (quotas are a non-goal) |
+| T6 | Tampering / elevation: abuse of the admin API | Deleting models, filling the disk, pushing to a registry, SSRF through `/api/pull` | The `admin` scope (REQ-14); unknown endpoints need `admin` | Admin key holders are trusted |
+| T7 | Tampering: path confusion | `..`, `%2e`, `%2f`, `//` or backslashes that turn a gated path into an ungated one | Raw-path rejection before any normalisation; exact matching (D12) | — |
+| T8 | Tampering: request smuggling or header injection | Crafted `Transfer-Encoding`, `Connection` or `Host` | h11 and httpx parsing; HTTP/1.1 only; hop-by-hop headers stripped; body length from bytes | Depends on h11 and httpx (pinned and updated) |
+| T9 | Spoofing: forging Seriatim headers through Ollama | A compromised or odd upstream sets `X-Seriatim-Gate: busy` to trigger replays | The sidecar strips every reserved header from Ollama's responses (§5.3) | — |
+| T10 | Spoofing: a rogue node lies to the gateway | A fake 429, `/api/tags` or status | Nodes are configured explicitly; the gateway authenticates to them | Responses from nodes are not authenticated without TLS (see T2) |
+| T11 | Cross-site requests from a LAN browser | A web page calling a node | Bearer only, no cookies, no CORS headers (and Ollama's are stripped) | Blind requests are possible, and are rejected with 401 |
+| T12 | Information disclosure through status and errors | Health, the 429 body | Health gives only a status and reasons; the 429 shows only `busy_for_s`; status needs a key | Key holders see which models are loaded |
+| T13 | Elevation: two sidecars on one Ollama | A second instance on another port, or with another lock directory | The host-wide OS lock in a fixed directory (D11); the local-only check's one-process check | Containers with separate filesystems (D11) |
+| T16 | Elevation: an unreviewed change reaches a host | A push to `ppe`/`prod` of a commit not on `main`; a workflow on another branch using the promotion key | Rulesets with `seriatim-promote` as the only bypass; the key held as an environment secret, released only to runs on `main`; the deployer's own ancestry and required-check verification (D13) | The maintainer's own account, and the promotion App's key |
+| T14 | Supply chain | A malicious dependency or Action | `uv.lock`; Actions pinned by SHA; gitleaks verified by checksum; hosts install only commits from `prod`, which is fast-forwarded from verified `main` commits and checked again by the deployer (D13) | A compromise between pinned updates |
+| T15 | Repudiation | "Who used the GPU?" | A request log with key id, request id, path, model and timings (REQ-22) | Logs are local and not tamper-proof |
 
 ## 8. Residual risks
 
-1. **Plain HTTP on the LAN** (T2), until Q6 changes the default.
-2. **Cancellation lag.** After an upstream close, Ollama can take a moment to stop generating.
-   A request admitted right then can briefly overlap the cancelled one on the GPU. Ollama's own
-   `NUM_PARALLEL=1` queue serialises them, so the result is a short delay, not a VRAM clash.
-   PPE test P6 measures this.
-3. **Local bypass.** A process on the node can still reach 127.0.0.1:11435. Maintenance scripts
-   use it on purpose, for pulls that are not gated anyway.
-4. **Restart loses in-flight work.** Restarting the sidecar drops its in-flight request (the
-   upstream closes and Ollama cancels it). There is no lock state to recover.
-5. **A static `Retry-After`** can be too short (wasted retries) or too long (idle GPU).
-6. **Ollama API drift.** A new Ollama endpoint is gated by default (REQ-5), but changed
-   streaming formats or new options could still surprise clients. This is managed by
-   capturing fixtures for each version (REQ-56).
-7. **The gateway is a single point of failure** for clients that only know it. They can fall
-   back to a sidecar directly.
-8. **`parameter_size` quality.** Routing trusts Ollama's metadata. A wrong or missing value
-   gives `MODEL_SIZE_UNKNOWN` (fail-closed) or a route chosen by the operator's override.
-9. **GPU memory figures are advisory.** `/models/select` and status read memory at a point in
-   time. They are not used to gate requests.
+1. **Plain HTTP on the LAN** while TLS is off (T2).
+2. **The drain is time-based** (D10).
+   - If Ollama takes longer than `DRAIN_S` to stop after a cancellation, the next request is
+     admitted, but Ollama's own `NUM_PARALLEL=1` queue holds it until the first one stops. The
+     result is a delay, not two requests at once.
+   - P6 and the S5/S6 node measurements record the real latency, and the default carries a
+     margin over it.
+   - If closing the upstream connection cannot be proven, the slot stays stuck instead
+     (D10).
+3. **Node-local bypass** of 11435 (T1), outside the guarantee by definition.
+4. **A static `Retry-After`** can be too short or too long.
+5. **Ollama API drift.** New endpoints are gated and need `admin` (D12). The fixtures and route
+   list captured for each version catch format changes before an upgrade (REQ-56).
+6. **The gateway as a single point of failure.** Clients can fall back to a sidecar directly.
+7. **Model metadata quality.** A wrong `parameter_size` misroutes a model, unless
+   `size_overrides` corrects it. A missing one is rejected (`MODEL_SIZE_UNKNOWN`).
+8. **Memory figures are advisory and never invented.** On Apple Silicon `free_mb` is null, so
+   `/models/select` cannot answer "fits" there.
 
-## 9. Evaluation summary (the evidence cited above)
+## 9. Evaluation summary
 
-All of this comes from the CPU-only PPE: two Ollama 0.40.16 backends serving `qwen2.5:0.5b`
-under size-named aliases, with packet capture used to see what each backend received. A
-cleaned full copy is proposed for `docs/EVALUATION.md` (Q11).
+The evidence is in [EVALUATION.md](../EVALUATION.md). In short:
 
-| | predecessor | LiteLLM v1.108.9 | Olla v0.1.0 | lollms_hub | ollama_load_balancer |
+| | predecessor | LiteLLM | Olla | lollms_hub | ollama_load_balancer |
 |---|---|---|---|---|---|
-| E1a native options incl. `num_ctx` | ◐ silently clamps `num_ctx` above a table | ❌ no native route | ✅ | ✅ (but hard-coded crop in code) | ✅ |
-| E1b `num_ctx` on `/v1` | ❌ ignored by Ollama | ◐ top-level only | ❌ | ❌ (500) | ❌ |
-| E2 busy → immediate 429 | ◐ global lock blocks idle B | ❌ queued 30 s (✅ with hook) | ❌ queued 28 s | ❌ queued | ❌ spills over, then 503 without `Retry-After` |
-| E3 size routing, including a machine down | ❌ | ✅ (config) | ✅ (discovery + priority) | ❌ | ❌ |
-| E4 Bearer auth | ✅ | ✅ | ❌ | ✅ ⚠ default secret | ❌ forwards client auth |
+| E1a native options | ◐ clamps `num_ctx` | ❌ no native route | ✅ | ✅ (crop in code) | ✅ |
+| E1b `num_ctx` on `/v1` | ❌ | ◐ | ❌ | ❌ | ❌ |
+| E2 busy → 429 | ◐ global lock | ❌ queued (✅ with hook) | ❌ queued | ❌ queued | ❌ 503 without `Retry-After` |
+| E3 size routing | ❌ | ✅ | ✅ | ❌ | ❌ |
+| E4 Bearer auth | ✅ | ✅ | ❌ | ✅ ⚠ default secret | ❌ |
 | E5 GPU memory | ✅ | ❌ | ❌ | ◐ | ❌ |
-| E6 native tags / ps / version | ◐ primary only | ❌ | ◐ | ❌ | ◐ |
+| E6 native views | ◐ one machine | ❌ | ◐ | ❌ | ◐ |
 
 ## 10. Slice plan
 
-Rules for every slice:
-- **Size.** At most about 15 changed files (lock files excluded). The review bundle stays under
-  ~150 KB, below agy's ~180 KB limit; CI checks both.
-- **Process.** The slice's TD is written and reviewed before its code. CI is green, and the PR
-  pastes the coverage (≥ 80%) and mutation (≥ 75%) results. The cross-vendor review (codex and
-  agy through the model-validator) runs, and every real finding is fixed. The PPE behaviour
-  tests are run with their output pasted. Then stop for Scott's approval before any push.
-- **Order.** Each slice leaves `main` releasable. Slices are ordered so that a sidecar is
-  useful alone (S1 to S6) before the gateway exists (S7 to S10).
+**Rules for every slice:**
+- **Size.** At most 15 changed files (lock files excluded) and a diff of at most 150 KB.
+  Slice 1 is planned at 13 files, to leave a margin.
+- **TD first.** The slice's TD is reviewed and merged *before* its code, in its own PR, so TD
+  changes never sit in the implementation PR.
+- **Gates.** CI is green, which includes coverage, mutation and the PPE. The PR quotes the
+  coverage and mutation numbers.
+- **Review and approval.** An independent reviewer reviews the slice, every real finding is
+  fixed, and the maintainer approves.
+- **Order.** Each slice leaves `main` releasable. A sidecar is useful on its own (S1 to S6)
+  before the gateway exists (S7 to S10).
 
-| slice | content | tests it adds | TD |
+**Already done:** `main` holds the licence, README, CONTRIBUTING, `.gitignore`,
+`.env.example`, CODEOWNERS, the gitleaks pre-commit hook and the `secret-scan` workflow.
+
+| slice | content | tests | TD |
 |---|---|---|---|
-| **S0a** Scaffolding and CI | `LICENSE` (Apache-2.0), `CONTRIBUTING.md`, `README.md`, `AGENTS.md` + `CLAUDE.md`, `.gitignore`, `.env.example`, uv workspace `pyproject.toml`, `.pre-commit-config.yaml` (gitleaks, ruff, private terms), `.gitleaks.toml` (IP-literal rule), CI workflow (§8.4 checks), PR template ("paste output") | CI proves each gate on a deliberately failing commit (shown in the PR) | none (Q8); reviewed as a PR |
-| **S0b** PPE harness and real fixtures | `ppe/compose.yaml` (one Ollama + capture container; caps; localhost ports), `ppe/ppe` (up/down/purge, cap check, allowed-host check), `tools/capture_fixtures.py`, `tests/fixtures/ollama-0.40.16.json`, `docs/EVALUATION.md` (Q11) | `tests/tools/test_capture_fixtures.py`; `ppe/ppe check` refuses a compose file that is over the cap or not on localhost | specified in TD-slice-1 App. B |
-| **S1** Contract + sidecar gate, 429, passthrough | `contract/openapi.yaml`, `node/` package: config, gate, proxy (streaming, disconnects, maximum hold, error mapping), health, logs | C1–C8, K1, G1–G9, H1–H7, B1–B4, S1–S8, E1–E5, HL1–HL2, L1, K-OAS1–3; PPE P1–P6 | **TD-slice-1** |
-| **S2** Sidecar auth and TLS | keys (hashes, ids, scopes), `keygen` CLI, 401/403, `X-API-Key`, non-loopback listen allowed only with keys, optional TLS | A1–A10: missing, wrong and right key on every route class; scope matrix; constant-time compare path; key never in logs or upstream; startup refusals; TLS smoke | TD-slice-2 |
-| **S3** `num_ctx` policy | body inspection without rewriting; limits by model pattern; `reject`/`flag` modes; `/v1` rule; the holder's model in status | N1–N8: over and under limit in each mode; no limit; `/v1` top-level and `options`; unparseable body; bytes still identical (wire capture in PPE) | TD-slice-3 |
-| **S4** Status, memory, exposure self-check | `/seriatim/status`; `nvidia-smi` and macOS probes with a 2 s timeout; `/api/ps`; REQ-19 probe; degraded health | M1–M8: recorded `nvidia-smi` outputs (captured on a real node, with ids removed) and failures; macOS `sysctl` outputs; probe timeout → `unavailable`; exposure detected → 503 | TD-slice-4 |
-| **S5** Deploy: Windows | `install.ps1`, WinSW XML templates, `check-local-only.ps1`, `update-models.ps1`, `weekly-maintenance.ps1`, scheduled-task registration | Pester tests with stubbed `Get-NetTCPConnection`, `Get-Service` and the `ollama` exit code; a manual run on one node, with output pasted | TD-slice-5 |
-| **S6** Deploy: macOS | `install.sh`, launchd plists, `check-local-only.sh`, `update-models.sh`, `weekly-maintenance.sh`; records the LaunchAgent vs LaunchDaemon (Metal) result | bats tests with stubbed `lsof`, `launchctl` and `ollama`; a manual node run | TD-slice-6 |
-| **S7** Gateway core | node config, discovery cache, size routing, passthrough, 429 passthrough or spill-over (Q1), failover before the request is sent, client auth, `NODE_REQUIRED` | R1–R14: routing table cases (including E3's "B down → 32B error"); 429 handling; connect failure vs failure after sending; client key not forwarded | TD-slice-7 |
-| **S8** Gateway combined views | `/api/tags`, `/api/ps`, `/api/version` merge; partial flags; `/seriatim/nodes`; health | V1–V8, using captured multi-node fixtures | TD-slice-8 |
-| **S9** `/models/select` | task preferences from config, routing, `fits_in_free_memory` | SEL1–SEL8: memory unknown → null; nothing fits; unknown task | TD-slice-9 |
-| **S10** Gateway deploy + two-node PPE | Dockerfile, systemd example, a PPE with two nodes | P-GW1–P-GW6 (routing, never-too-small, busy isolation between nodes (F1), combined views, streaming end to end, failover) | TD-slice-10 |
-| **S11** Release 0.1.0 | operator guide, supported Ollama versions, changelog, tag | full PPE run plus each node's local-only output, pasted | none |
+| **S0a** Tooling and CI | Root `pyproject.toml` (uv workspace, ruff, pytest, `mutmut>=3.3,<4`); `node/pyproject.toml` with pinned runtime dependencies; `node/seriatim_node/__init__.py` and `__main__.py`; `uv.lock`; `.env.example` with the `SERIATIM_NODE_*` names; `.github/workflows/ci.yml` (lint, test matrix, coverage, mutation with the score parser, contract lint, IP literals, private terms, PR size); `.github/workflows/security.yml` (Bandit, pip-audit, Trivy config scan; weekly schedule); both on PRs and on pushes to `main`, `ppe` and `prod`; PR template | Each gate shown failing on a deliberate bad commit, recorded in the PR | none (ruling Q8) |
+| **S0b** PPE, fixtures and the PPE job | `ppe/compose.yaml` (one Ollama + capture, real micro-models, limits, localhost ports); `ppe/ppe` (up/down/purge, effective-config guard, `--ci` only on GitHub Actions, allowed-host for local runs); `tools/capture_fixtures.py` (fixtures plus a probe of every classified route); `tests/fixtures/route-pairs.json` (the REQ-5 pairs); `tests/fixtures/ollama-0.40.16.json`; `.github/workflows/ppe.yml` (required, model cache) | `tests/tools/test_ppe_guard.py` (every refusal in SPEC §8.3); `tests/tools/test_capture.py` (cleaning, format) | none (Q8); formats in TD-slice-1 App. B |
+| **S1** Contract + sidecar gate, 429, passthrough | `contract/openapi.yaml`; `node/`: config, classification, gate with drain, proxy (streaming, disconnects, hold limit, framing-safe errors), startup quarantine, singleton, health, logs | TD-slice-1 §8: C, K, G, H, B, S, F, E, R, HL, L, K-OAS; PPE P1–P7 | **TD-slice-1** |
+| **S2** Sidecar auth | keys (hashes, ids, scopes), `keygen`, 401/403, `AUTH_AMBIGUOUS`, constant-time comparison against every hash, the hourly unauthenticated warning | A1–A12: every route class × {missing, wrong, infer, admin} key; ambiguous credentials; key never in logs or upstream; startup refusals | TD-slice-2 |
+| **S3** `num_ctx` policy | strict body inspection (duplicate keys, types, conflicts); limits by pattern with an overlap check; `/v1` rule; the holder's model in status | N1–N10, with wire-capture proof in the PPE that the bytes are unchanged | TD-slice-3 |
+| **S4** Status, memory, exposure | `/seriatim/status`; `nvidia-smi` and macOS probes (measured-only); `/api/ps` error state; the fail-closed exposure check; health extensions; non-loopback listen enabled | M1–M8 (recorded `nvidia-smi` and `sysctl` outputs, failures, timeouts); X1–X6 (exposed, unverifiable, timeout, incomplete, first-check gating, recovery) | TD-slice-4 |
+| **S0c** Release branches | `.github/workflows/promote.yml` (manual, target `ppe` or `prod`; the `prod` environment for `prod`; ancestry and check verification; fast-forward only); `deploy/common/seriatim_deploy.py` (poll, verify, versioned venv, switch, check, roll back, stagger); a systemd timer example for the PPE host; the `ppe` and `prod` ruleset settings, documented for the maintainer to apply | `tests/deploy/test_deployer.py` (refuses non-ancestor or red commits on `prod`; rolls back on a failed restart or a failed check; does not retry a refused head; stagger); a promote dry run on a fork | TD-slice-0c |
+| **S5** Deploy: Windows | install (including the deployer and its Task Scheduler timer), WinSW templates, `check-local-only`, `update-models` (through the sidecar), weekly maintenance | Pester with stubbed system commands; a manual node run, output pasted | TD-slice-5 |
+| **S6** Deploy: macOS | install (including the deployer and its launchd timer), launchd plists, the same scripts; the Metal-under-LaunchDaemon result recorded | bats with stubbed `lsof`, `launchctl` and `curl`; a manual node run | TD-slice-6 |
+| **S7** Gateway core | node config, discovery with unknown states, size routing with `size_overrides`, passthrough, spill-over on the admission marker only, replay-safe failover, client auth, `NODE_REQUIRED`, compatibility headers | R-GW1–R-GW16, using `/api/tags` captured in the PPE from real micro-models; upstream-429 vs admission-429 cases; every-candidate-once with 3 nodes | TD-slice-7 |
+| **S8** Gateway combined views | `/api/tags`, `/api/ps` and `/api/version` merges with schemas; partial flags; `/seriatim/nodes`; health | V1–V8 | TD-slice-8 |
+| **S9** `/models/select` | task preferences, routing, measured-memory fit (null when not measured) | SEL1–SEL8 | TD-slice-9 |
+| **S10** Gateway deploy + two-node PPE | Dockerfile, systemd example, a two-node PPE with real size metadata | P-GW1–P-GW7 (routing, never-too-small, busy isolation between nodes (F1), spill-over, combined views, streaming end to end, failover) | TD-slice-10 |
+| **S11** TLS (optional) | certificate and key settings for the sidecar and the gateway; PPE TLS smoke test | T1–T4 | TD-slice-11 |
+| **S12** Release 0.1.0 | operator guide, supported Ollama versions, changelog, tag | a full PPE run in CI, plus each node's local-only output | none |
 
 ---
 
 ## Appendix A — Contract draft (`contract/openapi.yaml`)
 
-Slice S1 commits this file to `contract/openapi.yaml` and lints it in CI. The gateway paths
-are specified now so that the sidecar and the gateway share one envelope and one set of
-headers; their behaviour is built in S7 to S9. The Ollama API is passed through, not
-redefined. Its paths are listed only to state how the gate treats them (`x-seriatim-gate`)
-and which Seriatim responses they can add.
+S1 commits this file and lints it in CI. The gateway paths are specified now, so that both
+components share one envelope and one set of headers. The Ollama API is passed through, not
+redefined. Its paths are listed only to state the class each one gets (`x-seriatim-gate`,
+`x-seriatim-scope`) and the Seriatim responses it can add.
 
 ```yaml
 openapi: 3.1.0
 info:
   title: Seriatim
-  version: 0.1.0
+  version: 0.2.0
   summary: One-at-a-time GPU gate for Ollama (sidecar + gateway contract)
-  license: { name: Apache-2.0, identifier: Apache-2.0 }
+  license: { name: MIT, identifier: MIT }
 servers:
   - url: http://127.0.0.1:11434
-    description: sidecar (x-seriatim-role sidecar)
+    description: sidecar
   - url: http://127.0.0.1:8434
-    description: gateway (x-seriatim-role gateway; port is an example)
+    description: gateway (example port)
 security:
   - bearer: []
-  - apiKey: []
 
 components:
   securitySchemes:
     bearer: { type: http, scheme: bearer }
-    apiKey: { type: apiKey, in: header, name: X-API-Key }
 
-  # Machine-readable form of the ADR-001 §5.4 table (checked by K-OAS3).
-  # status null = only ever sent as an in-stream StreamErrorRecord.
+  # Machine-readable form of ADR-001 §5.4 (checked by K-OAS3). status null = in-stream only.
   x-seriatim-codes:
-    GPU_BUSY:                  { status: 429, retryable: true }
-    AUTH_MISSING:              { status: 401, retryable: false }
-    AUTH_INVALID:              { status: 401, retryable: false }
-    FORBIDDEN_SCOPE:           { status: 403, retryable: false }
-    BAD_REQUEST_BODY:          { status: 400, retryable: false }
-    NUM_CTX_UNSUPPORTED_ROUTE: { status: 400, retryable: false }
-    NODE_REQUIRED:             { status: 400, retryable: false }
-    UNKNOWN_TASK:              { status: 400, retryable: false }
-    MODEL_NOT_FOUND:           { status: 404, retryable: false }
-    REQUEST_BODY_TIMEOUT:      { status: 408, retryable: true }
-    BODY_TOO_LARGE:            { status: 413, retryable: false }
-    NUM_CTX_EXCEEDS_LIMIT:     { status: 422, retryable: false }
-    MODEL_SIZE_UNKNOWN:        { status: 422, retryable: false }
-    INTERNAL:                  { status: 500, retryable: true }
-    UPSTREAM_UNAVAILABLE:      { status: 502, retryable: true }
-    UPSTREAM_PROTOCOL_ERROR:   { status: 502, retryable: true }
-    OLLAMA_EXPOSED:            { status: 503, retryable: true }
-    NO_HEALTHY_NODE:           { status: 503, retryable: true }
-    LOCK_HOLD_EXCEEDED:        { status: 504, retryable: true }
-    UPSTREAM_STREAM_BROKEN:    { status: null, retryable: true }
+    GPU_BUSY:                  { status: 429, retryable: true,  replay_safe: true }
+    BAD_PATH:                  { status: 400, retryable: false, replay_safe: true }
+    AUTH_AMBIGUOUS:            { status: 400, retryable: false, replay_safe: true }
+    BAD_REQUEST_BODY:          { status: 400, retryable: false, replay_safe: true }
+    NUM_CTX_AMBIGUOUS:         { status: 400, retryable: false, replay_safe: true }
+    NUM_CTX_UNSUPPORTED_ROUTE: { status: 400, retryable: false, replay_safe: true }
+    NODE_REQUIRED:             { status: 400, retryable: false, replay_safe: true }
+    UNKNOWN_TASK:              { status: 400, retryable: false, replay_safe: true }
+    AUTH_MISSING:              { status: 401, retryable: false, replay_safe: true }
+    AUTH_INVALID:              { status: 401, retryable: false, replay_safe: true }
+    FORBIDDEN_SCOPE:           { status: 403, retryable: false, replay_safe: true }
+    NOT_FOUND:                 { status: 404, retryable: false, replay_safe: true }
+    MODEL_NOT_FOUND:           { status: 404, retryable: false, replay_safe: true }
+    METHOD_NOT_ALLOWED:        { status: 405, retryable: false, replay_safe: true }
+    REQUEST_BODY_TIMEOUT:      { status: 408, retryable: true,  replay_safe: true }
+    UPLOAD_INTERRUPTED:        { status: 408, retryable: true,  replay_safe: false }
+    BODY_TOO_LARGE:            { status: 413, retryable: false, replay_safe: true }
+    NUM_CTX_EXCEEDS_LIMIT:     { status: 422, retryable: false, replay_safe: true }
+    MODEL_SIZE_UNKNOWN:        { status: 422, retryable: false, replay_safe: true }
+    INTERNAL:                  { status: 500, retryable: true,  replay_safe: false }
+    UPSTREAM_UNAVAILABLE:      { status: 502, retryable: true,  replay_safe: true }
+    UPSTREAM_PROTOCOL_ERROR:   { status: 502, retryable: true,  replay_safe: false }
+    NODE_STARTING:             { status: 503, retryable: true,  replay_safe: true }
+    EXPOSURE_UNVERIFIED:       { status: 503, retryable: true,  replay_safe: true }
+    OLLAMA_EXPOSED:            { status: 503, retryable: false, replay_safe: true }
+    NODE_SATURATED:            { status: 503, retryable: true,  replay_safe: true }
+    DISCOVERY_INCOMPLETE:      { status: 503, retryable: true,  replay_safe: true }
+    GPU_OFFLINE:               { status: 503, retryable: false, replay_safe: true }
+    LOCK_HOLD_EXCEEDED:        { status: 504, retryable: true,  replay_safe: false }
+    HTTP_VERSION_UNSUPPORTED:  { status: 505, retryable: false, replay_safe: true }
+    UPSTREAM_STREAM_BROKEN:    { status: null, retryable: true, replay_safe: false }
+
   headers:
     Retry-After:
       description: Whole seconds before retrying.
+      required: true
       schema: { type: string, pattern: '^[0-9]+$' }
     X-Seriatim-Gate:
-      schema: { type: string, enum: [acquired, ungated] }
+      schema: { type: string, enum: [acquired, ungated, busy] }
     X-Seriatim-Node:
       schema: { type: string, pattern: '^[a-z0-9][a-z0-9-]{0,31}$' }
-    X-Seriatim-Ctx:
-      schema: { type: string, pattern: '^exceeds-limit; requested=[0-9]+; limit=[0-9]+$' }
     X-Seriatim-Partial:
       schema: { type: string }
     X-Request-Id:
       schema: { type: string, pattern: '^[A-Za-z0-9._-]{1,128}$' }
+    X-Rerouted-From:
+      schema: { type: string }
+    X-Reroute-Reason:
+      schema: { type: string, enum: [busy] }
 
   schemas:
     ErrorCode:
       type: string
-      enum: [GPU_BUSY, AUTH_MISSING, AUTH_INVALID, FORBIDDEN_SCOPE, BAD_REQUEST_BODY,
-             NUM_CTX_UNSUPPORTED_ROUTE, NODE_REQUIRED, UNKNOWN_TASK, MODEL_NOT_FOUND,
-             REQUEST_BODY_TIMEOUT, BODY_TOO_LARGE, NUM_CTX_EXCEEDS_LIMIT, MODEL_SIZE_UNKNOWN,
-             INTERNAL, UPSTREAM_UNAVAILABLE, UPSTREAM_PROTOCOL_ERROR, OLLAMA_EXPOSED,
-             NO_HEALTHY_NODE, LOCK_HOLD_EXCEEDED, UPSTREAM_STREAM_BROKEN]
+      enum: [GPU_BUSY, BAD_PATH, AUTH_AMBIGUOUS, BAD_REQUEST_BODY, NUM_CTX_AMBIGUOUS,
+             NUM_CTX_UNSUPPORTED_ROUTE, NODE_REQUIRED, UNKNOWN_TASK, AUTH_MISSING, AUTH_INVALID,
+             FORBIDDEN_SCOPE, NOT_FOUND, MODEL_NOT_FOUND, METHOD_NOT_ALLOWED,
+             REQUEST_BODY_TIMEOUT, UPLOAD_INTERRUPTED, BODY_TOO_LARGE, NUM_CTX_EXCEEDS_LIMIT, MODEL_SIZE_UNKNOWN,
+             INTERNAL, UPSTREAM_UNAVAILABLE, UPSTREAM_PROTOCOL_ERROR, NODE_STARTING,
+             EXPOSURE_UNVERIFIED, OLLAMA_EXPOSED, NODE_SATURATED, DISCOVERY_INCOMPLETE,
+             GPU_OFFLINE, LOCK_HOLD_EXCEEDED, HTTP_VERSION_UNSUPPORTED, UPSTREAM_STREAM_BROKEN]
     ErrorEnvelope:
+      description: Every error Seriatim itself produces.
       type: object
-      required: [error, error_code, retryable, source]
+      required: [error, error_code, retryable, replay_safe, source]
       properties:
         error: { type: string, description: Human-readable; same key Ollama uses }
         error_code: { $ref: '#/components/schemas/ErrorCode' }
         retryable: { type: boolean }
+        replay_safe: { type: boolean, description: True only if Ollama never received the request }
         retry_after: { type: integer, minimum: 0 }
         source: { type: string, enum: [sidecar, gateway] }
         node: { type: string }
@@ -492,8 +689,17 @@ components:
         limit: { type: integer, minimum: 1 }
         hint: { type: string }
       additionalProperties: false
+    UpstreamError:
+      description: >
+        An error produced by Ollama, passed through unchanged (status and bytes). Seriatim does
+        not constrain it; Ollama's usual shape is shown for client authors.
+      type: object
+      properties:
+        error: { type: string }
     StreamErrorRecord:
-      description: Last NDJSON line (or SSE data payload) before an aborted stream.
+      description: >
+        Final NDJSON line, or SSE data payload, sent only when framing is safe (SPEC REQ-24);
+        always followed by an aborted connection.
       type: object
       required: [error, error_code]
       properties:
@@ -509,36 +715,35 @@ components:
           type: array
           items:
             type: string
-            enum: [ollama_unreachable, slot_overdue, ollama_exposed, no_healthy_node]
+            enum: [ollama_unreachable, ollama_bad_response, slot_overdue, slot_stuck,
+                   starting, ollama_exposed, exposure_unverified, no_healthy_node]
       additionalProperties: false
-    Holder:
+    Slot:
       type: object
-      required: [path, started_at, elapsed_s]
+      required: [state]
       properties:
-        path: { type: string }
+        state: { type: string, enum: [free, held, draining, stuck] }
+        path: { type: [string, 'null'] }
         model: { type: [string, 'null'] }
-        request_id: { type: string }
-        started_at: { type: string, format: date-time }
-        elapsed_s: { type: number, minimum: 0 }
+        request_id: { type: [string, 'null'] }
+        started_at: { type: [string, 'null'], format: date-time }
+        elapsed_s: { type: [number, 'null'], minimum: 0 }
+        drain_remaining_s: { type: [number, 'null'], minimum: 0 }
     NodeStatus:
       type: object
-      required: [node, version, lock, memory, loaded_models, ollama]
+      required: [node, version, starting, slots, memory, loaded_models, ollama]
       properties:
         node: { type: string }
         version: { type: string }
-        lock:
-          type: object
-          required: [slots, in_use, holders]
-          properties:
-            slots: { type: integer, minimum: 1 }
-            in_use: { type: integer, minimum: 0 }
-            holders: { type: array, items: { $ref: '#/components/schemas/Holder' } }
+        starting: { type: boolean }
+        slots: { type: array, items: { $ref: '#/components/schemas/Slot' } }
         memory:
           type: object
           required: [source, devices]
           properties:
             source: { type: string, enum: [nvidia-smi, apple-unified, unavailable] }
             error: { type: string }
+            models_vram_mb: { type: [integer, 'null'], minimum: 0 }
             devices:
               type: array
               items:
@@ -546,20 +751,58 @@ components:
                 required: [name, total_mb, used_mb, free_mb]
                 properties:
                   name: { type: string }
-                  total_mb: { type: integer, minimum: 0 }
-                  used_mb: { type: integer, minimum: 0 }
-                  free_mb: { type: integer, minimum: 0 }
+                  total_mb: { type: [integer, 'null'], minimum: 0 }
+                  used_mb: { type: [integer, 'null'], minimum: 0, description: null unless measured }
+                  free_mb: { type: [integer, 'null'], minimum: 0, description: null unless measured }
         loaded_models:
-          description: Ollama /api/ps "models" array, unchanged.
-          type: array
+          description: Ollama /api/ps "models", unchanged; null (with loaded_models_error) if unavailable.
+          type: [array, 'null']
           items: { type: object }
+        loaded_models_error: { type: string }
         ollama:
           type: object
-          required: [reachable, local_only]
+          required: [reachable, exposure]
           properties:
             reachable: { type: boolean }
             version: { type: [string, 'null'] }
-            local_only: { type: string, enum: ['true', 'false', unknown] }
+            exposure: { type: string, enum: [local_only, exposed, unverified] }
+    CombinedTags:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            description: Ollama /api/tags model entry, unchanged, plus seriatim_nodes.
+            type: object
+            required: [name, seriatim_nodes]
+            properties:
+              name: { type: string }
+              digest: { type: string }
+              details: { type: object }
+              seriatim_nodes: { type: array, items: { type: string }, minItems: 1 }
+        seriatim_partial: { type: array, items: { type: string } }
+    CombinedPs:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            description: Ollama /api/ps model entry, unchanged, plus seriatim_node.
+            type: object
+            required: [name, seriatim_node]
+            properties:
+              name: { type: string }
+              seriatim_node: { type: string }
+        seriatim_partial: { type: array, items: { type: string } }
+    CombinedVersion:
+      type: object
+      required: [version, seriatim_nodes]
+      properties:
+        version: { type: string, description: Lowest version among the nodes that answered }
+        seriatim_nodes: { type: object, additionalProperties: { type: string } }
+        seriatim_partial: { type: array, items: { type: string } }
     SelectRequest:
       type: object
       required: [task]
@@ -583,61 +826,122 @@ components:
 
   responses:
     Busy:
-      description: No free slot. Ollama did not receive the request.
+      description: >
+        Either Seriatim's admission 429 (X-Seriatim-Gate busy, ErrorEnvelope with GPU_BUSY;
+        Ollama did not receive the request) or Ollama's own 429 passed through
+        (X-Seriatim-Gate acquired, UpstreamError). Only the first triggers spill-over.
       headers:
-        Retry-After: { $ref: '#/components/headers/Retry-After' }
-      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+        Retry-After: { description: Always present on the admission 429, schema: { type: string, pattern: '^[0-9]+$' } }
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+              - $ref: '#/components/schemas/UpstreamError'
+    Unavailable:
+      description: >
+        Seriatim 503 (NODE_STARTING, EXPOSURE_UNVERIFIED, NODE_SATURATED, DISCOVERY_INCOMPLETE
+        and GPU_OFFLINE carry Retry-After; OLLAMA_EXPOSED does not), or Ollama's own 503 passed
+        through.
+      headers:
+        Retry-After: { schema: { type: string, pattern: '^[0-9]+$' } }
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+              - $ref: '#/components/schemas/UpstreamError'
     Error:
-      description: Seriatim-produced error (see ErrorCode table in ADR-001 §5.4).
-      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+      description: >
+        A Seriatim-produced error (ADR-001 §5.4), or, on proxied routes, Ollama's own error
+        with the same status passed through. A body with error_code is Seriatim's.
+      headers:
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+              - $ref: '#/components/schemas/UpstreamError'
     Unauthorized:
       description: Missing or invalid key.
       headers:
         WWW-Authenticate: { schema: { type: string, const: Bearer } }
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
       content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
     Passthrough:
       description: >
-        Ollama's response, status and body bytes unchanged. Streams
-        (application/x-ndjson, text/event-stream) are forwarded incrementally and, on a
-        mid-stream failure, end with a StreamErrorRecord followed by an aborted connection.
+        Ollama's response: status and body bytes unchanged, including Ollama's own errors
+        (UpstreamError). Streams are forwarded incrementally; a mid-stream failure ends with a
+        StreamErrorRecord when framing is safe, then an aborted connection.
       headers:
         X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
         X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
-        X-Seriatim-Ctx: { $ref: '#/components/headers/X-Seriatim-Ctx' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
       content:
-        application/json: {}
+        application/json: { schema: { $ref: '#/components/schemas/UpstreamError' } }
         application/x-ndjson: {}
         text/event-stream: {}
+        text/plain: {}
+        application/octet-stream: {}
 
   x-seriatim-gated-operation: &gated
     x-seriatim-gate: gated
+    x-seriatim-scope: infer
     requestBody:
       description: Opaque Ollama request; forwarded byte-for-byte. Seriatim may read
-        `model`, `num_ctx` and `options.num_ctx` but never rewrites the body.
+        `num_ctx` and `options.num_ctx` (slice S3) but never rewrites the body.
       content: { application/json: {} }
     responses:
       '200': { $ref: '#/components/responses/Passthrough' }
       '400': { $ref: '#/components/responses/Error' }
       '401': { $ref: '#/components/responses/Unauthorized' }
       '403': { $ref: '#/components/responses/Error' }
-      '404': { $ref: '#/components/responses/Error' }
       '408': { $ref: '#/components/responses/Error' }
       '413': { $ref: '#/components/responses/Error' }
       '422': { $ref: '#/components/responses/Error' }
       '429': { $ref: '#/components/responses/Busy' }
       '500': { $ref: '#/components/responses/Error' }
       '502': { $ref: '#/components/responses/Error' }
-      '503': { $ref: '#/components/responses/Error' }
+      '503': { $ref: '#/components/responses/Unavailable' }
       '504': { $ref: '#/components/responses/Error' }
+      '505': { $ref: '#/components/responses/Error' }
       default: { $ref: '#/components/responses/Passthrough' }
   x-seriatim-ungated-operation: &ungated
     x-seriatim-gate: ungated
+    x-seriatim-scope: infer
     responses:
       '200': { $ref: '#/components/responses/Passthrough' }
+      '400': { $ref: '#/components/responses/Error' }
       '401': { $ref: '#/components/responses/Unauthorized' }
       '403': { $ref: '#/components/responses/Error' }
       '502': { $ref: '#/components/responses/Error' }
+      '503': { $ref: '#/components/responses/Unavailable' }
       default: { $ref: '#/components/responses/Passthrough' }
+  x-seriatim-admin-operation: &admin
+    x-seriatim-gate: ungated
+    x-seriatim-scope: admin
+    responses:
+      '200': { $ref: '#/components/responses/Passthrough' }
+      '400': { $ref: '#/components/responses/Error' }
+      '401': { $ref: '#/components/responses/Unauthorized' }
+      '403': { $ref: '#/components/responses/Error' }
+      '502': { $ref: '#/components/responses/Error' }
+      '503': { $ref: '#/components/responses/Unavailable' }
+      default: { $ref: '#/components/responses/Passthrough' }
+
+# Unlisted method+path pairs are gated and need the admin scope (SPEC REQ-5).
+x-seriatim-unknown-endpoint: { x-seriatim-gate: gated, x-seriatim-scope: admin }
 
 paths:
   /seriatim/health:
@@ -696,13 +1000,17 @@ paths:
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  # Ollama read-only views: raw passthrough at the sidecar; combined at the gateway (REQ-38),
-  # where every entry gains seriatim_node(s) and partial results carry seriatim_partial.
-  /api/tags:    { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
-  /api/ps:      { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
-  /api/version: { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
+  # Ungated, infer scope. At the sidecar these are raw passthrough; at the gateway,
+  # /api/tags, /api/ps and /api/version are combined (REQ-38, schemas Combined*).
+  # At the gateway, / answers 200 "Ollama is running" if at least one node is healthy, else 503.
+  /:            { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] }, head: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
+  /api/tags:    { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-gateway-schema: CombinedTags } }
+  /api/ps:      { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-gateway-schema: CombinedPs } }
+  /api/version: { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-gateway-schema: CombinedVersion } }
+  /api/show:    { post: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
+  /v1/models:   { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
 
-  # Gated inference (REQ-5). Unlisted method+path pairs are also gated.
+  # Gated inference, infer scope (REQ-5).
   /api/generate:        { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
   /api/chat:            { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
   /api/embed:           { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
@@ -710,22 +1018,22 @@ paths:
   /v1/chat/completions: { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
   /v1/completions:      { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
   /v1/embeddings:       { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
-  /v1/responses:        { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
 
-  # Ungated (REQ-5). Admin scope (REQ-14) applies to pull/push/create/copy/delete/blobs
-  # from slice S2; through the gateway they need X-Seriatim-Node (REQ-41).
-  /api/show:   { post: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
-  /api/pull:   { post: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-scope: admin } }
-  /api/push:   { post: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-scope: admin } }
-  /api/create: { post: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-scope: admin } }
-  /api/copy:   { post: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-scope: admin } }
-  /api/delete: { delete: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-scope: admin } }
+  # Ungated, admin scope (REQ-14). Through the gateway they need X-Seriatim-Node (REQ-41).
+  /api/pull:   { post: { <<: *admin, x-seriatim-roles: [sidecar, gateway] } }
+  /api/push:   { post: { <<: *admin, x-seriatim-roles: [sidecar, gateway] } }
+  # create converts and quantises models, which loads the machine, so it is gated (admin scope).
+  /api/create: { post: { <<: *gated, x-seriatim-scope: admin, x-seriatim-roles: [sidecar, gateway] } }
+  /api/copy:   { post: { <<: *admin, x-seriatim-roles: [sidecar, gateway] } }
+  /api/delete: { delete: { <<: *admin, x-seriatim-roles: [sidecar, gateway] } }
   /api/blobs/{digest}:
-    parameters: [{ name: digest, in: path, required: true, schema: { type: string } }]
-    head: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-scope: admin }
-    post: { <<: *ungated, x-seriatim-roles: [sidecar, gateway], x-seriatim-scope: admin }
+    parameters:
+      - { name: digest, in: path, required: true, schema: { type: string, pattern: '^sha256:[0-9a-f]{64}$' } }
+    head: { <<: *admin, x-seriatim-roles: [sidecar, gateway] }
+    post: { <<: *admin, x-seriatim-roles: [sidecar, gateway] }
 ```
 
-*Note for S1:* the YAML anchors under `x-` keys are a convenience of the draft. If
-`openapi-spec-validator` rejects merge keys, S1 expands them and adds a test (K-OAS1) that
-checks the expanded file matches the gated table in code.
+The YAML anchors under the `x-` keys are only a convenience in this draft;
+`openapi-spec-validator` accepts the merged result. S1 keeps them, or expands them if a future
+validator rejects merge keys. Either way, K-OAS1 checks that the file's gate and scope classes
+agree with `classify()`.
