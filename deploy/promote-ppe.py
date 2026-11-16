@@ -15,6 +15,7 @@ installation token, not a workflow's GITHUB_TOKEN), so that promotion-source run
 token is read from the environment only, and never printed or written anywhere.
 Standard library only.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,11 +39,16 @@ class Fail(Exception):
 def call(token: str, method: str, path: str, body: dict | None = None):
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(
-        f"{API}{path}", data=data, method=method,
-        headers={"Authorization": f"Bearer {token}",
-                 "Accept": "application/vnd.github+json",
-                 "X-GitHub-Api-Version": "2022-11-28",
-                 "Content-Type": "application/json"})
+        f"{API}{path}",
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read()
@@ -89,8 +95,10 @@ def main() -> int:
         print("bad --repo or --source", file=sys.stderr)
         return 2
     if a.source in ("ppe", "prod") or a.source.startswith("promote/"):
-        print("the source must be a working branch or main, not ppe, prod or promote/*",
-              file=sys.stderr)
+        print(
+            "the source must be a working branch or main, not ppe, prod or promote/*",
+            file=sys.stderr,
+        )
         return 2
 
     repo = a.repo
@@ -113,42 +121,68 @@ def main() -> int:
             return 0
 
         owner = repo.split("/")[0]
-        open_prs = call(token, "GET", f"/repos/{repo}/pulls?state=open&base=ppe"
-                        f"&head={urllib.parse.quote(owner + ':' + branch, safe='')}")
+        open_prs = call(
+            token,
+            "GET",
+            f"/repos/{repo}/pulls?state=open&base=ppe"
+            f"&head={urllib.parse.quote(owner + ':' + branch, safe='')}",
+        )
         existing = ref_sha(token, repo, branch)
         if existing and open_prs:
-            parents = [x["sha"] for x in call(token, "GET",
-                       f"/repos/{repo}/git/commits/{existing}")["parents"]]
+            parents = [
+                x["sha"]
+                for x in call(token, "GET", f"/repos/{repo}/git/commits/{existing}")["parents"]
+            ]
             if parents and parents[0] == t_sha:
                 print(f"already open and current: {open_prs[0]['html_url']}")
                 return 0
 
-        p = call(token, "POST", f"/repos/{repo}/git/commits", {
-            "message": f"Promote {a.source} ({s_sha[:12]}) to ppe\n\nSource: {s_sha}\n",
-            "tree": s_tree,
-            "parents": [t_sha, s_sha],
-        })
+        p = call(
+            token,
+            "POST",
+            f"/repos/{repo}/git/commits",
+            {
+                "message": f"Promote {a.source} ({s_sha[:12]}) to ppe\n\nSource: {s_sha}\n",
+                "tree": s_tree,
+                "parents": [t_sha, s_sha],
+            },
+        )
         if existing:
             # Rebuild on the current ppe tip (only the App may update promote/**).
-            call(token, "PATCH", f"/repos/{repo}/git/refs/heads/{branch}",
-                 {"sha": p["sha"], "force": True})
+            call(
+                token,
+                "PATCH",
+                f"/repos/{repo}/git/refs/heads/{branch}",
+                {"sha": p["sha"], "force": True},
+            )
         else:
-            call(token, "POST", f"/repos/{repo}/git/refs",
-                 {"ref": f"refs/heads/{branch}", "sha": p["sha"]})
+            call(
+                token,
+                "POST",
+                f"/repos/{repo}/git/refs",
+                {"ref": f"refs/heads/{branch}", "sha": p["sha"]},
+            )
         if open_prs:
             print(f"rebuilt on ppe {t_sha[:12]}: {open_prs[0]['html_url']}")
             return 0
-        pr = call(token, "POST", f"/repos/{repo}/pulls", {
-            "title": f"Promote {a.source} ({s_sha[:12]}) to ppe",
-            "head": branch,
-            "base": "ppe",
-            "body": (f"Promotion built by `deploy/promote-ppe.py` (SPEC REQ-70).\n\n"
-                     f"- source branch: `{a.source}`\n- source commit: `{s_sha}`\n"
-                     f"- ppe tip: `{t_sha}`\n- promotion commit: `{p['sha']}` "
-                     f"(tree equals the source's)\n\n"
-                     f"Merging deploys this tree to PPE, after a clean wipe of the PPE "
-                     f"project."),
-        })
+        pr = call(
+            token,
+            "POST",
+            f"/repos/{repo}/pulls",
+            {
+                "title": f"Promote {a.source} ({s_sha[:12]}) to ppe",
+                "head": branch,
+                "base": "ppe",
+                "body": (
+                    f"Promotion built by `deploy/promote-ppe.py` (SPEC REQ-70).\n\n"
+                    f"- source branch: `{a.source}`\n- source commit: `{s_sha}`\n"
+                    f"- ppe tip: `{t_sha}`\n- promotion commit: `{p['sha']}` "
+                    f"(tree equals the source's)\n\n"
+                    f"Merging deploys this tree to PPE, after a clean wipe of the PPE "
+                    f"project."
+                ),
+            },
+        )
         print(f"opened {pr['html_url']}")
         return 0
     except Fail as e:

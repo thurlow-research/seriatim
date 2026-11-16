@@ -1438,8 +1438,14 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   are welcome and that features start as an issue.
 - **REQ-51. No identifying data.**
   - The repository holds no host names, no IP addresses other than the allowed ones, and no
-    keys or tokens. The allowed addresses are loopback, `0.0.0.0` and the RFC 5737
-    documentation ranges, such as `192.0.2.0/24`.
+    keys or tokens. The allowed addresses are loopback (`127.0.0.0/8` and `::1`), `0.0.0.0`
+    and the RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`,
+    `203.0.113.0/24`).
+    - An IPv4-mapped IPv6 address (in `::ffff:0:0/96`, the IPv4 part written dotted or in
+      hex) is judged by the IPv4 address it maps to, so a hex form can't hide a private
+      address.
+    - Every other IPv6 address is refused, the IPv6 documentation prefix (RFC 3849)
+      included. A bare `::` is punctuation, not an address.
   - It holds no personal names other than the licence's copyright line, and no
     developer-workflow tooling.
   - CI enforces this (REQ-63).
@@ -1540,7 +1546,7 @@ the operator.
     gateway runs a request twice.
   - **Where the LAN is not trusted,** TLS between the gateway and the nodes is required.
 - **In the repository.**
-  - gitleaks runs in the pre-commit hook and in CI (`secret-scan / gitleaks`).
+  - gitleaks runs in the pre-commit hook and in CI (workflow `secret-scan`, check `gitleaks`).
   - A private list of terms that must never appear (host names and personal names) is kept as
     a CI secret and checked in CI (REQ-63). The check never runs code from a pull request,
     and never prints a matched term.
@@ -1949,19 +1955,19 @@ The maintainer applies these settings; each slice's pull request says which rows
 
 | setting | value | from |
 |---|---|---|
-| Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks: `secret-scan` (now), then `ci`, `security`, `private-terms` (S0a) and `ppe` (S0b), each added by the slice that introduces it | now, extended per slice |
+| Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks, each bound to **GitHub Actions** and named by job: `gitleaks` (workflow `secret-scan`; now), then `ci` (S0a part 1), `private-terms` (S0a part 1b), `security` (S0a part 2) and `ppe` (S0b), each added by the PR that introduces it | now, extended per slice |
 | Default branch | `main`, and it stays `main`: `pull_request_target` workflows run from it, so changing it would change which `promotion-source` runs. `promotion-source` fails if the event reports another default branch | now |
-| Ruleset `deploy-branches` (targets `ppe`, `prod`; already active) | required checks with **"require branches to be up to date before merging"**, so a promotion built on an older `ppe` tip can't merge (it is rebuilt instead); changes by pull request only, with the code owner's approval after the last push (CODEOWNERS has a catch-all `*` entry for the maintainer, so every promotion needs that approval); stale approvals dismissed; threads resolved; merge commits only; no force push, no deletion; an empty bypass list, so no App, `seriatim-worker` included, can bypass it | interim deploy |
-| Required check `promotion-source` on `deploy-branches` | bound to the **GitHub Actions** app, so no other integration can report it. Where the organisation supports it, also an organisation-required workflow pinned to `promotion-source.yml` on `main`, which no branch workflow can stand in for | interim deploy |
+| Ruleset `deploy-branches` (targets `ppe`, `prod`; already active) | changes by pull request only, with the code owner's approval after the last push (CODEOWNERS has a catch-all `*` entry for the maintainer, so every promotion needs that approval); stale approvals dismissed; threads resolved; merge commits only; no force push, no deletion; an empty bypass list, so no App, `seriatim-worker` included, can bypass it | interim deploy |
+| Rulesets `deploy-checks-ppe` and `deploy-checks-prod` | require the check `promotion-source`, bound to the **GitHub Actions** app, so no other integration can report it. **"Require branches to be up to date before merging" is on for `ppe` only** (`deploy-checks-ppe`, strict), so a promotion built on an older `ppe` tip can't merge and is rebuilt instead. `deploy-checks-prod` is not strict: every merge adds a merge commit to `prod` that `main` never has, so a strict rule would leave every later `main` → `prod` pull request behind. Where the organisation supports it, also an organisation-required workflow pinned to `promotion-source.yml` on `main`, which no branch workflow can stand in for | interim deploy |
 | Ruleset `promote-branches` (targets `promote/**`) | creation, update and deletion restricted, with only the `seriatim-worker` App as bypass actor, so only the promotion builder makes promotion branches; force-push allowed for the App only, so it can rebuild one | interim deploy |
 | Environments `ppe`, `prod` | the maintainer as required reviewer; deployment branches limited to `ppe` and `prod` respectively; no secrets | interim deploy |
 | `seriatim-worker` App | `contents: write` and `pull-requests: write`. GitHub can't limit an App to a branch prefix, so its reach is bounded by the rulesets: it can't push `main`, `ppe`, `prod` or a `v*` tag. It is a bypass actor only on `promote-branches`, so that it alone makes promotion branches. It pushes working branches and `promote/ppe-*`, and opens pull requests. Its key never sits in Actions secrets; tokens are minted per use, outside the repository | interim deploy |
 | Fork pull request workflows | "Require approval for all external contributors". It does not cover members of the repository or organisation, so it adds to the runner-group limits and does not replace them | now |
 | Self-hosted runners | one per host, labelled `seriatim-ppe` or `seriatim-prod`. **Two organisation runner groups**, each limited to this repository: the PPE group only to `thurlow-research/seriatim/.github/workflows/deploy.yml@refs/heads/ppe`, the production group only to `…/deploy.yml@refs/heads/prod`. Labels route jobs; groups authorise them. One group for both refs would let a `ppe` promotion run a job on the production runner. The groups are created once `deploy.yml` exists on those refs. Each runner: a non-administrator service account with no access to unrelated credentials or clones; ephemeral or just-in-time where practical; registered only to its group | interim deploy |
-| Tag ruleset `tags-create` (`refs/tags/v*`) | restrict creations; the maintainer is the only bypass actor. A ruleset's bypass list covers all its rules, so this ruleset holds only this rule | S0a |
-| Tag ruleset `tags-immutable` (`refs/tags/v*`) | restrict updates and deletions, block force pushes; an **empty** bypass list, so nobody, the maintainer included, can move or delete a published tag | S0a |
-| Immutable releases | on, so a published release's assets and tag can't be changed | S0a |
-| Environment `release` | the maintainer as required reviewer; deployment limited to `v*` tags; the only environment whose job holds publish permissions (REQ-68) | S0a |
+| Tag ruleset `tags-create` (`refs/tags/v*`) | restrict creations; the maintainer is the only bypass actor. A ruleset's bypass list covers all its rules, so this ruleset holds only this rule | S0a; applied |
+| Tag ruleset `tags-immutable` (`refs/tags/v*`) | restrict updates and deletions, block force pushes; an **empty** bypass list, so nobody, the maintainer included, can move or delete a published tag | S0a; applied |
+| Immutable releases | on, so a published release's assets and tag can't be changed | S0a; applied |
+| Environment `release` | the maintainer as required reviewer; deployment limited to `v*` tags; the only environment whose job holds publish permissions (REQ-68) | S0a; applied |
 | GHCR package | linked to this repository; write access only from this repository's Actions (the `release` job); no personal access token | S10 |
 | Dependabot | `uv` and `github-actions` ecosystems, grouped weekly; never auto-merged | S0a |
 | Auto-merge, delete branch on merge | on | now |
@@ -2026,8 +2032,19 @@ command output, and never just says "tests pass".
     program's behaviour, and the test run noticed.
   - **A whole-run timeout fails the job** (the job's `timeout-minutes`). It never counts as a
     pass.
-  - **The score must be ≥ 75 %.** The parser reads mutmut's CI statistics export; a missing,
-    malformed or unknown-format export fails the job.
+  - **The score must be ≥ 75 %.** The parser reads mutmut's CI statistics export. A missing,
+    malformed or unknown-format export fails the job, and so does one with a non-integer
+    field, an interrupted run, or categories that don't add up to its total (unchecked
+    mutants).
+  - **Nothing to score.** A PR that changes no Python file under `node/` or `gateway/`, or
+    whose changed files have no mutable code (mutmut generates no mutants, such as for a
+    version-only change), passes with a visible notice. It never computes a score from zero
+    mutants. mutmut then exits non-zero and writes no export, so the gate decides "no
+    mutants" from mutmut's own per-file records; a failed run that did generate mutants,
+    or a missing export after a successful run, still fails.
+  - **How it runs** (TD-slice-1 Appendix B): from each package directory, with `only_mutate`
+    set to the changed files, and with `tests/` and `contract/` staged beside the mutated
+    code, so every test result really comes from a mutant.
 
 ### 8.3 HTTP behaviour tests (PPE)
 
@@ -2235,10 +2252,21 @@ command output, and never just says "tests pass".
       - each probe costs a public pull request, which the maintainer sees;
       - each probe tests one guess and reveals nothing else;
       - hiding the result altogether would mean the check cannot block a leak.
-  - an IP-literal check;
+  - an IP-literal check (`ip-literals`), over every tracked file, enforcing REQ-51;
   - the PPE suite;
-  - a PR-size check: ≤ 15 changed files (lock files excluded), and a diff of ≤ 150 KB, so
+  - a PR-size check (`pr-size`): ≤ 15 changed files (`uv.lock` excluded), and a diff of
+    ≤ 150 KB (150,000 bytes: the text diff, plus the full size of every changed binary
+    file, because git's binary patches are compressed), so
     that one reviewer can read the whole change.
+  - **The contract lint until slice 1.** With no `contract/` directory, `contract-lint`
+    passes with a visible notice. Once anything exists under `contract/`, `openapi.yaml`
+    must exist and pass.
+
+  **Check names.** Rulesets match a check by its job name. `ci.yml`'s jobs are `lint`,
+  `test` (one per operating system), `coverage`, `mutation`, `contract-lint`, `ip-literals`
+  and `pr-size`, and its roll-up job **`ci`** fails unless every one of them passed
+  (`pr-size` may be skipped on a push to `main`, where there's no pull request). The ruleset
+  requires `ci`, not the individual jobs.
 
   CI runs on every pull request and on every push to `main`. The security
   scanners also run weekly on a schedule, to catch newly disclosed vulnerabilities in pinned

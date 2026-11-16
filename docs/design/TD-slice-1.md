@@ -1,6 +1,7 @@
 # TD — Slice 1: contract, sidecar gate, 429 and passthrough
 
-**Status:** revision 4, for review. **Date:** 2026-11-16.
+**Status:** revision 5, for review. **Date:** 2026-11-16. Revision 5 updates Appendix B
+to the mutation layout S0a built (PR #13).
 **Implements:** SPEC REQ-1 to REQ-7, REQ-10 to REQ-12b, REQ-15 (pre-auth form), REQ-18
 (S1 form), REQ-20 to REQ-26. **Architecture:** ADR-001 D1 to D4, D7, D8, D10 to D12.
 **Not in this slice:**
@@ -40,12 +41,14 @@ TD is merged before its code (ADR-001 §10).
 | 12 | `tests/behaviour/test_sidecar.py` | P1 to P7 (black-box; the required `ppe` CI job) |
 | 13 | `ppe/compose.yaml` (modified) | adds the `node-a` sidecar container in `ollama-a`'s network namespace |
 
-**Dependencies.** S0a pins these in `node/pyproject.toml` and `uv.lock`:
+**Dependencies.** S0a pins these in `uv.lock`, the runtime ones also exactly in `node/pyproject.toml`:
 - **Runtime:** `starlette`, `uvicorn` (h11 only; no `[standard]` extra, so `httptools` is never
   picked), `httpx`, `anyio`, `pydantic-settings`. The singleton lock uses the standard
   library only (`fcntl`, `msvcrt`).
 - **Test:** `pytest`, `pytest-cov`, `hypothesis`, `openapi-spec-validator`, `jsonschema`,
-  `pyyaml`, and `mutmut>=3.3,<4`.
+  `pyyaml`, and `mutmut>=3.3,<4`, in the root `pyproject.toml`'s `dev` dependency group.
+  The `[tool.mutmut]` settings are in `node/pyproject.toml`, because mutmut runs from
+  `node/` (Appendix B).
 
 ## 2. Modules and functions
 
@@ -882,11 +885,16 @@ A log line, one per request:
 
 - **S0a**:
   - **The uv workspace.** A root `pyproject.toml` with `[tool.uv.workspace] members =
-    ["node"]` (later also `gateway`), plus the `ruff`, `pytest` and `mutmut` settings.
+    ["node"]` (later also `gateway`), plus the `ruff`, `pytest` and coverage settings. The
+    `mutmut` settings live in each package's own `pyproject.toml` (the mutation job, below).
   - **The node package.** `node/pyproject.toml`, with the pinned dependencies in §1 and the
     console script `seriatim-node = seriatim_node.app:main`.
     `node/seriatim_node/__init__.py` holds `__version__`, and `__main__.py` calls `main()`.
   - **`.env.example`**, with the `SERIATIM_NODE_*` names from §6 as commented placeholders.
+    It lands in S0a part 2 (#8). S0a ships as several PRs: part 1 (#13: workspace, node
+    skeleton, `ci.yml`), part 1b (#16: `private-terms`, `td-test-ids`), part 2 (#8:
+    `security.yml`, Dependabot, the PR template, `.env.example`) and the release workflow
+    (#10).
   - **The CI workflow** `ci.yml`, with these jobs:
     - `lint`;
     - `test` (matrix: ubuntu, windows, macos);
@@ -895,17 +903,34 @@ A log line, one per request:
     - `contract-lint`, `ip-literals` and `pr-size`;
     - `private-terms`, in its own workflow, as SPEC REQ-63 specifies for pull requests from
       forks.
-  - **The mutation job.**
-    - It finds the changed files with `git diff --name-only origin/main...HEAD --
-      'node/**.py' 'gateway/**.py'`, and writes them to `[tool.mutmut] paths_to_mutate`.
-    - It sets `also_copy` to the rest of the package, `contract/` and `tests/`, so the copy
-      in `mutants/` can import and find its fixtures.
+  - **The mutation job** (`tools/ci/mutation.py`).
+    - It finds the changed files with `git diff --name-only --diff-filter=d <base>...HEAD --
+      ':(glob)node/**/*.py' ':(glob)gateway/**/*.py'`. With none, it passes with a notice.
+    - **It runs mutmut from the package directory** (`node/`), with `[tool.mutmut]` in
+      `node/pyproject.toml`:
+      - `source_paths = ["seriatim_node"]`. mutmut names a mutant from its file path,
+        stripping only a leading `src.`, so from the repository root `node/seriatim_node/x.py`
+        would be named `node.seriatim_node.x`, while the tests import `seriatim_node.x`;
+      - `only_mutate`, which the job sets to the changed files. mutmut 3.8 deprecated
+        `paths_to_mutate`;
+      - `pytest_add_cli_args_test_selection = ["tests/node"]`, the package's own tests.
+    - **It stages `tests/` and `contract/` inside the package directory** for the run, and
+      removes them afterwards, even on failure. mutmut copies them into `mutants/`, beside the
+      mutated code, so collection and each mutant's re-run share one root. Without this,
+      the recorded test IDs don't resolve, pytest exits 4, and mutmut counts every mutant as
+      killed.
     - It runs the in-process tests only (`-m "not process and not behaviour"`). Subprocess
       tests would run the unmutated installed code.
     - It runs `mutmut run`, then `mutmut export-cicd-stats`.
     - It computes the score from the JSON export: (killed + timeout) ÷ (total − skipped).
-    - It fails if the export is missing, malformed or has unexpected keys, or if the score is
-      below 75 %.
+    - **No mutants.** When the changed files have no mutable code (a version-only change),
+      mutmut generates no mutants, exits 1 and writes no export. The job reads mutmut's
+      per-file records (`mutants/<file>.meta`, an empty `exit_code_by_key` for every
+      changed file) and passes with a notice. A failed run that did generate mutants still
+      fails, so does new code no test covers.
+    - It fails if the export is missing or malformed, has missing or unexpected keys or a
+      non-integer field, reports an interrupted run, or has categories that don't add up to
+      its total (unchecked mutants), or if the score is below 75 %.
 - **S0b**:
   - **`ppe/compose.yaml`**, with these services:
     - `ollama-a`: `ollama/ollama:0.40.16`, with env `OLLAMA_HOST=127.0.0.1:11435`,

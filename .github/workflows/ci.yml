@@ -1,0 +1,169 @@
+# CI (SPEC REQ-60, REQ-61, REQ-63; ADR-001 §10 S0a). Runs on every pull request and on every
+# push to main. The job `ci` rolls up every other job, so the main ruleset needs only `ci`.
+# Event values reach steps only through if: and env:, never inside run:.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.11.19"
+  UV_PYTHON: "3.12"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv sync --frozen
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv sync --frozen
+      - run: uv run --frozen pytest -m "not behaviour"
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv sync --frozen
+      # One block per package; the gateway (S7) adds its own.
+      - name: node, combined coverage >= 80 %
+        run: >-
+          uv run --frozen pytest -m "not behaviour"
+          --cov=seriatim_node --cov-branch --cov-report=term-missing --cov-fail-under=80
+      - name: node, branch coverage >= 80 %
+        run: |
+          set -euo pipefail
+          uv run --frozen coverage json -q -o "$RUNNER_TEMP/coverage-node.json"
+          python3 -I - "$RUNNER_TEMP/coverage-node.json" <<'PY'
+          import json, sys
+          totals = json.load(open(sys.argv[1]))["totals"]
+          if totals["num_branches"] == 0:
+              sys.exit("::error::no branches measured")
+          pct = totals["percent_branches_covered"]
+          print(f"node: branch coverage {pct:.2f} % "
+                f"({totals['covered_branches']}/{totals['num_branches']})")
+          if pct < 80:
+              sys.exit("::error::node branch coverage below 80 % (SPEC REQ-60)")
+          PY
+
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # a whole-run timeout fails the job; it never counts as a pass
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv sync --frozen
+      - name: Mutation score >= 75 % on the changed files
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="${PR_BASE:-$PUSH_BEFORE}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD^1)"
+          fi
+          uv run --frozen python -I tools/ci/mutation.py --base "$base"
+
+  contract-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv sync --frozen
+      - run: uv run --frozen python -I tools/ci/contract_lint.py
+
+  ip-literals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - run: python3 -I tools/ci/ip_literals.py
+
+  pr-size:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 -I tools/ci/pr_size.py --base "$BASE_SHA" --head "$HEAD_SHA"
+
+  ci:
+    if: always()
+    needs: [lint, test, coverage, mutation, contract-lint, ip-literals, pr-size]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every CI job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, sys
+          results = {job: v["result"] for job, v in json.loads(os.environ["NEEDS"]).items()}
+          ok = True
+          for job, result in sorted(results.items()):
+              allowed = {"success"} | ({"skipped"} if job == "pr-size" and os.environ["EVENT"] == "push" else set())
+              print(f"{job}: {result}")
+              ok = ok and result in allowed
+          if not ok:
+              sys.exit("::error::a required CI job did not pass")
+          PY

@@ -1,0 +1,38 @@
+[project]
+name = "seriatim-node"
+dynamic = ["version"]
+description = "Seriatim sidecar: a one-at-a-time GPU gate in front of a local Ollama"
+license = "MIT"
+requires-python = ">=3.12"
+# Pinned runtime dependencies (TD-slice-1 §1). uvicorn without [standard], so only h11 is used.
+dependencies = [
+    "starlette==1.10.0",
+    "uvicorn==0.54.0",
+    "httpx==0.28.1",
+    "anyio==4.16.0",
+    "pydantic-settings==2.16.3",
+]
+
+[project.scripts]
+seriatim-node = "seriatim_node.app:main"
+
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "seriatim_node/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["seriatim_node"]
+
+# Mutation testing (SPEC REQ-61) runs from this directory, so mutmut sees the package as a
+# plain ./ source and names mutants seriatim_node.*, as the tests import them.
+# tools/ci/mutation.py copies tests/ and contract/ in here for the run (mutmut then copies
+# them into mutants/), and sets only_mutate to the Python files a pull request changes.
+[tool.mutmut]
+source_paths = ["seriatim_node"]
+only_mutate = ["seriatim_node/*"]
+also_copy = ["contract/"]
+pytest_add_cli_args = ["-m", "not process and not behaviour"]
+pytest_add_cli_args_test_selection = ["tests/node"]
