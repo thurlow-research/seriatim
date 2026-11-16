@@ -175,8 +175,9 @@ def test_ip_reports_line_numbers():
 # --- git fixtures -------------------------------------------------------------------------
 
 
-def run_git(repo: Path, *args: str) -> str:
-    env = {
+def git_env() -> dict[str, str]:
+    """A fixed identity and no user config, so tests behave the same on any machine."""
+    return {
         **os.environ,
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -185,8 +186,11 @@ def run_git(repo: Path, *args: str) -> str:
         "GIT_COMMITTER_NAME": "Test Committer",
         "GIT_COMMITTER_EMAIL": "committer@example.invalid",
     }
+
+
+def run_git(repo: Path, *args: str, check: bool = True) -> str:
     r = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, env=env, check=True
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, env=git_env(), check=check
     )
     return r.stdout.strip()
 
@@ -317,7 +321,8 @@ def test_term_introduced_only_by_a_merge_resolution_is_found(repo):
     commit(repo, {"f.txt": "side\n"})
     run_git(repo, "switch", "-q", "main")
     commit(repo, {"f.txt": "main\n"})
-    subprocess.run(["git", "-C", str(repo), "merge", "-q", "side"], capture_output=True)
+    run_git(repo, "merge", "-q", "side", check=False)  # an add/add conflict, resolved below
+    assert (repo / ".git" / "MERGE_HEAD").exists()
     (repo / "f.txt").write_text("resolved with CANARYHOST-7F3A\n")
     run_git(repo, "add", "f.txt")
     run_git(repo, "commit", "-q", "--no-edit")
