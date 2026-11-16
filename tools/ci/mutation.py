@@ -21,8 +21,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 THRESHOLD = 0.75
@@ -120,15 +123,38 @@ def by_package(files: list[str]) -> dict[str, list[str]]:
     return out
 
 
+@contextmanager
+def staged(pdir: Path, root: Path = Path(".")) -> Iterator[None]:
+    """Copy tests/ (and contract/) into the package directory for the run, then remove them.
+
+    mutmut runs from the package directory and copies tests/ and contract/ from there into
+    mutants/, next to the mutated code. Tests are then collected and re-run for each mutant
+    from one root, so their node IDs resolve. Run from outside mutants/, a node ID doesn't
+    resolve, pytest exits 4, and mutmut would count every mutant as killed.
+    """
+    copies = [(root / d, pdir / d) for d in ("tests", "contract") if (root / d).is_dir()]
+    for _, dst in copies:
+        if dst.exists():
+            raise GateError(f"{dst} already exists; remove it before running the gate")
+    try:
+        for src, dst in copies:
+            shutil.copytree(src, dst)
+        yield
+    finally:
+        for _, dst in copies:
+            shutil.rmtree(dst, ignore_errors=True)
+
+
 def run_package(pkg: str, files: list[str]) -> tuple[float, int]:
     pdir = Path(pkg)
     pyproject = pdir / "pyproject.toml"
     pyproject.write_text(set_only_mutate(pyproject.read_text(encoding="utf-8"), files))
     print(f"mutating in {pkg}/: {', '.join(files)}", flush=True)
-    for cmd in (["mutmut", "run"], ["mutmut", "export-cicd-stats"]):
-        r = subprocess.run(["uv", "run", "--frozen", *cmd], cwd=pdir, check=False)
-        if r.returncode:
-            raise GateError(f"`{' '.join(cmd)}` in {pkg}/ exited {r.returncode}")
+    with staged(pdir):
+        for cmd in (["mutmut", "run"], ["mutmut", "export-cicd-stats"]):
+            r = subprocess.run(["uv", "run", "--frozen", *cmd], cwd=pdir, check=False)
+            if r.returncode:
+                raise GateError(f"`{' '.join(cmd)}` in {pkg}/ exited {r.returncode}")
     return score_file(pdir / EXPORT)
 
 

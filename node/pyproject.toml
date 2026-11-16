@@ -26,12 +26,13 @@ path = "seriatim_node/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["seriatim_node"]
 
-# Mutation testing (SPEC REQ-61) runs from this directory, so that mutmut sees the package as
-# a plain ./ source and names mutants seriatim_node.*, as the tests import them. The tests
-# run in place from the repository's tests/. The CI mutation job sets only_mutate to the
-# Python files a pull request changes.
+# Mutation testing (SPEC REQ-61) runs from this directory, so mutmut sees the package as a
+# plain ./ source and names mutants seriatim_node.*, as the tests import them.
+# tools/ci/mutation.py copies tests/ and contract/ in here for the run (mutmut then copies
+# them into mutants/), and sets only_mutate to the Python files a pull request changes.
 [tool.mutmut]
 source_paths = ["seriatim_node"]
 only_mutate = ["seriatim_node/*"]
+also_copy = ["contract/"]
 pytest_add_cli_args = ["-m", "not process and not behaviour"]
-pytest_add_cli_args_test_selection = ["../../tests"]
+pytest_add_cli_args_test_selection = ["tests/node"]
