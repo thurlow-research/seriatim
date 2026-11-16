@@ -110,6 +110,25 @@ def test_by_package():
     }
 
 
+def test_staged_copies_tests_and_contract_then_removes_them(tmp_path):
+    for d in ("tests/node", "contract", "pkg"):
+        (tmp_path / d).mkdir(parents=True)
+    (tmp_path / "tests" / "node" / "test_x.py").write_text("")
+    pdir = tmp_path / "pkg"
+    with mutation.staged(pdir, root=tmp_path):
+        assert (pdir / "tests" / "node" / "test_x.py").exists()
+        assert (pdir / "contract").is_dir()
+    assert not (pdir / "tests").exists() and not (pdir / "contract").exists()
+    with pytest.raises(RuntimeError):
+        with mutation.staged(pdir, root=tmp_path):
+            raise RuntimeError
+    assert not (pdir / "tests").exists()
+    (pdir / "tests").mkdir()
+    with pytest.raises(mutation.GateError, match="already exists"):
+        with mutation.staged(pdir, root=tmp_path):
+            pass
+
+
 def test_changed_files_needs_a_sha():
     with pytest.raises(mutation.GateError, match="40-character"):
         mutation.changed_files("main")
