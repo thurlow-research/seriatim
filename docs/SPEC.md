@@ -1446,6 +1446,10 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       address.
     - Every other IPv6 address is refused, the IPv6 documentation prefix (RFC 3849)
       included. A bare `::` is punctuation, not an address.
+    - Neither sentence punctuation after an address (`.`, `,`, `)`, `:`) nor a label
+      straight before one (`IP:`, `address:`, any word starting with a letter or `_`)
+      hides it. `Ruby::Cafe`-style names, `std::vector` and hash prefixes such as
+      `sha256:` are not addresses.
   - It holds no personal names other than the licence's copyright line, and no
     developer-workflow tooling.
   - CI enforces this (REQ-63).
@@ -1955,7 +1959,7 @@ The maintainer applies these settings; each slice's pull request says which rows
 
 | setting | value | from |
 |---|---|---|
-| Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks, each bound to **GitHub Actions** and named by job: `gitleaks` (workflow `secret-scan`; now), then `ci` (S0a part 1), `private-terms` (S0a part 1b), `security` (S0a part 2) and `ppe` (S0b), each added by the PR that introduces it | now, extended per slice |
+| Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks, each bound to **GitHub Actions** and named by job: `gitleaks` (workflow `secret-scan`; applied), then `ci` (S0a part 1; applied; it includes `td-test-ids` from part 1b), `private-terms` (S0a part 1b, added only once its secret `PRIVATE_TERMS` and variable `PRIVATE_TERMS_AGE_RECIPIENT` exist and a canary run has failed as expected), `security` (S0a part 2) and `ppe` (S0b), each added by the PR that introduces it | now, extended per slice |
 | Default branch | `main`, and it stays `main`: `pull_request_target` workflows run from it, so changing it would change which `promotion-source` runs. `promotion-source` fails if the event reports another default branch | now |
 | Ruleset `deploy-branches` (targets `ppe`, `prod`; already active) | changes by pull request only, with the code owner's approval after the last push (CODEOWNERS has a catch-all `*` entry for the maintainer, so every promotion needs that approval); stale approvals dismissed; threads resolved; merge commits only; no force push, no deletion; an empty bypass list, so no App, `seriatim-worker` included, can bypass it | interim deploy |
 | Rulesets `deploy-checks-ppe` and `deploy-checks-prod` | require the check `promotion-source`, bound to the **GitHub Actions** app, so no other integration can report it. **"Require branches to be up to date before merging" is on for `ppe` only** (`deploy-checks-ppe`, strict), so a promotion built on an older `ppe` tip can't merge and is rebuilt instead. `deploy-checks-prod` is not strict: every merge adds a merge commit to `prod` that `main` never has, so a strict rule would leave every later `main` → `prod` pull request behind. Where the organisation supports it, also an organisation-required workflow pinned to `promotion-source.yml` on `main`, which no branch workflow can stand in for | interim deploy |
@@ -1986,6 +1990,13 @@ command output, and never just says "tests pass".
     - **≥ 80 %** combined coverage (`--cov-branch --cov-fail-under=80`);
     - **≥ 80 %** branch coverage on its own, checked separately from `coverage json`.
   - The unit and component suites also run on `windows-latest` and `macos-latest`.
+  - **Test-scenario IDs are part of the test contract.** Each slice's TD lists its test
+    scenarios by ID (`C1`, `HL4`, `K-OAS1`: the first column of its test tables). A test
+    names the IDs it proves with `@pytest.mark.td("<ID>", ...)`. Once a TD says
+    `Enforced: yes`, every ID in it must be discharged by a test that ran and passed in CI
+    (`td-test-ids`, REQ-63). The coverage and mutation targets are unchanged; this check adds
+    to them. Whether a tagged test really exercises its scenario stays a review job: the
+    human-proxy reads the mapped tests at each slice PR.
 - **Component tests** start the real sidecar (uvicorn on an ephemeral loopback port) in front
   of a scriptable fake Ollama that is also a real HTTP server. Process-level tests (restart and
   duplicate start) run the sidecar as a subprocess.
@@ -2148,7 +2159,44 @@ command output, and never just says "tests pass".
   - ruff (lint and format);
   - pytest with coverage;
   - mutmut;
-  - the contract lint (`openapi-spec-validator`) and the allowlist-vs-route-list test;
+  - the contract lint (`openapi-spec-validator`, OpenAPI 3.1 only) and the
+    allowlist-vs-route-list test;
+  - **the TD test-ID check (`td-test-ids`)**, in `ci.yml`, counted in the `ci` roll-up:
+    - **IDs from the TDs, parsed strictly.** Every `docs/design/TD-slice-<N>.md` is read.
+      Its test tables are the Markdown tables whose header starts `| id |`; the first cell
+      of every row must be an ID. A table without its separator row, a row that isn't an ID,
+      a TD with no test table and an ID listed twice (in one TD or across TDs) all fail.
+    - **An explicit, ratcheted start signal.** Each TD carries exactly one line
+      `Enforced: yes` or `Enforced: no` in its first 20 lines; a missing line or any other
+      value fails. A slice's first code PR sets `yes` in that same PR, so the PR that adds
+      the code also discharges the IDs; the reviewer sends back a PR that adds files its
+      slice's ADR-001 §10 row names while the TD still says `no`. The TD's slice comes from
+      its file name (`TD-slice-1.md` is S1), and a TD whose slice has no §10 row fails.
+    - **Discharge by execution only.** The ubuntu `test` leg writes JUnit XML
+      (`--junitxml`), with each test's `td` IDs recorded as properties by
+      `tests/conftest.py`, and uploads it as the artifact `junit-test-ubuntu`.
+      `td-test-ids` downloads exactly that artifact from the same run. An ID counts only
+      through a test case with no failure, error or skip; skipped, xfailed (`xfail_strict`
+      is on) and uncollected tests leave it unresolved. A missing, empty or malformed JUnit
+      file fails; it never means "nothing to check". A test that names an ID absent from
+      every TD fails.
+    - **For an enforced TD,** every ID without a passing test fails, with the tests that
+      carried it and didn't pass. For a TD at `Enforced: no`, a visible notice gives its
+      count of IDs and how many are already discharged.
+    - **Obligations can't silently shrink** (pull requests only), against the base commit:
+      - an ID that disappears fails unless the PR body has a line
+        `TD-ID-REMOVED: <ID> - <reason>`;
+      - a TD that is `Enforced: yes` on the base and turns `no`, or is deleted, fails unless
+        the PR body has a line `TD-ENFORCEMENT-OFF: TD-slice-<N> - <reason>`.
+
+      The separator may be ` - ` or ` — `. The human-proxy confirms each waiver at review.
+      The PR body reaches the script only through `env:`. `ci.yml` also runs on the
+      `edited` event, so adding a waiver line re-runs the check. A base TD written before
+      this check existed has no `Enforced:` line and counts as `no`.
+    - **On a push to `main`** the removal and enforcement checks are skipped, with a
+      visible notice. `main` changes only by pull request, whose run enforced them, and a
+      merge commit's first-parent diff would show the very removal that pull request
+      waived.
   - **security scanners**, each a required check, under one failure policy:
     - **Fail on findings and on errors.** Every scanner job exits non-zero on a finding at
       or above its threshold. It also fails when the scanner could not run properly: a
@@ -2178,7 +2226,12 @@ command output, and never just says "tests pass".
     - **Fork pull requests** get the same check, because the workflow and the secret come
       from `main`. If the secret is unavailable, the check fails; it never passes in that
       case.
-    - **It also runs on every push to `main`,** scanning the whole tree.
+    - **It also runs on every push to `main`,** scanning the whole tree at the pushed
+      commit, and every pushed commit's metadata (the commits after the previous tip).
+    - **Matching.** Each non-blank line of the secret is a term. A term matches as a plain
+      substring of the bytes, ignoring ASCII case. An empty term list fails the check.
+    - **Triggers.** `pull_request_target` on `opened`, `synchronize`, `reopened` and
+      `edited`, and `push` to `main`.
     - **Injection rules.** It runs under `pull_request_target`, so it must never let the
       pull request control what runs:
       - **Code from `main` only.** The workflow, the scanner script and its config come
@@ -2245,7 +2298,16 @@ command output, and never just says "tests pass".
           longer report is cut short, with a note that says so.
         - **No plaintext leak.** The plaintext exists only in memory and is never written
           to disk or to the log. If encryption or upload fails, the job fails with the same
-          generic message.
+          generic message. So does any error during the scan; its reason goes into the
+          encrypted report only.
+        - **The artifact** is `private-terms-report` (one `age` file, kept 30 days). The
+          recipient must have the form of an `age` X25519 recipient (`age1` and 58
+          characters), or the check fails.
+        - **Known limitation: the `age` binary's provenance.** `age` 1.3.2 is downloaded
+          from its GitHub release and verified against a SHA-256 pinned in the workflow.
+          That checksum was recorded from the release asset, without verifying the
+          release's sigsum transparency-log proof, so it proves only that the binary hasn't
+          changed since it was pinned.
     - **The accepted trade-off.** Pass or fail is still a one-bit signal. A contributor could
       in principle learn whether one candidate name is on the list by opening a pull request
       that contains it. That is accepted for three reasons:
@@ -2260,11 +2322,13 @@ command output, and never just says "tests pass".
     that one reviewer can read the whole change.
   - **The contract lint until slice 1.** With no `contract/` directory, `contract-lint`
     passes with a visible notice. Once anything exists under `contract/`, `openapi.yaml`
-    must exist and pass.
+    must exist, declare `openapi: 3.1.x`, and pass the **OpenAPI 3.1** validator, never one
+    the document chooses for itself, so a 3.0 contract fails. Every `$ref` must resolve.
 
   **Check names.** Rulesets match a check by its job name. `ci.yml`'s jobs are `lint`,
-  `test` (one per operating system), `coverage`, `mutation`, `contract-lint`, `ip-literals`
-  and `pr-size`, and its roll-up job **`ci`** fails unless every one of them passed
+  `test` (one per operating system), `td-test-ids`, `coverage`, `mutation`,
+  `contract-lint`, `ip-literals` and `pr-size`, and its roll-up job **`ci`** fails unless
+  every one of them passed
   (`pr-size` may be skipped on a push to `main`, where there's no pull request). The ruleset
   requires `ci`, not the individual jobs.
 

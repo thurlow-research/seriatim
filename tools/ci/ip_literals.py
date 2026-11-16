@@ -5,7 +5,8 @@ Scans every tracked file for IPv4 and IPv6 address literals. The only addresses 
 loopback (127.0.0.0/8 and ::1), 0.0.0.0, and the RFC 5737 documentation ranges
 (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). An IPv4-mapped IPv6 address (in ::ffff:0:0/96,
 dotted or hex) is judged by the IPv4 address it maps to. Every other IPv6 address fails,
-the IPv6 documentation prefix (RFC 3849) included. A bare "::" is not an address.
+the IPv6 documentation prefix (RFC 3849) included. A bare "::" is not an address. Sentence
+punctuation after an address, and a "label:" before one ("IP:" or "address:"), don't hide it.
 """
 
 from __future__ import annotations
@@ -23,6 +24,11 @@ ALLOWED_V4 = [
 V4_RE = re.compile(rb"(?<![\d.])(?<!\d\.)(\d{1,3}(?:\.\d{1,3}){3})(?!\d|\.\d)")
 # Hex-and-colon runs not touching a word character or another colon; checked by ipaddress.
 V6_RE = re.compile(rb"(?<![\w:.])([0-9A-Fa-f:]*:[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*)(?![\w:])")
+# The same, straight after a "label:" such as "IP:" or "address:", which V6_RE's
+# lookbehind skips. The label is a word that starts with a letter or "_".
+V6_LABELLED_RE = re.compile(
+    rb"(?<![\w:.])[A-Za-z_][\w-]*:([0-9A-Fa-f:]*:[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*)(?![\w:])"
+)
 
 
 def allowed(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -41,7 +47,10 @@ def find(data: bytes) -> list[tuple[int, str]]:
     """
     found: list[tuple[int, str]] = []
     v6_spans: list[tuple[int, int]] = []
-    for m in V6_RE.finditer(data):
+    candidates = list(V6_RE.finditer(data)) + list(V6_LABELLED_RE.finditer(data))
+    for m in candidates:
+        if any(a <= m.start(1) and m.end(1) <= b for a, b in v6_spans):
+            continue  # already judged as part of a longer literal
         text = m.group(1).decode("ascii")
         if not re.search(r"[0-9A-Fa-f]", text):
             continue  # a bare "::" is punctuation, not an address

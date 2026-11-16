@@ -43,7 +43,10 @@ addopts = ["--strict-markers", "--strict-config"]
 markers = [
     "process: runs the sidecar as a subprocess (not mutation-tested: it runs installed code)",
     "behaviour: black-box PPE suite (tests/behaviour), run only by the ppe job",
+    "td(*ids): the TD test-scenario IDs this test discharges (SPEC REQ-60; tools/ci/td_test_ids.py)",
 ]
+# An unexpectedly passing xfail is a failure, so it can never count as discharging an ID.
+xfail_strict = true
 
 [tool.coverage.run]
 branch = true

@@ -1,7 +1,13 @@
 # TD — Slice 1: contract, sidecar gate, 429 and passthrough
 
-**Status:** revision 5, for review. **Date:** 2026-11-16. Revision 5 updates Appendix B
-to the mutation layout S0a built (PR #13).
+**Status:** revision 6, for review. **Date:** 2026-11-16. Revision 5 updates Appendix B
+to the mutation layout S0a built (PR #13); revision 6 adds the enforcement line below and
+the `td-test-ids` job to Appendix B (#16).
+
+Enforced: no
+
+(The `td-test-ids` check, SPEC REQ-63, reads this line. S1's first code PR sets it to `yes`,
+and from then on every ID in §8 needs a passing test marked `@pytest.mark.td("<ID>")`.)
 **Implements:** SPEC REQ-1 to REQ-7, REQ-10 to REQ-12b, REQ-15 (pre-auth form), REQ-18
 (S1 form), REQ-20 to REQ-26. **Architecture:** ADR-001 D1 to D4, D7, D8, D10 to D12.
 **Not in this slice:**
@@ -901,8 +907,14 @@ A log line, one per request:
     - `coverage` (ubuntu, `--cov-fail-under=80`);
     - `mutation`;
     - `contract-lint`, `ip-literals` and `pr-size`;
-    - `private-terms`, in its own workflow, as SPEC REQ-63 specifies for pull requests from
-      forks.
+    - `td-test-ids` (S0a part 1b): it reads the ubuntu `test` leg's JUnit (artifact
+      `junit-test-ubuntu`) and this TD's `Enforced:` line (SPEC REQ-63). While this TD says
+      `Enforced: no` it prints a notice. S1's first code PR sets `Enforced: yes` and marks
+      each test with its §8 ID, `@pytest.mark.td("<ID>")`. P1 to P7 run in the `ppe` job,
+      not in the `test` leg, so they can be discharged only once `td-test-ids` also reads
+      the `ppe` job's JUnit (S0b);
+    - `private-terms` (S0a part 1b), in its own workflow, as SPEC REQ-63 specifies for pull
+      requests from forks.
   - **The mutation job** (`tools/ci/mutation.py`).
     - It finds the changed files with `git diff --name-only --diff-filter=d <base>...HEAD --
       ':(glob)node/**/*.py' ':(glob)gateway/**/*.py'`. With none, it passes with a notice.
