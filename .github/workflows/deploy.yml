@@ -1,0 +1,211 @@
+# Interim deployment (SPEC REQ-70, ADR-001 T17). Runs on the self-hosted runner of the host
+# that follows the pushed branch. Retired per host once the release follower has passed PPE.
+#
+# ppe and prod change only through a pull request the code owner approves (ruleset
+# deploy-branches, merge commits only), whose source the required promotion-source check
+# accepted. This job then fails closed unless:
+#   - the pushed commit M is a merge whose first parent is the branch's previous tip, and
+#     whose tree equals its second parent's;
+#   - the merged pull request came from this repository, with M's second parent as its head
+#     and the pushed branch as its base;
+#   - ppe: the head is promote/ppe-<sha12>, a two-parent commit P whose first parent is the
+#     previous ppe tip and whose tree equals its second parent S's, which the name matches;
+#     and .github/ equals origin/main's;
+#   - prod: the head branch is main, and the head commit is on origin/main.
+# These checks run from the pushed tree, so they can't defend against a changed deploy.yml;
+# promotion-source's .github/ rule and review on main keep this file trustworthy.
+#
+# Every ppe deployment first wipes the PPE project's own resources, and nothing else.
+# prod is never wiped.
+#
+# No hosts or paths here: host-specific values come from the runner's own environment.
+# Event values reach steps only through if: and env:, never inside run:.
+name: deploy
+
+on:
+  push:
+    branches: [ppe, prod]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: deploy (${{ github.ref_name }})
+    environment: ${{ github.ref_name }}
+    runs-on: [self-hosted, "seriatim-${{ github.ref_name }}"]
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a forced push
+        if: github.event.forced
+        run: |
+          echo "::error::forced push refused"
+          exit 1
+
+      - name: Check out the pushed commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the merge commit
+        id: merge
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$REF_NAME" in ppe|prod) ;; *) echo "::error::unexpected branch"; exit 1 ;; esac
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad sha"; exit 1; }
+          test "$(git rev-parse HEAD)" = "$SHA" || { echo "::error::checkout is not the pushed commit"; exit 1; }
+          read -r -a parents <<< "$(git rev-list --parents -n 1 HEAD)"
+          [ "${#parents[@]}" -eq 3 ] || { echo "::error::not a two-parent merge commit"; exit 1; }
+          first="${parents[1]}"; head="${parents[2]}"
+          [ "$first" = "$BEFORE" ] || { echo "::error::first parent is not the previous $REF_NAME tip"; exit 1; }
+          [ "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse "$head^{tree}")" ] \
+            || { echo "::error::the merge changes the head commit's tree"; exit 1; }
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Check the merged pull request
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.api_url }}
+          HEAD: ${{ steps.merge.outputs.head }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.request
+          env = os.environ
+          token = env.get("GH_TOKEN", "")
+          if not token:
+              sys.exit("::error::empty token")
+          req = urllib.request.Request(
+              f"{env['API']}/repos/{env['REPO']}/commits/{env['SHA']}/pulls",
+              headers={"Authorization": f"Bearer {token}",
+                       "Accept": "application/vnd.github+json",
+                       "X-GitHub-Api-Version": "2022-11-28"})
+          match = []
+          for attempt in range(7):  # the first try, then 6 retries, 10 s apart
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      pulls = json.load(r)
+              except (urllib.error.URLError, TimeoutError) as e:
+                  print(f"lookup failed: {e}")
+                  pulls = []
+              # GitHub fills this list asynchronously: retry until the merged pull request
+              # for this exact merge commit appears, not merely any pull request.
+              match = [p for p in pulls
+                       if p.get("merge_commit_sha") == env["SHA"] and p.get("merged_at")]
+              if match:
+                  break
+              if attempt < 6:
+                  time.sleep(10)
+          if len(match) != 1:
+              sys.exit("::error::no single merged pull request for this commit")
+          p = match[0]
+          if p["base"]["ref"] != env["REF_NAME"]:
+              sys.exit("::error::the pull request's base is not the pushed branch")
+          if (p["head"].get("repo") or {}).get("full_name") != env["REPO"]:
+              sys.exit("::error::the pull request is not from this repository")
+          if p["head"]["sha"] != env["HEAD"]:
+              sys.exit("::error::the pull request's head is not the merge's second parent")
+          ref = p["head"]["ref"]
+          if env["REF_NAME"] == "prod" and ref != "main":
+              sys.exit("::error::prod is promoted only from main")
+          if env["REF_NAME"] == "ppe" and not ref.startswith("promote/ppe-"):
+              sys.exit("::error::ppe is promoted only from promote/ppe-*")
+          with open(env["GITHUB_ENV"], "a") as f:
+              f.write(f"HEAD_REF={ref}\n")
+          print(f"pull request #{p['number']} from {ref}")
+          PY
+
+      - name: Check the ppe promotion commit
+        id: ppe
+        if: github.ref_name == 'ppe'
+        env:
+          HEAD: ${{ steps.merge.outputs.head }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          read -r -a parents <<< "$(git rev-list --parents -n 1 "$HEAD")"
+          [ "${#parents[@]}" -eq 3 ] || { echo "::error::the promotion commit must have two parents"; exit 1; }
+          base="${parents[1]}"; source="${parents[2]}"
+          [ "$base" = "$BEFORE" ] \
+            || { echo "::error::the promotion commit was not built on the previous ppe tip"; exit 1; }
+          [ "$(git rev-parse "$HEAD^{tree}")" = "$(git rev-parse "$source^{tree}")" ] \
+            || { echo "::error::the promotion commit's tree differs from its source's"; exit 1; }
+          [ "$HEAD_REF" = "promote/ppe-${source:0:12}" ] \
+            || { echo "::error::the branch name does not match the source commit"; exit 1; }
+          [ "$(git rev-parse --verify --quiet 'HEAD:.github')" = "$(git rev-parse --verify --quiet 'origin/main:.github')" ] \
+            || { echo "::error::.github/ differs from origin/main's"; exit 1; }
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+
+      - name: Prod head is on main
+        id: prod
+        if: github.ref_name == 'prod'
+        env:
+          HEAD: ${{ steps.merge.outputs.head }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$HEAD" origin/main \
+            || { echo "::error::the head commit is not on origin/main"; exit 1; }
+          echo "source=$HEAD" >> "$GITHUB_OUTPUT"
+
+      - name: Wipe the PPE project (ppe only; this project's resources only)
+        if: github.ref_name == 'ppe'
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          # SERIATIM_PPE_COMPOSE_PROJECT comes from the runner's own environment. No Compose
+          # file is loaded: a promoted file could name an unrelated volume explicitly.
+          project="${SERIATIM_PPE_COMPOSE_PROJECT:-}"
+          [[ "$project" =~ ^seriatim-ppe(-[a-z0-9]+)*$ ]] \
+            || { echo "::error::SERIATIM_PPE_COMPOSE_PROJECT is unset or not a seriatim-ppe project name"; exit 1; }
+          label="com.docker.compose.project=$project"
+          # Each listing is captured on its own, so a failed docker call aborts the job
+          # instead of looking like an empty list. Exact label match only; never a prune.
+          list() {  # list <kind>: prints the ids of this project's <kind>, or fails
+            case "$1" in
+              containers) docker ps -aq --no-trunc --filter "label=$label" ;;
+              networks)   docker network ls -q --no-trunc --filter "label=$label" ;;
+              volumes)    docker volume ls -q --filter "label=$label" ;;
+            esac
+          }
+          for kind in containers networks volumes; do
+            ids="$(list "$kind")" || { echo "::error::listing PPE $kind failed"; exit 1; }
+            [ -n "$ids" ] || continue
+            mapfile -t items <<< "$ids"
+            case "$kind" in
+              containers) docker rm -f "${items[@]}" ;;
+              networks)   docker network rm "${items[@]}" ;;
+              volumes)    docker volume rm "${items[@]}" ;;
+            esac || { echo "::error::removing PPE $kind failed"; exit 1; }
+          done
+          for kind in containers networks volumes; do
+            ids="$(list "$kind")" || { echo "::error::verifying PPE $kind failed"; exit 1; }
+            [ -z "$ids" ] || { echo "::error::PPE $kind remain after the wipe"; exit 1; }
+          done
+          echo "wiped PPE project $project"
+
+      - name: Deploy (no-op until there is a service to deploy)
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SOURCE: ${{ steps.ppe.outputs.source || steps.prod.outputs.source }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no source commit"; exit 1; }
+          echo "deployed source $SOURCE to $REF_NAME (no-op: nothing to deploy yet)"
+          echo "### deploy ($REF_NAME): source $SOURCE (no-op)" >> "$GITHUB_STEP_SUMMARY"
