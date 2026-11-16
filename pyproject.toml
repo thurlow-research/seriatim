@@ -1,0 +1,52 @@
+# Seriatim uv workspace (ADR-001 §10 S0a). The packages live in node/ (and, from S7, gateway/).
+[project]
+name = "seriatim-workspace"
+version = "0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["node"]
+
+[tool.uv.sources]
+seriatim-node = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "seriatim-node",
+    "pytest",
+    "pytest-cov",
+    "hypothesis",
+    "openapi-spec-validator",
+    "jsonschema",
+    "pyyaml",
+    "mutmut>=3.3,<4",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["seriatim_node"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config"]
+markers = [
+    "process: runs the sidecar as a subprocess (not mutation-tested: it runs installed code)",
+    "behaviour: black-box PPE suite (tests/behaviour), run only by the ppe job",
+]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
