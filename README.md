@@ -45,21 +45,33 @@ Ollama on a single machine is easy. A shared set of uneven machines goes wrong i
 
 ## Your fleet is configuration
 
-The gateway's configuration file is the only place the fleet is described. Each machine is
-one entry:
+The gateway's configuration file lists the machines in the fleet. You don't enter how much
+memory each one has: the sidecar on each machine measures that and reports it. Each machine
+is one entry:
 
 ```toml
 [[nodes]]
 id = "node-a"                       # any label you like
 url = "http://node-a.example:11434"
 priority = 1                        # lower is tried first
-max_params_b = 14                   # the largest model this machine should run
+# capacity is measured and reported by the machine's sidecar
 
 [[nodes]]
 id = "node-b"
 url = "http://node-b.example:11434"
-priority = 2                        # no max_params_b: no size limit
+priority = 2
+capacity = "unlimited"              # optional override: no size check (e.g. a CPU-only box)
+
+[[nodes]]
+id = "node-c"
+url = "http://node-c.example:11434"
+priority = 3
+max_params_b = 14                   # optional override: cap by parameter count instead
 ```
+
+The overrides are for machines that can't report their memory, or where you know better.
+When one is set, it wins, and the gateway's node list shows which rule applies to each
+machine and why.
 
 Nothing in the code counts machines, or knows their sizes or platforms. To change the fleet,
 you edit that file:
@@ -67,8 +79,9 @@ you edit that file:
   gateway checks the new machine's health and models before it routes anything to it.
 - **Shrink.** Remove the entry. No new work goes to that machine, and requests already
   running there finish normally.
-- **Change.** After a card upgrade, raise `max_params_b`, or change `priority` to prefer a
-  different machine. The next routing decision uses the new values.
+- **Change.** After a card upgrade there is nothing to edit: the sidecar reports the new
+  capacity. Change `priority` to prefer a different machine, or adjust an override if you
+  use one. The next routing decision uses the new values.
 - **Models.** Pull or delete models on any machine as usual. The gateway rediscovers each
   machine's models every minute, and at once when a model it was asked for is missing.
 
@@ -90,10 +103,14 @@ rejected with a logged error, and the gateway keeps the configuration it already
 - **Busy means an immediate answer.** A request that arrives while the machine is working
   gets HTTP 429 with `Retry-After` straight away, without Ollama ever seeing it. It never waits in a hidden queue, so a
   client is never stuck behind someone else's long generation without knowing why.
-- **Routing by model size.** The **gateway** knows how large a model each machine can hold,
-  from the `max_params_b` you set per machine: for example "up to 14B" for a smaller card,
-  and no limit for the biggest one. The model's size comes from Ollama's own metadata. A model is only ever sent to a
-  machine big enough for it, even when that machine is busy and a smaller one is idle.
+- **Routing by fit.** Each **sidecar** measures how much GPU memory its machine can give
+  Ollama (on NVIDIA from `nvidia-smi`, on Apple Silicon from Metal) and reports it. The
+  **gateway** estimates what a model needs from its size on disk plus the memory for the
+  context length the request asks for, adds a safety margin, and sends it only to a machine
+  where it fits. A model never goes to a machine too small for it, even when that machine is
+  idle and the big one is busy.
+- **Unknown means no.** If a machine can't report its memory and has no override, the
+  gateway doesn't guess. It sends that machine no size-checked work, and says why.
 - **Spill-over to keep every machine working.** When a machine answers busy, the gateway
   tries the next machine that can serve the same model, in your priority order. Each one is
   tried once, and nothing waits. Only if every suitable machine is busy does the client get
@@ -122,14 +139,15 @@ rejected with a logged error, and the gateway keeps the configuration it already
 ## Platforms
 
 - **The sidecar** is plain Python 3.12. It runs wherever Python and Ollama run: Linux,
-  Windows or macOS, with NVIDIA, AMD, Apple or Intel graphics, or on the CPU alone. Routing
-  depends only on your configuration and on Ollama's model metadata, not on the hardware.
-- **GPU memory reporting** is per platform. NVIDIA (through `nvidia-smi`) and Apple Silicon
-  come first. Elsewhere memory is reported as unavailable, never guessed, and everything else
-  works the same.
-- **Install scripts** come first for Windows (NVIDIA) and macOS (Apple Silicon), because that
-  is the fleet Seriatim is first deployed on. Other platforms can run the sidecar as an
-  ordinary service. Scripts for them are welcome contributions.
+  Windows or macOS, with NVIDIA, AMD, Apple or Intel graphics, or on the CPU alone. The gate
+  and the routing work the same on every platform.
+- **Memory reporting** is the one per-platform part. NVIDIA (through `nvidia-smi`) and Apple
+  Silicon (through Metal) come first. Elsewhere the sidecar reports its memory as unknown,
+  never guessed. Give such a machine an override (`capacity = "unlimited"` or
+  `max_params_b`) to route to it. Probes for other platforms are welcome contributions.
+- **Install scripts** come first for Windows and macOS. That is a packaging order, not a
+  supported topology. Other platforms can run the sidecar as an ordinary service, and
+  scripts for them are welcome contributions.
 - **The gateway** runs on any host with Python 3.12, or in a container.
 
 ## Documents
