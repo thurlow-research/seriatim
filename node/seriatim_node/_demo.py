@@ -1,9 +1,5 @@
-"""DEMO: covered lines, half the branches."""
+"""DEMO: covered but untested behaviour."""
 
 
-def clamp(x: int) -> int:
-    if x < 0:
-        x = 0
-    if x > 10:
-        x = 10
-    return x
+def add(a: int, b: int) -> int:
+    return a + b
