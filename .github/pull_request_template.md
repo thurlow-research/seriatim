@@ -13,6 +13,9 @@ Closes #
 <!-- Quote the CI output (TD §8.7): coverage and branch coverage; mutation survivors, each with
 why it is equivalent or which test was added; the PPE output when this PR touches it. -->
 
+<!-- A failing `private-terms` check is resolved by the maintainer, who decrypts its report.
+Never explain it here: don't list, guess or describe what matched. -->
+
 ## Repository settings to apply (SPEC §7.9)
 
 <!-- The exact changes, with check names as GitHub shows them. Or: None. -->
