@@ -1,20 +1,20 @@
 # TD — Slice 1: contract, sidecar gate, 429 and passthrough
 
-**Status:** revision 2, for review. **Date:** 2026-11-16.
+**Status:** revision 3, for review. **Date:** 2026-11-16.
 **Implements:** SPEC REQ-1 to REQ-7, REQ-10 to REQ-12b, REQ-15 (pre-auth form), REQ-18
 (S1 form), REQ-20 to REQ-26. **Architecture:** ADR-001 D1 to D4, D7, D8, D10 to D12.
 **Not in this slice:**
 - auth (S2);
 - the `num_ctx` policy (S3);
-- `/seriatim/status`, the capacity report and the exposure check (S4);
-- deploy (S5, S6); automated deployment is deferred (SPEC §7.6);
+- `/seriatim/status` and the exposure check (S4a), the capacity report (S4b), the durable admin switch (S4c) and node metrics (S4d);
+- deploy (S5, S6), releases (SPEC §7.6), the release follower (§7.7) and the interim deployment (§7.8);
 - the gateway (S7 and later);
 - TLS (S11).
 
-**Exposure before S4.** Until S2 and S4 land, the sidecar has no authentication and no
+**Exposure before S4a.** Until S2 and S4a land, the sidecar has no authentication and no
 exposure check. It therefore refuses a non-loopback listen address unless
 `SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` is set (SPEC REQ-15), and only the PPE sets that.
-Slices S1 to S3 are not deployed to GPU nodes. The first node deploy needs S4, because REQ-19
+Slices S1 to S3 are not deployed to GPU nodes. The first node deploy needs S4a, because REQ-19
 must pass before anything is admitted.
 
 ## 1. Files (13)
@@ -74,7 +74,7 @@ class Settings(BaseSettings):            # pydantic-settings; env prefix SERIATI
 
 class ConfigError(Exception): ...        # the message names the offending key
 
-def default_lock_dir() -> Path           # %ProgramData%\seriatim\run | /usr/local/var/run/seriatim | /run/seriatim
+def default_lock_dir() -> Path           # %ProgramData%\seriatim\run | /Library/Application Support/seriatim/run | /run/seriatim
 def load_settings(environ: Mapping[str, str] = os.environ) -> Settings
 ```
 
@@ -373,7 +373,7 @@ exception type.
  5  if route.kind == GATED:
  6      r ← gate.try_acquire(path, request_id)
  7      Busy     → 429 GPU_BUSY, Retry-After, X-Seriatim-Gate: busy; return   # body never read
- 8      Starting → 503 NODE_STARTING, Retry-After;               return
+ 8      Starting → 503 NODE_STARTING, Retry-After, X-Seriatim-Gate: refused; return  # body never read
  9      lease ← r; req_client ← new_gated_client()
 10  try:
 11      with anyio.move_on_after(deadline_remaining(lease)) as hold:      # inf when ungated
@@ -615,7 +615,7 @@ column shows the lease result for a gated request.
 | HTTP version other than 1.1 | 505 `HTTP_VERSION_UNSUPPORTED` (`Connection: close`) | — | none taken | `rejected` |
 | Unsafe raw path | 400 `BAD_PATH` | — | none taken | `rejected` |
 | Unknown `/seriatim/*` path, or the wrong method on one | 404 `NOT_FOUND` / 405 `METHOD_NOT_ALLOWED` | — | none taken | `rejected` |
-| Starting | 503 `NODE_STARTING` + `Retry-After` | — | none taken | `starting` |
+| Starting | 503 `NODE_STARTING` + `Retry-After` + `X-Seriatim-Gate: refused` | — | none taken | `starting` |
 | No free slot | 429 `GPU_BUSY` + `Retry-After` + `X-Seriatim-Gate: busy` | — | none taken | `busy` |
 | `Content-Length` > limit (buffered routes) | 413 `BODY_TOO_LARGE` | — | none taken | `rejected` |
 | Body grows past the limit while being read | 413 `BODY_TOO_LARGE` | — | freed | `rejected` |
@@ -640,8 +640,10 @@ logged at `DEBUG`, and it never changes the slot result.
 - `source: "sidecar"` and `node: settings.id`;
 - `retryable` and `replay_safe` from `ERROR_TABLE`, never from the call site;
 - `retry_after`, with the matching `Retry-After` header, whenever it is given;
-- `X-Seriatim-Gate`: `busy` only for `GPU_BUSY`, `acquired` when a slot was taken, otherwise
-  `ungated`.
+- `X-Seriatim-Gate`: `busy` only for `GPU_BUSY`; `refused` for `NODE_STARTING` (and, from
+  later slices, the other refusals given before Ollama is contacted: `NODE_OFFLINE`, the
+  exposure codes and `NUM_CTX_EXCEEDS_LIMIT`, SPEC REQ-37); `acquired` when a slot was taken;
+  otherwise `ungated`.
 
 ## 6. Configuration
 
@@ -772,7 +774,7 @@ also run on `windows-latest` and `macos-latest`.
 | B2 | Request 1 ends cleanly → a new request 2 gets 200 at once | 10 |
 | B3 | Raw socket: request 1 is held; request 2 sends only the headers, with `Content-Length: 10485760` → the 429 arrives without any body being sent | 3 |
 | B4 | slots 2: two held requests proceed and the third gets 429; after one finishes cleanly, a fourth gets 200 | 2 |
-| B5 | During startup quarantine: gated → 503 `NODE_STARTING` with `Retry-After ≤ drain_s`; `GET /api/tags` → 200; health → 503 with `starting` | 12a, 18 |
+| B5 | During startup quarantine: gated → 503 `NODE_STARTING` with `Retry-After ≤ drain_s` and `X-Seriatim-Gate: refused`, and the request body is never read; `GET /api/tags` → 200; health → 503 with `starting` | 12a, 18 |
 | E1 | `ollama_url` points at a closed port → 502 `UPSTREAM_UNAVAILABLE` with `replay_safe: true`; the next request also gets 502, not 429, because the slot was freed: nothing was sent | 26, 10 |
 | E2 | An unsafe raw path sent over a raw socket (`POST /api/chat/../show`) → 400 `BAD_PATH`; upstream received nothing | 20a |
 | E3 | `max_body_bytes=2048`: a 4096-byte body with an honest `Content-Length` → 413, and no slot was taken. The same body chunked, without a length → 413, and the slot was freed. Upstream received nothing | 20 |
@@ -784,7 +786,7 @@ also run on `windows-latest` and `macos-latest`.
 | HL3 | Upstream `/api/version` returns each of: 500; 200 `not json`; 200 `[]`; 200 `{}`; 200 `{"version":""}`; 200 `{"version":7}` → each gives 503 with `["ollama_bad_response"]` | 18 |
 | HL4 | An injected overdue lease → `slot_overdue`; an injected stuck slot → `slot_stuck`. The body never contains the version string | 18 |
 | L1 | After H1, B1, E1 and S4: one JSON log line each, with the fields in Appendix A. No line contains the body marker string, the `Authorization` value or the `X-API-Key` value | 22, 13 |
-| K-OAS1 | `contract/openapi.yaml` passes `openapi-spec-validator` (OpenAPI 3.1). Every Ollama path's `x-seriatim-gate` and `x-seriatim-scope` agree with `classify()` (Seriatim's own `/seriatim/*` and `/models/select` paths are not Ollama routes and are not classified); `x-seriatim-unknown-endpoint` agrees with rule 5 | 5, G7 |
+| K-OAS1 | `contract/openapi.yaml` passes `openapi-spec-validator` (OpenAPI 3.1), and every `$ref` resolves (checked separately, because the validator accepts an unresolved one). Every Ollama path's `x-seriatim-gate` and `x-seriatim-scope` agree with `classify()` (Seriatim's own `/seriatim/*` and `/models/select` paths are not Ollama routes and have no `x-seriatim-gate`, but each must declare `x-seriatim-scope`: `none`, `infer` or `admin`, and the ones S1 serves must agree with `classify()`); `x-seriatim-unknown-endpoint` agrees with rule 5 | 5, G7 |
 | K-OAS2 | Every collected error body validates against `ErrorEnvelope`, in-stream records against `StreamErrorRecord`, and health bodies against `Health` | 25 |
 | K-OAS3 | `set(ErrorCode)` equals the contract's `ErrorCode.enum`, and `ERROR_TABLE` equals `x-seriatim-codes` (status, `retryable` and `replay_safe` for each code) | 25 |
 
@@ -911,7 +913,8 @@ A log line, one per request:
     (`docker compose config`) as SPEC §8.3 requires. In a local run it also checks the
     hostname against the gitignored `ppe/.allowed-host`. `--ci` is accepted only when
     `GITHUB_ACTIONS=true`. It then pulls `qwen2.5:0.5b`, `qwen2.5:1.5b` and `all-minilm:22m`, with no
-    `ollama cp` aliases.
+    `ollama cp` aliases. Each sidecar container's entrypoint runs `seriatim-node init-state`
+    against its test state directory before it starts, from S4c on.
   - **Fixtures.** `tools/capture_fixtures.py` drives `ollama-a` directly. For each exchange
     it records:
     - `id`: for example `chat.stream`, `chat.nostream`, `generate.stream`, `embed`,

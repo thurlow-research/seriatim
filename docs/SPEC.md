@@ -1,6 +1,6 @@
 # Seriatim — Specification
 
-**Status:** revision 4, for review (Phase 1). **Date:** 2026-11-16.
+**Status:** revision 5, for review (Phase 1). **Date:** 2026-11-16.
 
 **Companion documents:**
 - [ADR-001](adr/ADR-001-architecture.md): architecture, contract, threat model, slice plan.
@@ -32,7 +32,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 | F1 | One global lock: while machine A was busy, a request for idle machine B also got 429 | One lock per machine, in the sidecar (REQ-2); busy state never couples machines (REQ-36) |
 | F2 | No routing by size: a 32B request went to a machine too small for it | Routing by size (REQ-32, REQ-33) |
 | F3 | `num_ctx` above an internal table was silently lowered (30000 → 24576), and on the OpenAI route it had no effect | `num_ctx` is never changed; an over-limit value is rejected (REQ-7 to REQ-9) |
-| F4 | `/api/tags`, `/api/ps` and `/api/version` showed only one machine | Combined across machines (REQ-38) |
+| F4 | `/api/tags`, `/api/ps` and `/api/version` showed only one machine | Merged across machines in Ollama's own shape, with per-node detail on `/seriatim/models` and `/seriatim/nodes` (REQ-38) |
 
 | evaluation requirement | requirements here |
 |---|---|
@@ -63,7 +63,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
    streams and every Ollama option. Existing Ollama clients work with nothing changed except
    the base URL and a Bearer key.
 4. **G4. One address.** Clients use one gateway. It sends each request to a machine the
-   operator has made eligible for the model, and shows a combined view of every machine.
+   operator has made eligible for the model, and merges the model lists of every machine.
 5. **G4a. Any fleet, defined by configuration.** The set of machines is whatever the
    gateway's configuration lists. Its size and makeup are not fixed: any number of machines,
    each with any amount of memory, on any platform that runs Python and Ollama.
@@ -166,6 +166,17 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     right method is served by Seriatim. A known path with the wrong method gets 405
     `METHOD_NOT_ALLOWED`. Any other path under `/seriatim/` gets 404 `NOT_FOUND`. These are
     never forwarded to Ollama.
+    - **Their scopes** are fixed by the contract (`x-seriatim-scope` on each path):
+      `/seriatim/health` needs no key; `/seriatim/status`, `/seriatim/nodes`,
+      `/seriatim/models` and `/models/select` need `infer`; every `/seriatim/admin/*` route
+      needs `admin`.
+    - **Redaction.** With an `infer` key, the operator's offline `reason`, `changed_by`, and
+      every slot's holder details (`path`, `model` and `request_id`) are returned as
+      `null`. A key can't be matched to a slot across the gateway, so no slot is shown in
+      full to an `infer` key. On `/seriatim/nodes` the gateway redacts its cached copies,
+      fetched with the node's admin key: each `admin_state`, and the embedded status's
+      `admin_state` and slots. An `admin` key sees everything. The fields stay present, so the
+      schema is the same for both.
   - **Explicit allowlist (ungated).** Exact method and path pairs, each verified to exist in
     the supported Ollama version. S0b probes every listed pair against that version and
     records the result, and a test checks the allowlist against the record:
@@ -237,7 +248,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   has stopped. The drain covers that window, and it is time-based, not proof (G1).
   - **Choosing the default.** It is checked against the cancellation latency measured in the
     PPE (P6). S5 and S6 measure it again on each GPU node, and record it.
-  - **Replacing it.** S4 may replace it with a positive signal, but only if one is shown to be
+  - **Replacing it.** A later slice may replace it with a positive signal, but only if one is shown to be
     reliable.
   - **Unproven closure.** If closing the upstream connection fails or times out, closure is
     unproven. The slot then stays *stuck* until the sidecar restarts, health reports it, and
@@ -271,8 +282,10 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     after its upstream's port (`upstream-<port>.lock`). The upstream is always loopback, so
     the port identifies it on the host.
   - **Where the lock lives.** The lock directory is fixed and system-wide:
-    `%ProgramData%\seriatim\run` on Windows, `/usr/local/var/run/seriatim` on macOS,
-    `/run/seriatim` on Linux. Every account therefore meets the same lock.
+    `%ProgramData%\seriatim\run` on Windows, `/Library/Application Support/seriatim/run`
+    on macOS, `/run/seriatim` on Linux. On macOS that is outside Homebrew's tree, whose
+    directories may belong to an unprivileged user, or may not exist (Apple Silicon uses
+    `/opt/homebrew`). Every account therefore meets the same lock.
   - **No override in production.** `SERIATIM_NODE_LOCK_DIR` can change it only in PPE and
     test mode (`ALLOW_UNAUTHENTICATED=true`). That way two production sidecars can never be
     configured apart.
@@ -315,9 +328,9 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 
   *Tests:* C5, slice S2.
 
-### 4.3 Sidecar: status, health, capacity, admin switch and exposure (slice S4, unless noted)
+### 4.3 Sidecar: status, health, capacity, admin switch and exposure (slices S4a to S4c, as noted)
 
-- **REQ-16. Capacity, measured and reported (slice S4).** `GET /seriatim/status` reports a
+- **REQ-16. Capacity, measured and reported (slice S4b).** `GET /seriatim/status` reports a
   `capacity` object (contract schema `Capacity`). Every figure names its source, and none is
   ever estimated or invented.
   - **What it is for.** In Phase 1 the report is **information**. The gateway shows it in
@@ -475,14 +488,14 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     test needs a real GPU.
 
   *Tests:* M1–M16, with the recorded probe fixtures (§8.1).
-- **REQ-17. Loaded models and slots.** Status includes:
+- **REQ-17. Loaded models and slots (slice S4a).** Status includes:
   - Ollama's `/api/ps` list, unchanged. If `/api/ps` fails or cannot be parsed, the field is
     `loaded_models: null` with `loaded_models_error`, never an empty list.
   - Each slot's state (free, held, draining or stuck), and for each holder its path, its model (when
     known), its start time, its elapsed time and any time left to drain.
 
-  *Tests:* G6, M5, M6.
-- **REQ-18. Health (slice S1, extended in S4).** `GET /seriatim/health` requires no
+  *Tests:* G6 (S1); ST1–ST3 (S4a: the `/api/ps` error state, slot details, and redaction for `infer` keys).
+- **REQ-18. Health (slice S1, extended in S4a and S4c).** `GET /seriatim/health` requires no
   authentication.
   - It returns 200 `{"status":"ok"}` only when all of these hold:
     - Ollama answers `GET /api/version` within 2 s with HTTP 200 and a JSON object whose
@@ -490,8 +503,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     - no slot has been held longer than its maximum hold plus 30 s, and no slot is stuck
       because closing its upstream connection timed out (TD-slice-1 §3.3);
     - the node is not starting;
-    - from S4, the exposure check has passed;
-    - from S4, the node is not offline by the admin switch (REQ-19a).
+    - from S4a, the exposure check has passed;
+    - from S4c, the node is not offline by the admin switch (REQ-19a).
   - Otherwise it returns 503. The body has `status: offline` whenever the switch is on, and
     `status: degraded` otherwise. `reasons` lists every cause, including `offline_admin`,
     so an offline node with another fault shows both.
@@ -517,7 +530,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       Ollama, and the check runs again before admission resumes.
 
   *Tests:* X1–X6.
-- **REQ-19a. Admin offline/online switch (slice S4).** The operator can take a node out of
+- **REQ-19a. Admin offline/online switch (slice S4c).** The operator can take a node out of
   service on purpose, and the sidecar owns that state.
   - **Routes**, both in the `admin` scope:
     - `POST /seriatim/admin/offline`, with an optional JSON body `{"reason": "…"}`. The
@@ -526,14 +539,17 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     - `POST /seriatim/admin/online`, with no body. A non-empty body gets 400
       `BAD_REQUEST_BODY`.
     - **The reason.** No body, `{}` and `{"reason": null}` all mean no reason. A reason is
-      a string of 1 to 200 characters for which Python's `str.isprintable()` is true, so no
-      control characters or line breaks.
+      a string of 1 to 200 characters, each of which is in a Unicode general category L,
+      M, N, P or S, or is the space U+0020. That rule is language-independent, and it is
+      what Python's `str.isprintable()` checks. So no control or format characters, line
+      breaks, or other spaces such as U+00A0. Contract cases include each of those, and
+      an accepted letter, accent and symbol.
 
     Both return 200 with the resulting state (contract `AdminState`).
     - **Going offline** sets `offline: true`, the reason, `since` (now) and `changed_by`.
     - **Going online** sets `offline: false` and `reason: null`, with `since` and
       `changed_by` recording that change.
-    - **On a first start,** with no file, every field but `offline: false` and
+    - **After `init-state`** (below), every field but `offline: false`, `epoch` and
       `revision: 0` is `null`.
     - **Idempotent.** Repeating the current state keeps `since`. A repeated `offline`
       replaces the reason and `changed_by`. A call that changes nothing still increments
@@ -543,20 +559,49 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       `replay_safe: true`). Ollama is not contacted.
     - **A request already admitted** runs to completion. Going offline never aborts work in
       progress, and its slot ends and drains as usual (REQ-10).
-    - **Ungated requests** (`/api/tags`, `/api/ps`, `/api/version`, `/api/show`) and admin
-      requests are still served, so the operator can inspect and maintain the node.
-  - **One commit point.** A change and admission are serialised by the gate's own lock:
-    - **The order.** The change is persisted (below), then published to memory, all while
-      that lock is held, and the 200 is sent only after it is released.
-    - **What it guarantees.** A gated request that took a slot before that point may
-      finish. One that asks for a slot after it gets `NODE_OFFLINE`. So no request reaches
-      Ollama after an `offline` call has returned 200.
-    - **Concurrent calls** are serialised the same way. Memory and disk always end in the
-      state of the last call to commit.
-  - **A revision number.** Every committed change increments `revision`, a persisted
-    integer, so an observer can tell a newer state from an older one.
+    - **Gated admin requests** are refused too, with the same `NODE_OFFLINE`: `POST
+      /api/create` and every unknown endpoint (REQ-5), because they wait for the GPU.
+    - **Ungated requests are still served,** so the operator can inspect and maintain the
+      node: the `infer` ones (`/api/tags`, `/api/ps`, `/api/version`, `/api/show`,
+      `/v1/models`) and the ungated `admin` ones (pull, push, copy, delete, blobs), as well
+      as `/seriatim/*`.
+  - **One commit point.** Changes are serialised by an admin lock of their own, never by
+    the gate's lock:
+    - **Persist first.** The new state is written and made durable (below) in a worker
+      thread (`anyio.to_thread`), holding only the admin lock. Neither the event loop nor
+      the gate's lock is held during that I/O, so admission never waits for a disk.
+    - **Then publish.** The new state replaces the in-memory one in one synchronous step on
+      the event loop. Admission is itself a synchronous check on the event loop (TD-slice-1
+      §3.2), so the two never interleave. That step is the **commit point**, and the 200 is
+      sent after it.
+    - **Not cancellable.** From the start of persistence to publication, the work is
+      shielded from the request's cancellation and keeps the admin lock. A client that
+      disconnects doesn't leave the file and memory apart.
+    - **A crash between persisting and publishing** leaves the new state on disk, so the
+      next process starts with it. The call's outcome is then unknown to its caller, and
+      re-sending it is safe.
+    - **What it guarantees.** After the commit point, there are **no new admissions**: a
+      gated request that asks for a slot gets `NODE_OFFLINE`. A request admitted before it
+      keeps running, and may still reach Ollama afterwards, because a body is buffered after
+      admission (REQ-20). The switch never claims otherwise.
+    - **Concurrent calls** are serialised by the admin lock. Once each call has finished,
+      memory and disk hold the state of the last call to commit.
+  - **Epoch and revision.** The state carries two persisted values, so an observer can
+    always order what it sees:
+    - **`epoch`:** 32 random hex characters. A new epoch is started by `init-state`, and by
+      every recovery from a lost or unreadable state (below). It is never reused.
+    - **`revision`:** an integer that starts at 0 in each epoch and increments on every
+      committed change within it.
+
+    A recovered node therefore never depends on an old revision number that it can no
+    longer read. REQ-42a defines how the gateway orders observations.
   - **Precedence of refusals** for a new gated request: `NODE_OFFLINE`, then the exposure
-    codes (`OLLAMA_EXPOSED`, `EXPOSURE_UNVERIFIED`), then `NODE_STARTING`, then busy. So an
+    codes (`OLLAMA_EXPOSED`, `EXPOSURE_UNVERIFIED`), then `NODE_STARTING`, then busy (a
+    maintainer decision).
+    - **Before the body.** All of them are answered before the request body is read, as
+      busy is, so a refused request costs no upload.
+    - **Marked.** Each carries `X-Seriatim-Gate: refused` (busy keeps `busy`), so the
+      gateway knows that Seriatim refused it and Ollama was not contacted (REQ-37). So an
     offline node that restarts says it is offline, which is not retryable, rather than
     starting, which is.
     - **Independent of slots.** The admin state is separate from slot state. `online` never
@@ -569,29 +614,57 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     at `WARNING`, with the key id, the reason and the previous state.
   - **Gateway or not.** The switch also applies to clients that call the sidecar directly,
     because the sidecar holds the lock.
-  - **It survives a restart.** The state is kept in `node-state.json`, in the same fixed,
-    system-wide directory as the singleton lock (REQ-12b). On POSIX it has mode 0600. On
-    Windows the directory's ACL (REQ-57) protects it, because a file mode means nothing
-    there.
+  - **It survives a restart.** The state is kept in `node-state.json` in a **persistent
+    state directory**, separate from the runtime lock directory (REQ-12b), which may be a
+    tmpfs:
+    - `%ProgramData%\seriatim\state` on Windows, `/Library/Application Support/seriatim/state`
+      on macOS, and `/var/lib/seriatim` on Linux;
+    - **owned by the sidecar's service account,** with every parent directory owned by an
+      administrator (`root:wheel` on macOS, `root` on Linux), so no other account can
+      rename or replace it;
+    - **fixed in production,** like the lock directory. `SERIATIM_NODE_STATE_DIR` can
+      change it only in PPE and test mode;
+    - on POSIX, mode 0700 for the directory and 0600 for the file. On Windows the
+      directory's ACL (REQ-57) protects it, because a file mode means nothing there.
+    - **`seriatim-node init-state`** is a first-install step. It creates the directory and an
+      online state with a new epoch.
+      - **Already initialised:** a valid file is left unchanged, and it exits 0 saying so.
+      - **Unreadable file:** it is never overwritten; `init-state` exits non-zero.
+      - **Who runs it:** the install scripts (REQ-57, REQ-58), and `ppe/ppe up` when it
+        creates a node's state volume. An ordinary service start never runs it, so lost
+        state is never re-initialised automatically.
     - **Writes are atomic and durable.** A temporary file with a unique name
       (`node-state.json.<pid>.<random>.tmp`) in the same directory is written and fsynced, then renamed over the old one, then made durable:
       - **POSIX:** `os.replace`, then an fsync of the directory.
-      - **Windows:** `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`,
-        which returns only when the move is on disk.
+      - **Windows:** the temporary file is closed after its fsync, then moved with
+        `MoveFileExW` and `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`, which returns
+        only when the move is on disk. A sharing or access-denied error (a scanner holding
+        the file) is retried up to 5 times, 100 ms apart. If it still fails, the rename and
+        the flush were one call, so the sidecar decides which side of the rename it is on by
+        checking whether the temporary file still exists.
     - **A failure before the rename** gets 500 `INTERNAL`. Neither the file nor memory
       changes, and the temporary file is removed.
     - **A failure after the rename** (the directory fsync) gets 500 `INTERNAL` too. The
       file may already hold the new state, so memory takes the new state as well, and an
       `ERROR` says the change may not survive a power loss. Re-sending the same call is
       safe, because it is idempotent.
-    - **At startup** the sidecar reads the file before it admits anything. A missing file
-      means online (a first start).
-    - **A file that cannot be read or parsed** means **offline**, with the reason
-      `state file unreadable`, and an `ERROR` is logged. Only an explicit `online` call
-      brings the node back, and that call rewrites the file.
-    - **A reboot during maintenance** therefore never brings a GPU back into service.
+    - **At startup** the sidecar reads the file before it admits anything.
+    - **Lost or unreadable state fails closed.** A missing directory, a missing file, or a
+      file that cannot be read or parsed means **offline**:
+      - the reason is `state file missing` or `state file unreadable`;
+      - a **new epoch** begins, with `revision: 0`, held in memory, with `since` the
+        startup time and `changed_by: null`;
+      - an `ERROR` is logged.
 
-  *Tests:* AS1–AS12:
+      A missing file is never taken as a first start: only `init-state` makes one.
+    - **Recovery.** An explicit `online` call writes a fresh file in the new epoch
+      (`revision: 1`), first recreating a missing state directory with the permissions or
+      ACL above, and the node returns to service. The gateway accepts it, because the
+      epoch is new (REQ-42a), whatever revision it held before.
+    - **A reboot during maintenance** therefore never brings a GPU back into service, even
+      where the lock directory is on a tmpfs.
+
+  *Tests:* AS1–AS18:
   - offline refuses new gated work with `NODE_OFFLINE`, while a request already admitted
     finishes;
   - **barrier tests:** an `offline` that commits while a request is between "read state"
@@ -605,9 +678,22 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - the state persists across a restart, and across a kill during the write; a first
     write and a replacement are tested separately, with failures injected before and after
     the rename;
-  - an unreadable file starts the node offline;
-  - online restores it;
-  - a non-admin key gets 403, and a reason that is too long gets 400.
+  - an unreadable file, a missing file and a missing state directory each start the node
+    offline, in a new epoch; on Linux, the state survives with the lock directory on a
+    tmpfs that is emptied between runs;
+  - `init-state` leaves a valid file unchanged (exit 0) and never overwrites an unreadable
+    one (non-zero);
+  - **cancellation and crashes:** a client disconnect during an `offline` call, and a
+    process kill between persisting and publishing, each leave memory and disk agreeing
+    after restart;
+  - **sidecar-side recovery:** after corruption, `online` recreates the directory if needed
+    and reports `revision: 1` in a new epoch (the gateway side is GA, in S8);
+  - gated admin requests (`/api/create`, an unknown endpoint) get `NODE_OFFLINE`, while
+    ungated admin requests are served;
+  - state I/O never runs under the gate's lock: with an injected slow fsync during an
+    `offline` call, ungated requests and the admission check keep answering;
+  - a non-admin key gets 403; a reason that is too long, empty or has a control character
+    gets 400.
 
 ### 4.4 Sidecar: limits, process, errors and logging
 
@@ -703,10 +789,10 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 - **REQ-30. One address.** The gateway serves:
   - the native Ollama API and the `/v1` routes;
   - `/models/select`;
-  - `GET /seriatim/health` and `GET /seriatim/nodes`;
+  - `GET /seriatim/health`, `GET /seriatim/nodes` and `GET /seriatim/models`;
   - `POST /seriatim/admin/nodes/{id}/offline` and `.../online` (REQ-42a);
   - `GET /` and `HEAD /`, which answer 200 `Ollama is running` when at least one node is
-    healthy, and 503 `GPU_OFFLINE` otherwise.
+    healthy, and 503 `FLEET_UNAVAILABLE` otherwise (REQ-35).
 
   Its classification uses the same table as REQ-5.
 - **REQ-31. Gateway auth.**
@@ -733,23 +819,35 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
        default is applied.
     2. **`capacity = "unlimited"` on the node.** Eligible, with no size check. This is for
        CPU-only or unusual machines, by the operator's explicit choice.
+    2a. **`capacity = "listed_only"` on the node.** Not eligible (reason `listed_only`).
+       Such a node runs only the models whose eligible-nodes lists name it (rule 1), which
+       is how a node is kept for a few chosen models.
     3. **`max_params_b` on the node.** Eligible when the model's parameter count is at most
        `max_params_b`.
     4. **None of these.** The node has **no size policy** for this model. It is **excluded**,
        and Seriatim never guesses.
 
-    Setting both `capacity = "unlimited"` and `max_params_b` on one node is a configuration
-    error. An eligible-nodes list that names an unknown node is also a configuration error.
+    **Configuration errors**, rejected at startup and on reload (REQ-45):
+    - setting `max_params_b` together with any `capacity` value on one node;
+    - an eligible-nodes list that names an unknown node;
+    - two `[models."…"]` tables whose names normalise to the same model, such as
+      `[models."m"]` and `[models."m:latest"]`.
   - **Parameter counts are per node.** Each node is judged against the model as that node's
     own `/api/tags` describes it, because two nodes can hold different models under one name.
-    - **`size_overrides` first.** A table of the model name, normalised with Ollama's
-      `:latest` default, to a positive, finite number of billions of parameters, such as
-      `"mixtral:8x7b" = 46.7`. It applies to that name on every node.
-    - **Override errors.** Two keys that normalise to the same name, or a value that is not
-      positive and finite, are configuration errors.
-    - **Otherwise `details.parameter_size`,** parsed as `^([0-9]+(\.[0-9]+)?)([MB])$` (M = 10⁶,
-      B = 10⁹). Any other form, such as `8x7B`, is unknown unless `size_overrides` gives
-      it.
+    - **The node's own `details.parameter_size` first,** parsed as
+      `^([0-9]+(\.[0-9]+)?)([MB])$` (M = 10⁶, B = 10⁹).
+    - **`size_overrides` only where that fails.** A table from a model to a positive,
+      finite number of billions of parameters. It is consulted only for a node whose own
+      `parameter_size` can't be parsed, such as `8x7B`, so an override never changes a
+      node whose size is already known. Its keys are:
+      - `"<name>@<digest>"`, such as `"mixtral:8x7b@sha256:…"`, for exactly that model;
+      - or `"<name>"`, for any digest under that name.
+
+      A digest key wins over a name key. Names are normalised with Ollama's `:latest`
+      default.
+    - **Override errors.** Two keys that normalise to the same name and digest, or a value
+      that is not positive and finite, are configuration errors.
+    - **Otherwise** the count is unknown, and the verdict is `size_unknown`.
   - **A node named in the request.** A request that names its node in `X-Seriatim-Node` and
     names a model is checked against **that node only**.
     - **An unknown node id** gets 404 `NOT_FOUND`.
@@ -762,7 +860,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       checked.
   - **A per-node verdict for every configured node**, exactly one of:
     - `eligible`;
-    - `not_eligible` (not in the model's list, or `max_params_b` too small);
+    - `not_eligible` (not in the model's list, `listed_only`, or `max_params_b` too small);
     - `no_size_policy` (rule 4);
     - `size_unknown` (rule 3 applies, but the parameter count is unknown);
     - `model_absent` (its last discovery answered and did not list the model);
@@ -798,6 +896,9 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     unreachable node, whose verdict is `unhealthy` and whose `lists_model` is `unknown`,
     still makes a model that no other node lists `DISCOVERY_INCOMPLETE`, as REQ-34
     requires.
+  - **Verdict reasons** never contain the operator's offline reason or a key id. An offline
+    node's reason is `offline_admin`. The full `AdminState` is in `/seriatim/nodes`, for
+    admin keys (REQ-42).
   - **Candidates** are the nodes whose verdict is `eligible`, in configured priority order.
   - **When there are no candidates,** the first of these that applies is returned, so each
     case has exactly one answer:
@@ -806,11 +907,13 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     2. **`MODEL_NOT_FOUND` (404).** Every node has `lists_model: false`.
     3. **`GPU_OFFLINE` (503).** Some node with `lists_model: true` is `unhealthy` or
        `offline` and has `rule_verdict: eligible`, and no node is a candidate. The model
-       could run there once the node is back. Existing clients already handle this code (ruling Q7). The verdicts in
+       could run there once the node is back. Existing clients already treat this code as
+       fail-fast (ruling Q7), so it has `retryable: false` and **no** `Retry-After`. The verdicts in
        `nodes` tell an admin switch apart from a failure.
     4. **`SIZE_POLICY_MISSING` (503, `retryable: false`).** Some node that lists the model
        has `no_size_policy` as its verdict or its `rule_verdict`. The operator has to add a rule; retrying won't help.
-       The `hint` names the node and the three ways to fix it.
+       The `hint` names the node and the four ways to fix it (an eligible-nodes list,
+       `unlimited`, `listed_only`, `max_params_b`).
     5. **`MODEL_SIZE_UNKNOWN` (422).** Some node that lists the model has `size_unknown` as
        its verdict or its `rule_verdict`. `size_overrides` fixes it.
     6. **`MODEL_NOT_ELIGIBLE` (422).** Every node that lists the model has `not_eligible` as
@@ -835,9 +938,15 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     `Retry-After`.
 - **REQ-35. No healthy node.** If a node that lists the model and whose rules admit it
   is `unhealthy` or `offline`, and no node is a candidate (REQ-32, case 3), the request gets 503
-  `GPU_OFFLINE` with `retryable: false` and `Retry-After`. The code and the
-  `retryable` value match what existing clients already handle (ruling Q7).
-- **REQ-36. Busy and spill-over (ruling Q1).** The gateway has no lock and no queue.
+  `GPU_OFFLINE` with `retryable: false`, its per-node verdicts, and no `Retry-After`. The
+  code and the `retryable` value match what existing clients already treat as fail-fast
+  (ruling Q7).
+  - **Fleet-wide answers are different.** A route that names no model (`/`, `HEAD /` and
+    the merged views of REQ-38) gets 503 `FLEET_UNAVAILABLE` when no node answers. That is
+    `retryable: true`, with `Retry-After: 15`, the health-check interval, and no per-node
+    verdicts.
+- **REQ-36. Busy and spill-over (ruling Q1).** The gateway has no lock and no queue. REQ-37
+  extends the same rule to Seriatim's other refusals.
   - **Admission 429.** When a candidate answers with an admission 429 (`X-Seriatim-Gate: busy`
     and `error_code: GPU_BUSY` with `source: sidecar`), the gateway MUST try the next eligible
     candidate at once. It tries each eligible candidate **once**, in priority order, and never
@@ -851,11 +960,31 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     node id tried>` and `X-Reroute-Reason`, with the same values as the metric's `reason`.
     Nodes skipped without being tried are not reported there.
 - **REQ-37. Node failure.**
-  - Only `replay_safe: true` failures may be retried on another candidate: a failed connect to
-    the node, an admission 429, `NODE_STARTING`, `NODE_SATURATED`, `EXPOSURE_UNVERIFIED`,
-    `OLLAMA_EXPOSED` or `NODE_OFFLINE`. A `NODE_OFFLINE` answer marks that node `offline`
-    until its next health check, and never marks it down. Only `UPSTREAM_UNAVAILABLE` and a failed connect mark a node down;
-    `NODE_SATURATED` does not.
+  - **The gateway MUST try the next eligible candidate** at once, in priority order and once
+    each, after any of these replay-safe answers. In none of them was Ollama contacted:
+    - a failed connect to the node;
+    - `X-Seriatim-Gate: busy` (REQ-36);
+    - `X-Seriatim-Gate: refused`, with `NODE_OFFLINE`, `OLLAMA_EXPOSED`,
+      `EXPOSURE_UNVERIFIED`, `NODE_STARTING` or `NUM_CTX_EXCEEDS_LIMIT` (REQ-8: the nodes
+      may have different limits);
+    - `NODE_SATURATED`;
+    - the sidecar's own 502 `UPSTREAM_UNAVAILABLE`, which means its connect to Ollama
+      failed, so Ollama received nothing.
+
+    The decision is taken on the header together with an `ErrorEnvelope` whose
+    `source` is `sidecar`, never on the status code alone.
+  - **When every candidate refuses,** the client gets one answer, the first that applies:
+    1. if any candidate was busy, that 429, with the smallest `Retry-After`;
+    2. if any refusal was retryable (`NODE_STARTING`, `EXPOSURE_UNVERIFIED`,
+       `NODE_SATURATED`, `UPSTREAM_UNAVAILABLE`, or a failed connect), the first of those,
+       because that node may take the request soon;
+    3. if every candidate refused for `num_ctx`, that 422, with the **largest** `limit`
+       among them, and a `hint` naming that node;
+    4. otherwise, the first refusal that is not for `num_ctx` (`NODE_OFFLINE`,
+       `OLLAMA_EXPOSED`).
+  - **Marking.** A `NODE_OFFLINE` answer marks that node offline until its next status
+    read, and never marks it down. Only `UPSTREAM_UNAVAILABLE` and a failed connect mark a
+    node down. `NODE_SATURATED` and the other refusals do not.
   - **Only routed requests fail over.** A request the gateway routed itself may be retried on
     another candidate. A request that names its node in `X-Seriatim-Node`, which every admin
     request must (REQ-41), is never retried elsewhere. Its failure goes back to the
@@ -864,20 +993,49 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - A failure after the request reached Ollama is never retried; the client gets it as in
     REQ-24.
   - A node that is down is checked again through `/seriatim/health` every 15 s.
-- **REQ-38. Combined views.**
-  - `GET /api/tags` returns the union of all nodes' model lists, one entry per model name.
-    - **The entry** is the highest-priority node's, unchanged, including both `name` and
-      `model`, plus `seriatim_nodes`: every node that lists the name, in priority order.
-    - **Different models under one name.** If the nodes' digests differ, the entry also
-      carries `seriatim_digests: {node id: digest}`, so the difference is visible.
-  - `GET /api/ps` returns every node's list, and each entry carries `seriatim_node`.
-  - `GET /api/version` returns the lowest version, plus `seriatim_nodes: {id: version}`.
-  - `GET /v1/models` returns the union of the nodes' `/v1/models` lists, in OpenAI's list
-    shape, one entry per model id, with no added fields. `created` is the latest of the
-    nodes' values.
-  - If some nodes did not answer, the response carries `seriatim_partial` and the
-    `X-Seriatim-Partial` header. If none answered, it is 503 `GPU_OFFLINE`.
-  - The schemas are in the contract (F4).
+- **REQ-38. Merged views, in the standard shapes (maintainer decision).** A response on an
+  Ollama-native (`/api/*`) or OpenAI-compatible (`/v1/*`) route has **exactly Ollama's
+  schema**. Seriatim adds no body field there, not even in a merged view. Seriatim's own
+  data lives on `/seriatim/*` paths and in `X-Seriatim-*` headers. Seriatim's own refusals
+  are its `ErrorEnvelope`, marked by `X-Seriatim-*` headers, as before.
+  - **`GET /api/tags`:** one entry per model name, so a client sees one model once.
+    - **The source node** for a name is the highest-priority node whose rules admit that
+      model (REQ-32), or, if none does, the highest-priority node that lists it. The entry
+      is that node's, unchanged, in Ollama's fields only. So the entry describes the model
+      that requests are actually routed to.
+    - **Different models under one name** (the nodes' digests differ) still give one entry,
+      the source node's. Which node holds which digest is in `/seriatim/models`.
+    - **Order:** by `modified_at`, newest first, as Ollama orders its own list, then by
+      name. `modified_at` is compared as a parsed instant, because each node writes it in
+      its own time zone and precision.
+    - **Priority ties** between nodes are broken by their order in the configuration file,
+      here and everywhere else.
+  - **`GET /api/ps`:** every node's entries, unchanged and concatenated in node priority
+    order. A model loaded on two nodes appears twice, which Ollama's list allows.
+  - **`GET /api/version`:** `{"version": "<v>"}`, Ollama's shape, where `<v>` is the
+    lowest of the nodes' versions, compared as dotted integers after removing any `-…` or
+    `+…` suffix. A node whose version still can't be parsed is left out and named in
+    `X-Seriatim-Partial`. If no version can be parsed, the answer is 503
+    `FLEET_UNAVAILABLE`.
+  - **`GET /v1/models`:** OpenAI's list shape exactly: one entry per model id, from the same
+    source node as `/api/tags`, so `created` and `owned_by` agree with it. Ordered by
+    `created`, newest first, then by id.
+  - **Partial results** are signalled only by the `X-Seriatim-Partial` header, which names
+    the nodes that didn't answer, or whose answer didn't validate against the plain shape
+    and was therefore left out. If no valid answer remains, the view gets 503
+    `FLEET_UNAVAILABLE`.
+  - **Per-node detail** is on Seriatim's own paths:
+    - `GET /seriatim/models` (scope `infer`): for each model name, every node that lists
+      it, with that node's `digest`, `size`, `parameter_size` and `modified_at`, plus
+      `digests_differ` when they don't agree. Models are ordered by name, and each model's
+      nodes by priority. A node that didn't answer is listed in `partial`.
+  - **Live, not cached.** The merged views and `/seriatim/models` ask the nodes at the time
+    of the request, each bounded by the discovery timeout; if no node answers, they get 503
+    `FLEET_UNAVAILABLE`.
+    - `/seriatim/nodes` (REQ-42): each node's loaded models and Ollama version.
+  - **Checked against the plain shapes.** Every merged response validates against the
+    response shape recorded from the pinned Ollama version by S0b, with no extra keys (F4,
+    and REQ-62a).
 - **REQ-39. `/models/select`.**
   - It picks a model and a node for a `task`, from operator-configured preference lists, model
     presence and the eligibility rules (REQ-32).
@@ -896,9 +1054,11 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   `NODE_REQUIRED`.
 - **REQ-42. Gateway health.**
   - `/seriatim/health` returns 200 when at least one node is healthy, otherwise 503.
-  - `/seriatim/nodes` (authenticated) returns, for each node:
-    - its id, health, priority, last check time and status;
-    - **its configured eligibility:** `size_policy` (`unlimited`, `max_params_b` or `none`),
+  - `/seriatim/nodes` (scope `infer`, redacted for `infer` keys as REQ-5 says) returns, for
+    each node:
+    - its id, health, priority, last check time, Ollama version and status;
+    - **its configured eligibility:** `size_policy` (`unlimited`, `listed_only`,
+      `max_params_b` or `none`),
       `max_params_b` when set, and `eligible_for_models`: the models whose eligible-nodes
       lists name it;
     - **its measured capacity**, next to that eligibility: the node's last `Capacity` report
@@ -918,7 +1078,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     - 502 `UPSTREAM_UNAVAILABLE` when the connection fails, before anything is sent;
     - 502 `UPSTREAM_PROTOCOL_ERROR` when the call was sent but no HTTP answer arrives, as
       after a 10 s timeout. The outcome is then **unknown**, because the sidecar may have
-      committed. The gateway refreshes that node's state at once, and the error says so.
+      committed. The error says so, and the gateway answers at once: it does **not** wait
+      for the status refresh it then starts in the background, itself bounded at 10 s.
       Re-sending is still safe, because the call is idempotent;
     - the sidecar's HTTP error, unchanged, when the sidecar answers with one;
     - 502 `UPSTREAM_PROTOCOL_ERROR` when a 200 body is not a valid `AdminState`.
@@ -929,26 +1090,53 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     - **What it keeps** is an in-memory observation of each node's `AdminState`, with the
       time it was read.
     - **Where it comes from:**
-      - the sidecar's health and its authenticated `/seriatim/status`, both read every
-        15 s, including while health is degraded;
-      - a confirmed admin call, applied at once, so routing changes before the next read;
-      - a `NODE_OFFLINE` answer, which marks the node offline until the next status read.
+      - **authoritative:** the sidecar's `/seriatim/status`, read with the node's admin key
+        every 15 s, including while health is degraded, and the `AdminState` returned by a
+        confirmed admin call, applied at once, so routing changes before the next read;
+      - **hints only:** health saying `offline`, and a `NODE_OFFLINE` answer. Neither
+        carries an epoch or revision, so neither overwrites the observation. Each marks the
+        node offline for routing and triggers an immediate status read. A hint whose
+        request was sent before the held observation was received is ignored, so a slow
+        health check can't undo a confirmed `online`.
     - **Unreachable while offline.** A node that stops answering keeps its last observed
       `AdminState`, so a node rebooted during maintenance stays `offline`, not `unhealthy`,
       until a status read shows otherwise.
-    - **Ordering.** An observation with a lower `revision` than the one held is ignored, so
-      a slow health check never overwrites a newer confirmation. A sidecar restart keeps
-      `revision`, because it is persisted.
+    - **Ordering: one authoritative operation per node at a time.** Status reads and admin
+      calls to a node are serialised by a per-node lock on the gateway, so their answers
+      can't cross.
+      - **Fencing.** Each operation takes a sequence number. An operation that timed out
+        is fenced: its late answer, if one ever arrives, is discarded.
+      - **Same epoch:** an observation with a lower `revision` than the one held is
+        ignored.
+      - **A different epoch:** the gateway discards the held observation, and applies the
+        next status read it starts **after** seeing the new epoch. That fresh read decides,
+        so a recovered node is accepted whatever revision the gateway held, and no answer
+        from before the recovery can win.
+  - **Coming back online.** When a node's observation turns from offline to online, its
+    `lists_model` becomes `unknown` and the gateway refreshes its `/api/tags` before routing
+    to it, because models may have changed during maintenance. Until then the node is not a
+    candidate.
+    - **After a confirmed `online` call,** the gateway does that refresh before it returns
+      the 200, bounded by the discovery timeout, so a request sent right after the 200 can
+      be routed to the node. If the refresh fails, the 200 still stands, and the node waits
+      for the next discovery.
+    - **After a status read** that shows the change, the refresh runs in the background.
   - **Routing.** An offline node is out of routing (verdict `offline`, REQ-32), so requests
     spill over to the other eligible nodes.
   - **Visible.** `/seriatim/nodes` shows each node's `admin_state`: offline, reason, since.
 
-  *Tests:* GA1–GA8:
+  *Tests:* GA1–GA12:
   - the gateway forwards the call and reports success only after the sidecar confirms;
   - an unreachable sidecar gives 502, and the node's state is unchanged in the view;
   - a timeout after the sidecar committed gives 502 with the outcome unknown, and the next
     status read shows the committed state;
-  - an older observation never replaces a newer `revision`;
+  - an older observation never replaces a newer `revision` in the same epoch; health and
+    `NODE_OFFLINE` never overwrite the observation;
+  - **barrier tests for epochs:** a status read that snapshots the old epoch while a
+    confirmed admin call reports the new one; a timed-out call whose answer arrives after
+    recovery (fenced); in each, the fresh read after the new epoch decides, and the node is
+    routed again after recovery although the gateway held a higher revision;
+  - after `online`, the node is not routed to until its discovery has been refreshed;
   - an unknown id gives 404;
   - requests fail over around an offline node;
   - online restores routing;
@@ -958,7 +1146,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 - **REQ-44. The fleet is configuration.**
   - **One place.** The gateway's configuration file is the only description of the fleet.
     - **Per node:** `id`, `url`, keys and `priority`, plus an optional size policy:
-      `max_params_b`, or `capacity = "unlimited"`.
+      `max_params_b`, `capacity = "unlimited"` or `capacity = "listed_only"`.
     - **Per model** (optional): `[models."<name>"] eligible_nodes = [...]`.
     - **Fleet-wide:** `size_overrides` and the task preferences.
   - **Measured, but not yet trusted.** Each node measures and reports its capacity (REQ-16).
@@ -1011,7 +1199,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     service, and the firewall rule (§6.1). The install scripts (§7.3, §7.4) automate this for
     their platforms. The local-only check (REQ-53) states what must hold on any platform.
 
-### 4.5a Monitoring (sidecar in S4, gateway in S8)
+### 4.5a Monitoring (sidecar in S4d, gateway in S8)
 
 - **REQ-67. Prometheus metrics through the textfile collector.**
   - **The mechanism.** Each sidecar, and the gateway, writes its metrics in the Prometheus
@@ -1024,28 +1212,41 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - **Configuration.**
     - `SERIATIM_NODE_METRICS_TEXTFILE_DIR` or `SERIATIM_GW_METRICS_TEXTFILE_DIR` names the
       collector's directory. When it is unset, no file is written.
-    - The file is `seriatim_node.prom` on a node and `seriatim_gateway.prom` on the gateway
-      host. In the gateway's container image, the directory is a mounted volume.
+    - **One writer per file.** The file is `seriatim_node.prom` on a node, and
+      `seriatim_gateway_<instance>.prom` for a gateway, where `<instance>` is
+      `SERIATIM_GW_INSTANCE` (default `default`), which must match
+      `^[a-z0-9][a-z0-9-]{0,31}$`, or the gateway exits with code 2. Several gateway copies
+      may run, so each needs its own instance name. Every gateway series carries the label
+      `gateway="<instance>"`.
+    - **Enforced.** A writer holds an exclusive lock on `.<file>.lock` in the directory. A
+      second writer that can't take it writes no metrics and logs an `ERROR` naming the
+      file.
   - **Writing.** Every 15 s, and at shutdown, the file is written atomically: a temporary
     file in the same directory, then a rename. The collector therefore never reads half a
     file.
-    - **The temporary name** is `.seriatim_node.prom.tmp` (or `.seriatim_gateway.prom.tmp`).
-      It doesn't end in `.prom`, so the collector never reads it.
+    - **The temporary name** is `.<file>.<pid>.tmp`. It doesn't end in `.prom`, so the
+      collector never reads it, and it is unique to the writer.
     - **No sample timestamps.** `node_exporter` rejects a whole file that has them.
       Freshness is the value of `metrics_timestamp_seconds`.
     - **On Windows** a reader can hold the file open. The rename is retried up to 5 times,
       100 ms apart. If it still fails, the old, complete file stays, and the failure is
       logged.
-    - **Mode** 0644, because the exporter must read it. On Windows, the file grants read to
-      the exporter's service account.
+    - **Mode** 0644, because the exporter must read it. On Windows, the file takes its ACL by
+      inheritance from the directory, where the install script grants the exporter's
+      account read and the sidecar's account modify, both inherited by new files
+      (`(OI)(CI)`). The sidecar sets no ACL itself.
     - **In a container,** the directory must be a bind mount of the host's collector
       directory, writable by the container's user. A named volume the exporter can't see is
       a configuration error, and the startup check reports it.
     - **A failed write** is logged at `WARNING` at most once a minute, and never affects
       serving.
   - **What the file must not contain:** keys, key hashes, prompts, request bodies or
-    addresses. Labels may carry only configured node ids, device indices, error codes, the
-    Seriatim version, and the fixed values listed below for each label.
+    addresses. Labels may carry only configured node ids, the gateway instance name, device
+    indices, error codes, the Seriatim version, and the fixed values listed below for each
+    label.
+    - **A retired gateway instance's file** stays in the directory until removed. The
+      install notes say to remove it, and alerts on `metrics_timestamp_seconds` catch one
+      that was forgotten.
     - **No model names in labels.** They are unbounded and partly user-controlled.
     - **No client key ids in labels.** The request log (REQ-22) answers "who".
   - **Sidecar metrics** (prefix `seriatim_node_`):
@@ -1059,8 +1260,9 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       `metrics_timestamp_seconds`, which lets a stale file be alerted on;
     - `slots{state}`: the number of slots in each of `free`, `held`, `draining`, `stuck`;
     - `admissions_total{result}`: `acquired`, `busy`, `refused`. `refused` covers a
-      request turned away by `NODE_STARTING`, `NODE_OFFLINE`, `OLLAMA_EXPOSED` or
-      `EXPOSURE_UNVERIFIED`;
+      request turned away by `NODE_STARTING`, `NODE_OFFLINE`, `OLLAMA_EXPOSED`,
+      `EXPOSURE_UNVERIFIED` or `NUM_CTX_EXCEEDS_LIMIT` (every answer with
+      `X-Seriatim-Gate: refused`);
     - `requests_total{kind, status}`: `kind` is `gated`, `ungated` or `seriatim`;
       `status` is the HTTP status class (`2xx`, `4xx`, `5xx`);
     - `errors_total{error_code}`, for every code in the contract;
@@ -1076,11 +1278,13 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       figure that is `null` in the report is left out of the file, never written as 0.
   - **Gateway metrics** (prefix `seriatim_gw_`):
     - `up`, `build_info{version}`, `metrics_timestamp_seconds`;
-    - **per node:** `node_healthy{node}` and `node_offline{node}`;
+    - **per node:** `node_healthy{node}` and `node_offline{node}`. Per-node series exist only
+      for the nodes currently configured: a node removed by a reload disappears from the
+      next file;
     - `routed_total{node, outcome}`, where `outcome` is `served`, `spilled` or `failed`;
     - `spillovers_total{from_node, reason}`: a tried node answered with a replay-safe
       refusal (REQ-37) and the next was tried. `reason` is `busy`, `offline`, `starting`,
-      `saturated`, `exposure` or `unreachable`. Skipping a node already known to be offline
+      `saturated`, `exposure`, `num_ctx_limit` or `unreachable`. Skipping a node already known to be offline
       or down is not a spill-over, and is counted in `skipped_total{node, verdict}`;
     - `routing_errors_total{error_code}`, for the REQ-32 errors;
     - `config_reloads_total{result}` (`applied` or `rejected`) and
@@ -1091,7 +1295,10 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     directory from the exporter's own configuration (`--collector.textfile.directory`, or
     `windows_exporter`'s `--collector.textfile.directories`), never assume a path.
 
-  *Tests:* MX1–MX10:
+  *Tests:* MX1–MX12:
+  - a second writer for the same file writes nothing and logs the error; two gateway
+    instances write two files with distinct `gateway` labels;
+  - a node removed by a reload has no series in the next file;
   - the file parses with a pinned `promtool check metrics`, and a pinned `node_exporter`
     serves every series from it;
   - no sample has a timestamp (no sample line has a third field), every family has
@@ -1127,7 +1334,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 | condition | sidecar | gateway |
 |---|---|---|
 | No free slot, or a slot is draining | 429 `GPU_BUSY` + `Retry-After` + `X-Seriatim-Gate: busy`; body not read; Ollama not contacted | Tries each other eligible node once; if all are busy, the smallest `Retry-After` |
-| The sidecar is starting | 503 `NODE_STARTING` + `Retry-After` | Tries the next node (replay-safe) |
+| The sidecar is starting | 503 `NODE_STARTING` + `Retry-After` + `X-Seriatim-Gate: refused`; body not read | Tries the next node (replay-safe) |
 | Ollama 429 or 503 | Passed through unchanged | Passed through; no spill-over |
 | Connection to Ollama refused, or connect timeout | 502 `UPSTREAM_UNAVAILABLE`, replay-safe; slot freed | Marks the node down; tries the next node |
 | Ollama fails before the response headers | 502 `UPSTREAM_PROTOCOL_ERROR`, not replay-safe; upstream closed, then drain | Passed through; no retry |
@@ -1143,17 +1350,19 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 | The ungated connection pool is full | 503 `NODE_SATURATED`; inference is unaffected (it has its own connections) | A routed request tries the next node; one aimed at a named node gets the 503. The node is not marked down |
 | Closing the upstream connection fails or times out | Slot *stuck*; health degraded; freed only by a restart (REQ-10) | Node unhealthy |
 | Unknown `/seriatim/*` path, or the wrong method on one | 404 `NOT_FOUND` / 405 `METHOD_NOT_ALLOWED` | The same |
-| `num_ctx` over its limit, ambiguous, or sent on `/v1` | 422 / 400; Ollama not contacted | Passed through |
+| `num_ctx` over its limit, ambiguous, or sent on `/v1` | 422 / 400; Ollama not contacted; the over-limit 422 carries `X-Seriatim-Gate: refused` | Over the limit: the next eligible candidate is tried, and if all refuse, the largest limit is returned (REQ-37). Ambiguous or on `/v1`: passed through, because every node would refuse it |
 | Body cannot be parsed, or `model` missing or not a string | 400 `BAD_REQUEST_BODY`, when a check needs the body | 400 `BAD_REQUEST_BODY` before routing (REQ-32); no node contacted |
 | GPU probe fails / `/api/ps` fails | `source: unavailable`, with an error / `loaded_models: null`, with an error | Shown in `/seriatim/nodes`. Routing is unaffected, because it uses the configured rules (REQ-32) |
-| Ollama reachable from the LAN | 503 `OLLAMA_EXPOSED` on gated routes; health degraded | Node unhealthy |
+| Ollama reachable from the LAN | 503 `OLLAMA_EXPOSED` + `X-Seriatim-Gate: refused` on gated routes; health degraded | Tries the next eligible node (REQ-37); node unhealthy |
 | Exposure check uncertain | 503 `EXPOSURE_UNVERIFIED`; never treated as safe | Tries the next node |
 | Invalid or unknown config key | Exit code 2, naming the key | The same |
 | No keys configured | Refuses to start (REQ-15) | The same |
 | Model missing / node state unknown / no healthy node / size unknown | — | 404 `MODEL_NOT_FOUND` / 503 `DISCOVERY_INCOMPLETE` / 503 `GPU_OFFLINE` / 422 `MODEL_SIZE_UNKNOWN` |
 | Node switched offline by the operator | 503 `NODE_OFFLINE` for new gated requests; in-flight requests finish; state persists across restarts | Node out of routing (verdict `offline`); spill-over to other eligible nodes; `GPU_OFFLINE` if none is left |
 | No eligible node / a node with no size policy | — | 422 `MODEL_NOT_ELIGIBLE` / 503 `SIZE_POLICY_MISSING`, in the order of REQ-32, with every node's verdict; never sent to a node outside the rules |
-| Some nodes unreachable in a combined view | — | Partial result, flagged |
+| Some nodes unreachable in a merged view | — | Partial result, in Ollama's shape, flagged only by `X-Seriatim-Partial`; 503 `FLEET_UNAVAILABLE` if none answered |
+| Admin state lost or unreadable at startup | Node starts offline in a new epoch, `ERROR` logged; an explicit `online` recovers it (REQ-19a) | Node out of routing until a status read shows it online |
+| A pre-admission refusal (offline, exposure, starting, `num_ctx` limit) | 503 or 422 with `X-Seriatim-Gate: refused`; body not read (except for the `num_ctx` check); Ollama not contacted | The next eligible candidate is tried (REQ-37) |
 | A slot leaked through a bug | Health degraded, and status shows the holder's age; never force-freed (REQ-11) | Node unhealthy |
 
 Scripts follow the same rule. Every native command's exit code is checked, and any failure
@@ -1225,7 +1434,9 @@ the operator.
 - on a 429, the `Retry-After` header and the body field `retry_after`;
 - the envelope fields `error`, `error_code` and `retryable`, and the code `GPU_BUSY`;
 - 401 and 403 as fatal, non-retryable errors;
-- 503 with `error_code: GPU_OFFLINE` and `retryable: false` as fail-fast;
+- 503 with `error_code: GPU_OFFLINE` and `retryable: false` as fail-fast. Revision 5 keeps
+  that: it has no `Retry-After`. The fleet-wide case is the new `FLEET_UNAVAILABLE`, which
+  falls under the next line;
 - other 502 and 503 responses as retryable with backoff.
 
 **Optional response headers** (clients already treat their absence as a default):
@@ -1244,7 +1455,10 @@ the operator.
   which ignores it, and the request is gated like any other.
 - **`auto:*` model aliases are gone.** Use `/models/select`.
 - **Clamping is gone.** An over-limit `num_ctx` is rejected (422) instead.
-- **`/models` and `/status` are replaced** by `/api/tags` (combined) and `/seriatim/nodes`.
+- **`/models` and `/status` are replaced** by `/api/tags` (merged, in Ollama's shape),
+  `/seriatim/models` and `/seriatim/nodes`.
+- **No Seriatim fields in standard bodies.** The `/api/*` and `/v1/*` responses are exactly
+  Ollama's (REQ-38). Per-node detail is on `/seriatim/*`.
 - **`X-GPU-Status` is not sent.** No existing client reads it.
 
 ### 7.2 Scripts
@@ -1277,8 +1491,9 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
   - It then runs the local-only check.
 - **REQ-55. Weekly maintenance.**
   - It runs the model update, the local-only check and log rotation, and writes a summary.
-  - It does **not** update Seriatim (ruling Q10). Seriatim changes only through a manual
-    install of a tagged release (§7.6).
+  - It does **not** update Seriatim (ruling Q10). Seriatim changes only through a verified
+    release (§7.6, §7.7), or, until the follower has passed PPE on that host, the interim
+    deployment (§7.8).
 - **REQ-56. Ollama upgrades.** These steps run in order, and a failure stops the sequence:
   1. In the PPE, capture fixtures and the route probe with the new Ollama version.
   2. Run the contract, allowlist and behaviour tests against them, in CI.
@@ -1292,11 +1507,14 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
 ### 7.3 Windows (GPU node)
 
 - **REQ-57.** `deploy/windows/install.ps1` does the following:
+  - creates the state directory `%ProgramData%\seriatim\state`, with an ACL for the
+    sidecar's service account and Administrators only, and runs `seriatim-node init-state`
+    (REQ-19a);
   - if `windows_exporter` is installed with its textfile collector, reads its directory from
     the service's `--collector.textfile.directories`, sets
     `SERIATIM_NODE_METRICS_TEXTFILE_DIR`, and grants the sidecar's service account modify
     rights on that directory (REQ-67). It never changes the exporter;
-  - installs Python 3.12+ and a tagged release into a venv under `%ProgramFiles%\seriatim`;
+  - installs Python 3.12+ and a release, verified as REQ-68a requires, into a venv under `%ProgramFiles%\seriatim`;
   - puts the config in `%ProgramData%\seriatim\`, with an ACL for the service account and
     Administrators;
   - registers two services with WinSW: `seriatim-ollama` (`ollama serve`, with `OLLAMA_HOST`,
@@ -1314,8 +1532,13 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
   - if `node_exporter` runs with `--collector.textfile.directory` (it has no default on
     macOS), sets `SERIATIM_NODE_METRICS_TEXTFILE_DIR` to that directory (REQ-67). It never
     changes the exporter;
-  - installs a tagged release into a venv under `/usr/local/seriatim`;
+  - installs a release, verified as REQ-68a requires, into a venv under `/usr/local/seriatim`;
   - puts the config in `/usr/local/etc/seriatim/` (mode 0600);
+  - runs the sidecar's LaunchDaemon as a dedicated service account (`UserName` in the
+    plist), not as root;
+  - creates `/Library/Application Support/seriatim/run` and `.../state` owned by that
+    account (mode 0700), with every parent owned by `root:wheel`, then runs
+    `seriatim-node init-state` as that account (REQ-12b, REQ-19a);
   - installs the `macos` extra, which adds `pyobjc-framework-Metal` for the capacity probe
     (REQ-16);
   - adds launchd plists `org.seriatim.ollama` and `org.seriatim.node`, with `KeepAlive`;
@@ -1334,26 +1557,146 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
   is reloaded live (REQ-45). Examples use placeholders only, such as `node-a.example`, and
   show fleets of more than one shape.
 
-### 7.6 Deferred: automated promotion and deployment
+### 7.6 Releases (slices S0a, S10 and S12)
 
-Phase 1 covers the gate and CI. **Deploys are manual** until a later slice designs automated
-promotion and deployment. Until then, a node or the gateway is upgraded by installing a tagged
-release by hand (§7.3 to §7.5).
+- **REQ-68. Release workflow.** `.github/workflows/release.yml` is the only way a release is
+  made. It runs on CI only; nothing is published from a laptop.
+  - **Tags from `main` only.** It runs on a pushed tag, and refuses, failing closed, any tag
+    whose commit is not reachable from `main`.
+  - **What it builds:** the sdist and wheels, and from S10 the gateway container image.
+  - **What it publishes:** a GitHub Release with a SHA-256 checksum for every asset, and a
+    build-provenance attestation (`actions/attest-build-provenance`) for each. The image
+    goes to GHCR, and deployers refer to it **by digest**, never by tag.
+  - **Two channels, one workflow:**
+    - **pre-release:** `vX.Y.Z-rc.N`, published as a GitHub pre-release, for PPE and testing;
+    - **release:** `vX.Y.Z`, a full release, for production.
 
-That slice starts from these open problems, recorded as the revision-2 review stated them.
-They are not designed here.
+    The same commit can be tagged rc first, then released.
+  - **Who may publish:** tag rules allow only the maintainer to create `v*` tags, and the
+    release job runs in a `release` environment that the maintainer must approve
+    (Repository settings, §7.9).
+- **REQ-68a. Installers verify before installing.** The install scripts (REQ-57, REQ-58) and
+  the gateway deployment check each asset's checksum and its attestation
+  (`gh attestation verify`, against this repository's release workflow identity) before
+  installing. Any failure is a hard stop.
+- **REQ-68b. Dependency updates.** Dependabot proposes updates to `uv.lock` and to the
+  Actions SHAs, grouped weekly. They go through full CI, and are never auto-merged.
 
-- **Blocking, PPE→prod bypass:** a single promotion App key in both `ppe` and `prod`, with
-  bypass on both rulesets, gives a compromised PPE job prod push authority. Use separate
-  identities; the prod credential is reachable only after prod approval.
-- **Blocking, unauthenticated PPE status:** `seriatim/ppe` is checked by name only. Bind it
-  to the reporter App (an expected source), and verify that identity during promotion.
-- **Should-fix:**
-  - bind the verified SHA to the installed bytes: an immutable checkout, frozen or
-    hash-pinned deps, and the same check on first install;
-  - verify rollback health, persist the last-good deployment and its config, and define a
-    rollback-failed state;
-  - either coordinate the one-node-at-a-time rollout or call it best effort.
+### 7.7 The release follower (a slice right after S12)
+
+Releases are the only thing that will deploy. This replaces the deploy-branch design of
+revision 2, and with it both revision-2 blocking findings: there is no promotion App and no
+ruleset bypass for one.
+
+- **REQ-69. The follower.** A generic, config-driven host agent in `deploy/`. Its config
+  sets the channel, the install path or image, the service name and the health URL. No host
+  appears in the repository. It:
+  - polls GitHub Releases for its channel;
+  - verifies the checksum and the attestation (REQ-68a);
+  - installs side by side: a new venv, or the image by digest;
+  - runs the health and local-only checks, then switches;
+  - **rolls back automatically** to the last-good version if a check fails, and holds the
+    failed version, so it doesn't loop;
+  - logs and reports the version it runs, in status and in metrics.
+
+  It covers both the sidecar (Windows and macOS services) and the gateway container.
+  - **PPE follows the pre-release channel,** with the same follower, so every rc exercises
+    the code path production uses before any full release exists. Production follows the
+    release channel.
+  - **Promotion is a human action.** The maintainer publishes `vX.Y.Z` only after the
+    matching rc has passed PPE.
+  - **Carried over from the old deferred list:** one captured version used throughout,
+    with immutable artifacts and frozen dependencies; verified rollback health, with an
+    explicit state when rollback fails; and honest wording for a multi-node rollout, which
+    is best effort, one node at a time, not coordinated.
+  - **Still an open problem:** an automated check, before a full release is allowed, that
+    the rc passed PPE. It needs a check whose source can be authenticated (the revision-2
+    provenance finding), so it is not designed here.
+  - **Order:** S12 publishes the first rc (`v0.1.0-rc.1`) → the follower slice lands and the
+    PPE host's follower installs that rc → the maintainer publishes `v0.1.0` → production
+    follows it. So `v0.1.0` itself closes the follower slice, not S12.
+
+  Threats: ADR-001 T18 to T20.
+
+### 7.8 Interim deployment, until the follower has passed PPE
+
+Until the release follower has passed PPE on a host, that host deploys the way the
+maintainer's existing services do: by following a `ppe` or a `prod` branch, through a
+GitHub Actions self-hosted runner. This lets the gateway and sidecars run on real hosts long
+before S12. It is temporary.
+
+- **REQ-70. Interim deployment.**
+  - **Promotion is a pull request the maintainer approves.** Nobody pushes `ppe` or `prod`
+    directly, and no App may bypass their ruleset. GitHub merges pull requests with a merge
+    commit (it can't fast-forward), so each promotion adds one merge commit.
+  - **Sources:**
+    - **`ppe`:** any branch of this repository, so a branch can be tested on the PPE host
+      before it merges. **Never a fork.**
+    - **`prod`:** **only `main`.** So production always runs a `main` commit, which passed
+      every required check there.
+  - **The `promotion-source` check** (`.github/workflows/promotion-source.yml`) is required
+    on both branches:
+    - it runs on `pull_request_target`, with `permissions: {}` and no checkout, so it never
+      runs code from the pull request. It must be `pull_request_target`: under
+      `pull_request` the workflow file would come from the pull request, which could edit it
+      to pass;
+    - for either base, it fails unless the head repository is this repository;
+    - for base `prod`, it also fails unless the head branch is `main`;
+    - GitHub runs a `pull_request_target` workflow from the repository's default branch,
+      so this file must be on `main` before the check is made required;
+    - binding the check to the GitHub Actions app keeps other integrations out, but any
+      workflow in this repository could report a check of the same name. So the deploy job
+      checks the source again itself, and changes to `.github/workflows/` need the code
+      owner's review;
+    - event values reach it only through `if:` or `env:`, never interpolated into `run:`.
+  - **The deploy workflow** (`.github/workflows/deploy.yml`) runs only on `push` to `ppe` or
+    `prod`, which only a merged promotion can cause. It never runs on `pull_request`,
+    `pull_request_target` or `workflow_run`.
+    - **Scope:** `permissions: contents: read`, no repository secrets; it declares the
+      environment `ppe` or `prod`, and runs on `[self-hosted, seriatim-ppe]` or
+      `[self-hosted, seriatim-prod]`.
+    - **It checks out the pushed SHA,** and fails closed unless all of these hold:
+      - the pushed commit is a merge commit whose first parent is the branch's previous
+        tip;
+      - the merged tree equals the tree of the pull request's head commit (its second
+        parent), so the merge adds nothing of its own;
+      - the merged pull request, looked up by its merge commit, came from this repository,
+        with that head commit. The lookup (`GET /repos/{repo}/commits/{sha}/pulls`) needs no
+        `pull-requests` permission only while the repository is public; if it ever becomes
+        private, the lookup fails and the job fails closed;
+      - **for `prod`:** the head branch is `main`, and the head commit is on `origin/main`.
+    - **It logs the deployed head commit,** the pull request's head, not the merge commit.
+    - **The deploy step** is a no-op until there is a service to deploy. From then on it
+      installs with frozen dependencies (`uv sync --frozen`, or the image by digest), runs
+      the health and local-only checks, rolls back to the previous deployment if they fail,
+      and logs what it runs.
+    - **No hosts in the repository.** The file is generic. Host-specific values come from
+      the runner's own environment.
+  - **CI is unchanged.** A `prod` deployment is always a `main` commit. A `ppe` deployment of
+    another branch runs only after the maintainer has approved both the pull request and
+    the `ppe` environment.
+  - **Retirement.** Each host leaves this mechanism as soon as the release follower has
+    passed PPE on it. The follower is pull-based and needs no runner, so the runner is then
+    removed.
+
+  Threat: ADR-001 T17. The controls are in the next section.
+
+### 7.9 Repository settings
+
+The maintainer applies these settings; each slice's pull request says which rows it adds.
+
+| setting | value | from |
+|---|---|---|
+| Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks: `secret-scan` (now), then `ci`, `security`, `private-terms` (S0a) and `ppe` (S0b), each added by the slice that introduces it | now, extended per slice |
+| Ruleset `deploy-branches` (targets `ppe`, `prod`; already active) | changes by pull request only, with the code owner's approval after the last push (CODEOWNERS has a catch-all `*` entry for the maintainer, so every promotion needs that approval); stale approvals dismissed; threads resolved; merge commits only; no force push, no deletion; an empty bypass list, so no App, `seriatim-worker` included, can bypass it | interim deploy |
+| Required check `promotion-source` on `deploy-branches` | bound to the **GitHub Actions** app, so no other integration can report it | interim deploy |
+| Environments `ppe`, `prod` | the maintainer as required reviewer; deployment branches limited to `ppe` and `prod` respectively; no secrets | interim deploy |
+| Fork pull request workflows | "Require approval for all external contributors". It does not cover members of the repository or organisation, so it adds to the runner-group limits and does not replace them | now |
+| Self-hosted runners | one per host. **Two organisation runner groups,** each limited to this repository: the PPE group only to `.github/workflows/deploy.yml@refs/heads/ppe`, the production group only to `.github/workflows/deploy.yml@refs/heads/prod`. One group allowing both refs would let a `ppe` promotion edit `deploy.yml` to select `seriatim-prod` and drop `environment:`, because labels route jobs but don't authorise them; labels `seriatim-ppe` and `seriatim-prod`; a non-administrator service account with no access to unrelated credentials or clones; ephemeral or just-in-time where practical; each registered only to this group | interim deploy |
+| Tag rules `v*` | only the maintainer may create, update or delete them | S0a |
+| Environment `release` | the maintainer as required reviewer; used by `release.yml` to publish, and required for a full release (`vX.Y.Z`) | S0a |
+| Dependabot | `uv` and `github-actions` ecosystems, grouped weekly; never auto-merged | S0a |
+| Auto-merge, delete branch on merge | on | now |
 
 ## 8. Test plan
 
@@ -1434,8 +1777,14 @@ command output, and never just says "tests pass".
     - with `openai`: `chat.completions` and `completions`, each streamed and not,
       `embeddings` with `encoding_format="float"` (the SDK asks for base64 by default when
       `numpy` is installed), and `models.list` (`/v1/models`).
-  - **Errors, through both clients:** a busy node (429 `GPU_BUSY`), `GPU_OFFLINE`, a
-    `MODEL_NOT_ELIGIBLE` and a stream broken by fault injection. Each client must raise its
+  - **Errors, through both clients:** a busy node (429 `GPU_BUSY`), `GPU_OFFLINE`,
+    `NODE_OFFLINE`, `MODEL_NOT_ELIGIBLE` and a stream broken by fault injection.
+    - **How each is triggered in the two-node PPE:** busy, by holding both nodes' slots;
+      `GPU_OFFLINE`, by switching both nodes offline through the gateway; `NODE_OFFLINE`,
+      by switching one node offline and calling its sidecar directly; `MODEL_NOT_ELIGIBLE`,
+      by a live config reload (REQ-45) that sets `max_params_b = 1` on both nodes and then
+      requesting `qwen2.5:1.5b`; a broken stream, through the capture container's fault
+      injection. Each client must raise its
     documented exception, and never treat an error record as a finished answer.
     - **No hidden retries.** The `openai` client is built with `max_retries=0`, so a fast
       429 stays fast. The README says so, and says what the default of 2 retries does.
@@ -1460,17 +1809,19 @@ command output, and never just says "tests pass".
   - **Listing.** `ollama` parses `/api/tags` and `/api/ps`, and `openai` parses
     `/v1/models`. Each is compared with the baseline:
     - **through a sidecar,** the same entries;
-    - **through the gateway,** the union over the nodes (`/api/tags`, `/v1/models`), or the
-      multiset of every node's entries (`/api/ps`).
-
-    The extra fields `seriatim_nodes` and `seriatim_node` (REQ-38) are checked through raw
-    HTTP. "Accepted" means `ollama` parses the response without error; its models ignore
-    unknown fields. `openai` never sees them.
+    - **through the gateway,** the merge of REQ-38: one entry per name (`/api/tags`,
+      `/v1/models`), or every node's entries (`/api/ps`).
+  - **Plain shapes, no extra keys.** Every successful standard response, and every error
+    that Ollama itself produced, through a sidecar and through the gateway, validates
+    against the plain Ollama or OpenAI shape recorded by S0b from the pinned versions, with
+    no keys beyond it. Seriatim's own refusals validate against `ErrorEnvelope` instead,
+    and in-stream failures against `StreamErrorRecord`. That is asserted on the raw JSON, because the
+    clients ignore unknown keys and would hide them.
   - **Recorded versions.** CI records the Ollama version and both client versions. The
     README states, from that record: "a drop-in Ollama endpoint, verified against Ollama
     x.y with ollama-python a.b and openai c.d".
 
-  *Tests:* CC1–CC16.
+  *Tests:* CC1–CC18.
 - **Where it runs.**
   - The PPE is Docker Compose with CPU-only micro-models. **The `ppe` CI job on
     `ubuntu-latest` is a required check** (ruling Q9).
@@ -1645,7 +1996,7 @@ The maintainer ruled on the open questions of revision 1 as follows.
 | Q7 | Compatibility? | Keep the header names and fields existing clients use; document everything else | REQ-43, §7.1 |
 | Q8 | S0 without a TD? | Yes | ADR-001 §10 |
 | Q9 | PPE in CI? | Yes, as a required check. The host guard applies to local runs only; CI declares itself | §8.3 |
-| Q10 | Should maintenance update Seriatim? | No. Seriatim is updated by a manual install of a tagged release until automated deployment is designed (§7.6) | REQ-55, §7.6 |
+| Q10 | Should maintenance update Seriatim? | No. Seriatim is updated by a verified release (§7.6, §7.7), or by the interim deployment (§7.8) until the follower has passed PPE | REQ-55, §7.6 |
 | Q11 | Publish the evaluation? | Yes, cleaned, as `docs/EVALUATION.md` | `docs/EVALUATION.md` |
 
 Two points were raised in review and decided without change. Ollama **0.40.16** is the real

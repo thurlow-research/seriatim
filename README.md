@@ -46,7 +46,8 @@ Ollama on a single machine is easy. A shared set of uneven machines goes wrong i
 ## Your fleet is configuration
 
 The gateway's configuration file lists the machines in the fleet, and says which models each
-one may run. Each machine is one entry:
+one may run. Each machine is one entry (the keys each entry also needs are left out here,
+for brevity):
 
 ```toml
 [[nodes]]
@@ -64,15 +65,17 @@ capacity = "unlimited"              # no size check (for example a CPU-only box)
 [[nodes]]
 id = "node-c"
 url = "http://node-c.example:11434"
-priority = 3                        # no rule of its own: only models that list it below
+priority = 3
+capacity = "listed_only"            # only the models whose eligible_nodes name it
 
 [models."llama3.1:70b"]
 eligible_nodes = ["node-c"]         # this model runs only here
 ```
 
 **Each machine needs a rule** for the models it should serve: `max_params_b`,
-`capacity = "unlimited"`, or a place in a model's `eligible_nodes` list. A machine with no
-rule for a model gets none of it, and the gateway says why. It never guesses.
+`capacity = "unlimited"`, `capacity = "listed_only"`, or a place in a model's
+`eligible_nodes` list. A machine with no rule for a model gets none of it, and the gateway
+says why, naming the rule to add. It never guesses.
 
 **You set the numbers from real data.** Each machine's sidecar reports how much GPU memory
 Ollama can use: on NVIDIA, the free memory plus what Ollama already holds, from
@@ -106,8 +109,10 @@ POST /seriatim/admin/nodes/node-a/offline   {"reason": "driver update"}
 POST /seriatim/admin/nodes/node-a/online
 ```
 
-Work already running there finishes, and new work goes to the other machines. The setting
-is held by the machine's own sidecar, so it survives a reboot. Clients that talk to that
+Work already running there finishes, and no new work is admitted; it goes to the other
+machines. The setting is held by the machine's own sidecar, in a state directory on disk, so
+it survives a reboot. If that state is ever lost or damaged, the machine starts offline
+rather than back in service, until someone brings it online. Clients that talk to that
 machine directly are refused too.
 
 ## How Seriatim handles it
@@ -130,38 +135,51 @@ machine directly are refused too.
   machine you haven't allowed it on, even when that machine is idle and the others are busy.
 - **No rule means no.** A machine with no rule for a model gets none of it, and the error
   lists every machine with the reason, so you know what to add.
-- **Spill-over to keep every machine working.** When a machine answers busy, the gateway
+- **Spill-over to keep every machine working.** When a machine answers busy, or refuses
+  before starting the work (offline, starting, or a `num_ctx` above its limit), the gateway
   tries the next machine that can serve the same model, in your priority order. Each one is
-  tried once, and nothing waits. Only if every suitable machine is busy does the client get
-  the 429, with the shortest `Retry-After` of them.
+  tried once, and nothing waits. If none of them takes it, the client gets one answer: a 429
+  with the shortest `Retry-After` if any machine was busy; otherwise a refusal that may
+  clear soon, such as a machine still starting; otherwise, if every one refused for
+  `num_ctx`, that error with the largest limit; otherwise the first machine's refusal.
 - **Throughput.** Seriatim admits one job per GPU at a time, so its requests never compete
   with each other for that GPU's memory, and the next job goes to a free machine that may
   run the model. (Other programs on the same machine can still use the GPU.) Work spreads
   across every machine that can serve it, instead of stacking up on one of them.
 - **One address.** Clients point their usual Ollama client at the gateway and add a key.
-  `/api/tags`, `/api/ps` and `/api/version` show every machine at once. `/models/select`
-  suggests a model and a machine for a task.
+  `/api/tags`, `/api/ps`, `/api/version` and `/v1/models` show every machine at once, in
+  Ollama's own format. `/models/select` suggests a model and a machine for a task.
 - **Your requests, unchanged.** The bodies Seriatim forwards pass through byte for byte,
   including streaming and every Ollama option. The only responses it builds itself are the
-  combined model lists and its own errors. A `num_ctx` that is too large for a model is
+  merged fleet-wide lists, still in Ollama's format, and its own errors. A `num_ctx` that is too large for a model is
   rejected with a clear error. It is never quietly lowered.
 - **Failures you can see.** An unreachable machine, a broken stream or an exceeded limit
   comes back as an explicit, machine-readable error. It is never a silent success.
 - **Monitoring.** The sidecar and the gateway write Prometheus metrics for the textfile
   collector of the exporter you already run (`node_exporter` or `windows_exporter`): slots,
   busy answers, errors, drains, spill-over, offline machines, and measured memory. Seriatim
-  opens no extra port for them.
+  opens no extra port for them. If you run more than one gateway, give each its own
+  instance name, so each writes its own file.
 
 ## Is it the standard API?
 
-Yes, by design. Bodies pass through unchanged, and the gateway only adds fields to the
-combined model lists. That will be checked by a test suite that runs the official `ollama`
+Yes, by design. **Every `/api/*` and `/v1/*` response has exactly Ollama's (or OpenAI's)
+format, with no extra fields.** Bodies Seriatim forwards pass through unchanged. The one
+exception is Seriatim's own refusals, such as "busy", which use its error format and are
+marked by `X-Seriatim-*` headers. For the
+lists that cover the whole fleet, the gateway merges the machines' answers within that same
+format: one `/api/tags` entry per model name, every machine's loaded models in `/api/ps`,
+and the lowest machine's version in `/api/version`. A list missing some machines is flagged
+only by the `X-Seriatim-Partial` header. Which machine holds what is on Seriatim's own
+paths, `/seriatim/models` and `/seriatim/nodes`. That will be checked by a test suite that runs the official `ollama`
 Python client, and the `openai` Python SDK on Ollama's `/v1` routes, against plain Ollama,
-a sidecar and the gateway, and requires the same results. (The suite builds the `openai`
+a sidecar and the gateway, requires the same results, and checks every response against
+the plain format with no extra keys. (The suite builds the `openai`
 client with `max_retries=0`. Its default of 2 retries turns a fast "busy" into a delay, so
 set it the same way if you want Seriatim's immediate answer.) When that suite lands, this
-section will name the exact versions verified. The first Ollama version targeted is 0.40.16: "a drop-in Ollama endpoint, verified against
-Ollama x.y with ollama-python a.b and openai c.d".
+section will name the exact versions verified: "a drop-in Ollama endpoint, verified against
+Ollama x.y with ollama-python a.b and openai c.d". The first Ollama version targeted is
+0.40.16.
 
 ## What it does not do
 
@@ -185,6 +203,8 @@ Ollama x.y with ollama-python a.b and openai c.d".
   supported topology. Other platforms can run the sidecar as an ordinary service, and
   scripts for them are welcome contributions.
 - **The gateway** runs on any host with Python 3.12, or in a container.
+- **Releases** are built by CI from `main`, with checksums and build-provenance
+  attestations, and the install scripts verify both before installing.
 
 ## Documents
 
