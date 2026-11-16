@@ -3,7 +3,9 @@
 
 Scans every tracked file for IPv4 and IPv6 address literals. The only addresses allowed are
 loopback (127.0.0.0/8 and ::1), 0.0.0.0, and the RFC 5737 documentation ranges
-(192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). Anything else fails the check.
+(192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). An IPv4-mapped IPv6 address (::ffff:...,
+dotted or hex) is judged by the IPv4 address it maps to. Every other IPv6 address fails,
+the IPv6 documentation prefix (RFC 3849) included. A bare "::" is not an address.
 """
 
 from __future__ import annotations
@@ -25,26 +27,41 @@ V6_RE = re.compile(rb"(?<![\w:.])([0-9A-Fa-f:]*:[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*)(?!
 
 def allowed(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:  # ::ffff:a.b.c.d, in dotted or hex form
+            return allowed(addr.ipv4_mapped)
         return addr == ipaddress.IPv6Address("::1")
     return any(addr in n for n in ALLOWED_V4)
 
 
 def find(data: bytes) -> list[tuple[int, str]]:
-    """Return (line number, literal) for every disallowed address literal in data."""
+    """Return (line number, literal) for every disallowed address literal in data.
+
+    IPv6 literals are matched first. A dotted quad inside one (::ffff:a.b.c.d) belongs to
+    it, and isn't reported again on its own.
+    """
     found: list[tuple[int, str]] = []
-    for regex in (V4_RE, V6_RE):
-        for m in regex.finditer(data):
-            text = m.group(1).decode("ascii")
-            if regex is V6_RE and not re.search(r"[0-9A-Fa-f]", text):
-                continue  # a bare "::" is punctuation, not an address
-            try:
-                addr = ipaddress.ip_address(text)
-            except ValueError:
-                continue
-            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
-                continue  # its IPv4 part is checked by the IPv4 pattern
-            if not allowed(addr):
-                found.append((data.count(b"\n", 0, m.start()) + 1, text))
+    v6_spans: list[tuple[int, int]] = []
+    for m in V6_RE.finditer(data):
+        text = m.group(1).decode("ascii")
+        if not re.search(r"[0-9A-Fa-f]", text):
+            continue  # a bare "::" is punctuation, not an address
+        try:
+            addr = ipaddress.IPv6Address(text)
+        except ValueError:
+            continue
+        v6_spans.append(m.span(1))
+        if not allowed(addr):
+            found.append((data.count(b"\n", 0, m.start()) + 1, text))
+    for m in V4_RE.finditer(data):
+        if any(a <= m.start(1) and m.end(1) <= b for a, b in v6_spans):
+            continue
+        text = m.group(1).decode("ascii")
+        try:
+            addr4 = ipaddress.IPv4Address(text)
+        except ValueError:
+            continue
+        if not allowed(addr4):
+            found.append((data.count(b"\n", 0, m.start()) + 1, text))
     return sorted(found)
 
 

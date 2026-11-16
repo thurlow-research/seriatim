@@ -41,12 +41,14 @@ TD is merged before its code (ADR-001 §10).
 | 12 | `tests/behaviour/test_sidecar.py` | P1 to P7 (black-box; the required `ppe` CI job) |
 | 13 | `ppe/compose.yaml` (modified) | adds the `node-a` sidecar container in `ollama-a`'s network namespace |
 
-**Dependencies.** S0a pins these in `node/pyproject.toml` and `uv.lock`:
+**Dependencies.** S0a pins these in `uv.lock`, the runtime ones also exactly in `node/pyproject.toml`:
 - **Runtime:** `starlette`, `uvicorn` (h11 only; no `[standard]` extra, so `httptools` is never
   picked), `httpx`, `anyio`, `pydantic-settings`. The singleton lock uses the standard
   library only (`fcntl`, `msvcrt`).
 - **Test:** `pytest`, `pytest-cov`, `hypothesis`, `openapi-spec-validator`, `jsonschema`,
-  `pyyaml`, and `mutmut>=3.3,<4`.
+  `pyyaml`, and `mutmut>=3.3,<4`, in the root `pyproject.toml`'s `dev` dependency group.
+  The `[tool.mutmut]` settings are in `node/pyproject.toml`, because mutmut runs from
+  `node/` (Appendix B).
 
 ## 2. Modules and functions
 
