@@ -2190,9 +2190,12 @@ command output, and never just says "tests pass".
       a TD with no test table and an ID listed twice (in one TD or across TDs) all fail.
     - **An explicit, ratcheted start signal.** Each TD carries exactly one line
       `Enforced: yes` or `Enforced: no` in its first 20 lines; a missing line or any other
-      value fails. A slice's first code PR sets `yes` in that same PR, so the PR that adds
-      the code also discharges the IDs; the reviewer sends back a PR that adds files its
-      slice's ADR-001 §10 row names while the TD still says `no`. The TD's slice comes from
+      value fails. A slice delivered in one PR sets `yes` in that PR, so the PR that adds the
+      code also discharges the IDs. A slice delivered as a series of PRs (its TD's §9) sets
+      `yes` in the **last** PR of the series. Until then each PR marks the tests for the IDs
+      its §9 row gives it, and the reviewer sends back a PR that doesn't discharge exactly
+      those IDs, or a single-PR slice that adds files its ADR-001 §10 row names while the
+      TD still says `no`. The TD's slice comes from
       its file name (`TD-slice-1.md` is S1), and a TD whose slice has no §10 row fails.
     - **Discharge by execution only.** Two jobs write JUnit XML (`--junitxml`), with each
       test's `td` IDs recorded as properties by `tests/conftest.py`: the ubuntu `test` leg

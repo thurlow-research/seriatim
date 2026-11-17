@@ -237,10 +237,22 @@ the caller, not a background task (invariant 4).
 - `Starting` while starting;
 - a `Lease` on the first `FREE` slot, which becomes `HELD`;
 - otherwise `Busy`, with `retry_after_s = max(retry_after_s, ceil(earliest drain_until -
-  clock()))` and `busy_for_s` = the age of the oldest holder (0 if every slot is draining).
+  clock()))` and `busy_for_s` = the age of the oldest `HELD` holder (0 if no slot is `HELD`).
 
 **`Lease.finish(clean=True)`** sets the slot to `FREE`. **`finish(clean=False)`** sets it to
 `DRAINING`, with `drain_until = clock() + drain_s`.
+
+**Details fixed by the code (S1-4).**
+- **Construction.** `Gate` also refuses `retry_after_s < 1` and `max_hold_s ≤ 0`, as well as the
+  `slots < 1` and `drain_s ≤ 0` of G10. NaN counts as invalid for all four, and G10 tests it.
+- **Arguments.** `Gate` takes plain arguments, not `Settings`, so `gate.py` does not import
+  `config.py`.
+- **`busy_for_s` and `overdue()`** count `HELD` slots only. A `STUCK` slot is reported by
+  `any_stuck()` (`slot_stuck`), never as busy time or as overdue.
+- **What `slots()` shows.** A `STUCK` slot keeps its holder there. A `DRAINING` or `FREE` slot
+  has none.
+- **Old leases.** A lease ends at most once: after `finish` or `stuck`, every later call returns
+  `False` and changes nothing. So an old lease can never free a slot that a newer lease now holds.
 
 ### 2.3 `proxy.py`
 
@@ -801,7 +813,7 @@ also run on `windows-latest` and `macos-latest`.
 | G7 | 1000 tasks call `try_acquire` concurrently with `asyncio.gather` (slots 1, after quarantine) → exactly one `Lease` | 2 |
 | G8 | A new `Gate` returns `Starting(retry_after_s=ceil(drain_s))` until `drain_s` passes; `starting()` is true until then | 12a |
 | G9 | Hypothesis: random sequences of acquire, finish(clean), finish(drain), stuck and clock steps (slots 1–4) keep `held + draining + stuck ≤ slots`, and never return a `Lease` while no slot is `FREE` | 2, 10, 11 |
-| G10 | `Gate(slots=0)` and `Gate(drain_s=0)` raise `ValueError` | 2, 10 |
+| G10 | `Gate(slots=0)` and `Gate(drain_s=0)` raise `ValueError`, as do `retry_after_s < 1`, `max_hold_s ≤ 0`, and NaN for any of the four | 2, 10 |
 | G11 | Monotonic time only. With an injected monotonic clock and a separate wall clock, moving the wall clock by ±1 day changes nothing in `try_acquire`, the drain or `overdue()`. The overdue boundary is strict: a holder at exactly `max_hold_s + grace_s` is not overdue; one at that plus 1 ms is | 10, 18 |
 | G12 | slots 3: one `HELD`, two `DRAINING` with 4 s and 9 s left, `retry_after_s=1` → `Busy(retry_after_s=4)`, the **earliest** drain. Every slot `DRAINING` → `busy_for_s == 0` | 2, 3 |
 
@@ -1058,8 +1070,9 @@ A log line, one per request:
     - `contract-lint`, `ip-literals` and `pr-size`;
     - `td-test-ids` (S0a part 1b): it reads the ubuntu `test` leg's JUnit (artifact
       `junit-test-ubuntu`) and this TD's `Enforced:` line (SPEC REQ-63). While this TD says
-      `Enforced: no` it prints a notice. S1's first code PR sets `Enforced: yes` and marks
-      each test with its §8 ID, `@pytest.mark.td("<ID>")`. P1 to P7 run in the `ppe` job,
+      `Enforced: no` it prints a notice. S1 is a PR series (§9): each PR marks the tests for
+      its §9 IDs with `@pytest.mark.td("<ID>")`, and the last one, S1-14, sets
+      `Enforced: yes`. P1 to P7 run in the `ppe` job,
       not in the `test` leg; from S0b, `td-test-ids` also reads that job's JUnit
       (`junit-ppe`, SPEC REQ-63);
     - `private-terms` (S0a part 1b), in its own workflow, as SPEC REQ-63 specifies for pull
