@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """TD test-ID check (SPEC REQ-60, REQ-63; issue #16). Standard library only.
 
-    td_test_ids.py --junit <file>
+    td_test_ids.py --junit <file> [--junit <file> ...]
+    td_test_ids.py --check-needs
 
 Every test scenario a slice's TD lists must be discharged by a test that ran and passed.
 
@@ -14,12 +15,18 @@ Every test scenario a slice's TD lists must be discharged by a test that ran and
   first 20 lines; a missing line or any other value fails. The TD's slice comes from its file
   name (`TD-slice-1.md` is S1) and must have a row in ADR-001 §10. For an enforced TD, every ID
   needs a passing test; for one that isn't, the job prints a notice.
-- **Discharge by execution.** IDs are read from the JUnit file the ubuntu `test` leg wrote:
-  tests declare IDs with `@pytest.mark.td("H14")`, and `tests/conftest.py` records them as
+- **Discharge by execution.** IDs are read from every JUnit file given: in CI, the ubuntu
+  `test` leg's (`junit-test-ubuntu`) and the `ppe` job's (`junit-ppe`), from the same run.
+  Tests declare IDs with `@pytest.mark.td("H14")`, and `tests/conftest.py` records them as
   `td` properties. Only a test case with no `failure`, `error` or `skipped` element discharges
   its IDs, so a skipped, xfailed or uncollected test leaves them unresolved. A missing, empty
-  or malformed JUnit file fails; it never means "nothing to check". A test that names an ID
+  or malformed JUnit file fails; it never means "nothing to check", and that holds for each
+  file, so a missing `ppe` report can't shrink the set of IDs read. A test that names an ID
   absent from every TD fails.
+- **Fail closed on the jobs it reads** (`--check-needs`, and again in the main check). With
+  `NEEDS` set (the workflow's `toJSON(needs)`), every job it lists must have succeeded: a
+  failed, cancelled or skipped `test` or `ppe` fails this check, even while every TD says
+  `Enforced: no`.
 - **Obligations can't silently shrink** (pull requests only). Against the base commit:
   - every ID that disappears needs a PR-body line `TD-ID-REMOVED: <ID> - <reason>`;
   - a TD that main has as `Enforced: yes` and the PR turns to `no` or deletes needs a line
@@ -30,12 +37,13 @@ Every test scenario a slice's TD lists must be discharged by a test that ran and
   request, whose run enforced them, and a merge commit's first-parent diff would show the very
   removal the pull request waived.
 
-Environment: EVENT (`pull_request` or `push`), BASE_SHA (pull requests), PR_BODY.
+Environment: EVENT (`pull_request` or `push`), BASE_SHA (pull requests), PR_BODY, NEEDS.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -182,6 +190,24 @@ def junit_results(path: Path) -> tuple[dict[str, list[str]], dict[str, list[str]
     return passed, other, len(cases)
 
 
+def needs_errors(raw: str | None) -> list[str]:
+    """Every job in the workflow's `needs` context that did not succeed."""
+    if raw is None:
+        return []
+    try:
+        needs = json.loads(raw)
+        results = {job: v["result"] for job, v in needs.items()}
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        raise CheckError(f"NEEDS is not the workflow's needs context: {e}") from e
+    if not results:
+        raise CheckError("NEEDS lists no jobs")
+    return [
+        f"job {job} did not succeed ({result}), so its test results can't be read"
+        for job, result in sorted(results.items())
+        if result != "success"
+    ]
+
+
 def waivers(body: str) -> dict[str, dict[str, str]]:
     found: dict[str, dict[str, str]] = {"TD-ID-REMOVED": {}, "TD-ENFORCEMENT-OFF": {}}
     for line in body.splitlines():
@@ -216,15 +242,33 @@ def shrink_errors(base: list[TD], head: list[TD], body: str) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--junit", type=Path, required=True)
+    ap.add_argument("--junit", type=Path, action="append", default=[])
+    ap.add_argument("--check-needs", action="store_true")
     ap.add_argument("--td-dir", type=Path, default=TD_DIR)
     ap.add_argument("--adr", type=Path, default=ADR)
     a = ap.parse_args(argv)
     env = os.environ
     errors: list[str] = []
     try:
+        needs = needs_errors(env.get("NEEDS"))
+        if a.check_needs:
+            for err in needs:
+                print(f"::error::td-test-ids: {err}")
+            if not needs:
+                print("td-test-ids: every job it reads succeeded")
+            return 1 if needs else 0
+        if not a.junit:
+            raise CheckError("give at least one --junit file")
+        errors += needs
         tds = load_tds(a.td_dir, a.adr)
-        passed, other, count = junit_results(a.junit)
+        passed, other, count = {}, {}, 0
+        for path in a.junit:
+            p, o, n = junit_results(path)
+            for tid, tests in p.items():
+                passed.setdefault(tid, []).extend(tests)
+            for tid, tests in o.items():
+                other.setdefault(tid, []).extend(tests)
+            count += n
         known = {tid for td in tds for tid in td.ids}
         for tid in sorted((set(passed) | set(other)) - known):
             tests = ", ".join(passed.get(tid, []) + other.get(tid, []))
@@ -261,7 +305,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"::error::td-test-ids: {err}")
     if errors:
         return 1
-    print(f"td-test-ids: {len(tds)} TD(s), {count} test cases read; every check passed")
+    print(
+        f"td-test-ids: {len(tds)} TD(s), {count} test cases read from {len(a.junit)} "
+        "JUnit file(s); every check passed"
+    )
     return 0
 
 

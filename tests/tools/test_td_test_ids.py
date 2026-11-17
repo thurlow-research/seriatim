@@ -162,7 +162,7 @@ def run(tmp_path, monkeypatch, capsys, cases, event="push", **env) -> tuple[int,
     monkeypatch.chdir(tmp_path)
     (tmp_path / "j.xml").write_text(junit(cases))
     monkeypatch.setenv("EVENT", event)
-    for k in ("BASE_SHA", "PR_BODY"):
+    for k in ("BASE_SHA", "PR_BODY", "NEEDS"):
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -324,3 +324,94 @@ def test_td_marker_records_properties():
 def test_td_marker_misuse_is_an_error(mark):
     with pytest.raises(pytest.UsageError):
         hooks.td_ids(item(mark))
+
+
+# --- two reports, and failing closed on the jobs it reads (#9, S0b) ------------------------
+
+OK_NEEDS = '{"test": {"result": "success", "outputs": {}}, "ppe": {"result": "success"}}'
+
+
+def two_reports(tmp_path, test_cases, ppe_cases) -> list[str]:
+    (tmp_path / "test.xml").write_text(junit(test_cases))
+    if ppe_cases is not None:
+        (tmp_path / "ppe.xml").write_text(
+            ppe_cases if isinstance(ppe_cases, str) else junit(ppe_cases)
+        )
+    return ["--junit", "test.xml", "--junit", "ppe.xml"]
+
+
+def test_ids_are_discharged_from_both_reports(tmp_path, monkeypatch, capsys):
+    write_docs(tmp_path, {"TD-slice-1.md": td_text(["C1", "P1"], "yes")})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EVENT", "push")
+    monkeypatch.setenv("NEEDS", OK_NEEDS)
+    args = two_reports(tmp_path, [("unit", ["C1"], None)], [("behaviour", ["P1"], None)])
+    assert td_test_ids.main(args) == 0
+    assert "2 test cases read from 2 JUnit file(s)" in capsys.readouterr().out
+    # Without the ppe report, P1 is not discharged.
+    assert td_test_ids.main(["--junit", "test.xml"]) == 1
+    assert "P1 (TD-slice-1) has no passing test" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("ppe_report", "message"),
+    [
+        (None, "JUnit file ppe.xml: FileNotFoundError"),
+        ("", "JUnit file ppe.xml: ParseError"),
+        ("<testsuites><testsuite/></testsuites>", "JUnit file ppe.xml: no test cases"),
+        ("<html/>", "unexpected root element <html>"),
+    ],
+)
+def test_a_missing_empty_or_malformed_ppe_report_fails_even_unenforced(
+    tmp_path, monkeypatch, capsys, ppe_report, message
+):
+    write_docs(tmp_path, {"TD-slice-1.md": td_text(["C1"], "no")})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EVENT", "push")
+    monkeypatch.setenv("NEEDS", OK_NEEDS)
+    assert td_test_ids.main(two_reports(tmp_path, [("unit", ["C1"], None)], ppe_report)) == 1
+    assert message in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("result", ["failure", "skipped", "cancelled"])
+def test_a_ppe_job_that_did_not_succeed_fails_closed(tmp_path, monkeypatch, capsys, result):
+    write_docs(tmp_path, {"TD-slice-1.md": td_text(["C1"], "no")})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EVENT", "push")
+    monkeypatch.setenv(
+        "NEEDS",
+        OK_NEEDS.replace('"ppe": {"result": "success"}', f'"ppe": {{"result": "{result}"}}'),
+    )
+    expected = f"job ppe did not succeed ({result})"
+    assert td_test_ids.main(["--check-needs"]) == 1
+    assert expected in capsys.readouterr().out
+    args = two_reports(tmp_path, [("unit", ["C1"], None)], [("behaviour", [], None)])
+    assert td_test_ids.main(args) == 1
+    assert expected in capsys.readouterr().out
+
+
+def test_check_needs_passes_when_every_job_succeeded(monkeypatch, capsys):
+    monkeypatch.setenv("NEEDS", OK_NEEDS)
+    assert td_test_ids.main(["--check-needs"]) == 0
+    assert "every job it reads succeeded" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("not json", "NEEDS is not the workflow's needs context"),
+        ("{}", "NEEDS lists no jobs"),
+        ('{"ppe": "success"}', "NEEDS is not"),
+        ("[]", "NEEDS is not"),
+    ],
+)
+def test_malformed_needs_fails(monkeypatch, capsys, raw, message):
+    monkeypatch.setenv("NEEDS", raw)
+    assert td_test_ids.main(["--check-needs"]) == 1
+    assert message in capsys.readouterr().out
+
+
+def test_no_junit_file_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("NEEDS", raising=False)
+    assert td_test_ids.main([]) == 1
+    assert "give at least one --junit file" in capsys.readouterr().out

@@ -16,3 +16,11 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+  # The image digests pinned in ppe/compose.yaml (S0b, #9).
+  - package-ecosystem: docker-compose
+    directory: "/ppe"
+    schedule:
+      interval: weekly
+    groups:
+      docker-compose:
+        patterns: ["*"]

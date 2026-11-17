@@ -1,4 +1,4 @@
-# CI (SPEC REQ-60, REQ-61, REQ-63; ADR-001 §10 S0a). Runs on every pull request and on every
+# CI (SPEC REQ-60, REQ-61, REQ-63, §8.3; ADR-001 §10 S0a, S0b). Runs on every pull request and on every
 # push to main. The job `ci` rolls up every other job, so the main ruleset needs only `ci`.
 # Event values reach steps only through if: and env:, never inside run:.
 name: ci
@@ -61,8 +61,66 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The PPE (SPEC §8.3; #9): CPU-only micro-models in Docker Compose, started through the guard.
+  # S0b checks that Ollama answers and the models are real; S1 adds P1-P7 to tests/behaviour.
+  ppe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv sync --frozen
+      # The models (about 1.5 GB) are cached between runs (SPEC §8.3). The key names the Ollama
+      # version and the models. A pull request's run writes only its own PR-scoped cache, so it
+      # never reaches the runs on main. Only models/ is cached: Ollama's own key pair
+      # (id_ed25519) beside it never goes into a cache.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        id: models
+        with:
+          path: ppe/data/ollama/models
+          key: ppe-models-ollama-0.40.16-qwen2.5-0.5b-1.5b-all-minilm-22m-v1
+      - name: Start the PPE through the guard
+        run: ppe/ppe up --ci
+      - name: S0b checks (tests/behaviour)
+        env:
+          SERIATIM_PPE_URL: http://127.0.0.1:11434
+        run: >-
+          uv run --frozen pytest -m behaviour tests/behaviour -rA
+          --junitxml="$RUNNER_TEMP/junit-ppe.xml"
+      - name: What ran
+        if: always()
+        run: |
+          docker compose -p seriatim-ppe -f ppe/compose.yaml ps
+          docker compose -p seriatim-ppe -f ppe/compose.yaml logs --no-color --tail 50 ollama-a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always()
+        with:
+          name: junit-ppe
+          path: ${{ runner.temp }}/junit-ppe.xml
+          if-no-files-found: error
+          retention-days: 7
+      - name: Stop the PPE
+        if: always()
+        run: ppe/ppe down
+      # Ollama writes the models as root, some mode 0600, so the cache step (which runs as the
+      # runner user after this job's steps) could not read them. Only on a cache miss.
+      - name: Let the cache step read the models
+        if: always() && steps.models.outputs.cache-hit != 'true'
+        run: |
+          if [ -d ppe/data/ollama/models ]; then
+            sudo chown -R "$(id -u):$(id -g)" ppe/data/ollama/models
+          fi
+
+  # Reads both reports from this run (#9): fails closed if test or ppe did not succeed, or
+  # either report is missing, empty or malformed, even while every TD says 'Enforced: no'.
   td-test-ids:
-    needs: test
+    if: always()
+    needs: [test, ppe]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -70,16 +128,28 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: test and ppe succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 -I tools/ci/td_test_ids.py --check-needs
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: junit-test-ubuntu
           path: ${{ runner.temp }}/junit
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: junit-ppe
+          path: ${{ runner.temp }}/junit-ppe
       - name: Every TD test ID is discharged by a passing test
         env:
           EVENT: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: python3 -I tools/ci/td_test_ids.py --junit "$RUNNER_TEMP/junit/junit.xml"
+          NEEDS: ${{ toJSON(needs) }}
+        run: >-
+          python3 -I tools/ci/td_test_ids.py
+          --junit "$RUNNER_TEMP/junit/junit.xml"
+          --junit "$RUNNER_TEMP/junit-ppe/junit-ppe.xml"
 
   coverage:
     runs-on: ubuntu-latest
@@ -179,7 +249,7 @@ jobs:
 
   ci:
     if: always()
-    needs: [lint, test, td-test-ids, coverage, mutation, contract-lint, ip-literals, pr-size]
+    needs: [lint, test, ppe, td-test-ids, coverage, mutation, contract-lint, ip-literals, pr-size]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

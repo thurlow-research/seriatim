@@ -1959,7 +1959,7 @@ The maintainer applies these settings; each slice's pull request says which rows
 
 | setting | value | from |
 |---|---|---|
-| Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks, each bound to **GitHub Actions** and named by job: `gitleaks` (workflow `secret-scan`; applied), then `ci` (S0a part 1; applied; it includes `td-test-ids` from part 1b), `private-terms` (S0a part 1b; applied after its canary run, #19), `security` (S0a part 2; the roll-up of `security.yml`) and `ppe` (S0b), each added by the PR that introduces it | now, extended per slice |
+| Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks, each bound to **GitHub Actions** and named by job: `gitleaks` (workflow `secret-scan`; applied), then `ci` (S0a part 1; applied; it includes `td-test-ids` from part 1b), `private-terms` (S0a part 1b; applied after its canary run, #19), `security` (S0a part 2; the roll-up of `security.yml`) and `ppe` (S0b; a job in `ci.yml`, so `ci` already includes it, and also required by its own name, as §8.3 requires), each added by the PR that introduces it | now, extended per slice |
 | Default branch | `main`, and it stays `main`: `pull_request_target` workflows run from it, so changing it would change which `promotion-source` runs. `promotion-source` fails if the event reports another default branch | now |
 | Ruleset `deploy-branches` (targets `ppe`, `prod`; already active) | changes by pull request only, with the code owner's approval after the last push (CODEOWNERS has a catch-all `*` entry for the maintainer, so every promotion needs that approval); stale approvals dismissed; threads resolved; merge commits only; no force push, no deletion; an empty bypass list, so no App, `seriatim-worker` included, can bypass it | interim deploy |
 | Rulesets `deploy-checks-ppe` and `deploy-checks-prod` | require the check `promotion-source`, bound to the **GitHub Actions** app, so no other integration can report it. **"Require branches to be up to date before merging" is on for `ppe` only** (`deploy-checks-ppe`, strict), so a promotion built on an older `ppe` tip can't merge and is rebuilt instead. `deploy-checks-prod` is not strict: every merge adds a merge commit to `prod` that `main` never has, so a strict rule would leave every later `main` → `prod` pull request behind. Where the organisation supports it, also an organisation-required workflow pinned to `promotion-source.yml` on `main`, which no branch workflow can stand in for | interim deploy |
@@ -1973,7 +1973,7 @@ The maintainer applies these settings; each slice's pull request says which rows
 | Immutable releases | on, so a published release's assets and tag can't be changed | S0a; applied |
 | Environment `release` | the maintainer as required reviewer; deployment limited to `v*` tags; the only environment whose job holds publish permissions (REQ-68) | S0a; applied |
 | GHCR package | linked to this repository; write access only from this repository's Actions (the `release` job); no personal access token | S10 |
-| Dependabot | `.github/dependabot.yml`: the `uv` and `github-actions` ecosystems, each in one weekly grouped PR; never auto-merged (no auto-merge is enabled on Dependabot PRs; they pass the same checks and review as any PR) | S0a part 2 |
+| Dependabot | `.github/dependabot.yml`: the `uv` and `github-actions` ecosystems, and `docker-compose` (`directory: "/ppe"`, the image digests pinned in `ppe/compose.yaml`, from S0b), each in one weekly grouped PR; never auto-merged (no auto-merge is enabled on Dependabot PRs; they pass the same checks and review as any PR) | S0a part 2 |
 | Auto-merge, delete branch on merge | on | now |
 
 ## 8. Test plan
@@ -2172,13 +2172,18 @@ command output, and never just says "tests pass".
       the code also discharges the IDs; the reviewer sends back a PR that adds files its
       slice's ADR-001 §10 row names while the TD still says `no`. The TD's slice comes from
       its file name (`TD-slice-1.md` is S1), and a TD whose slice has no §10 row fails.
-    - **Discharge by execution only.** The ubuntu `test` leg writes JUnit XML
-      (`--junitxml`), with each test's `td` IDs recorded as properties by
-      `tests/conftest.py`, and uploads it as the artifact `junit-test-ubuntu`.
-      `td-test-ids` downloads exactly that artifact from the same run. An ID counts only
-      through a test case with no failure, error or skip; skipped, xfailed (`xfail_strict`
-      is on) and uncollected tests leave it unresolved. A missing, empty or malformed JUnit
-      file fails; it never means "nothing to check". A test that names an ID absent from
+    - **Discharge by execution only.** Two jobs write JUnit XML (`--junitxml`), with each
+      test's `td` IDs recorded as properties by `tests/conftest.py`: the ubuntu `test` leg
+      (artifact `junit-test-ubuntu`) and the `ppe` job (artifact `junit-ppe`, the PPE
+      behaviour tests, so P1–P7 can be discharged from S1). `td-test-ids` has
+      `needs: [test, ppe]` and downloads exactly those two artifacts from the same run, never
+      another workflow's results. An ID counts only through a test case with no failure,
+      error or skip; skipped, xfailed (`xfail_strict` is on) and uncollected tests leave it
+      unresolved. A missing, empty or malformed JUnit file fails, each one on its own; it
+      never means "nothing to check".
+      **It fails closed:** if `test` or `ppe` failed, was cancelled or was skipped, or either
+      report is missing, empty or malformed, `td-test-ids` fails, even while every TD says
+      `Enforced: no`. It never counts fewer IDs instead. A test that names an ID absent from
       every TD fails.
     - **For an enforced TD,** every ID without a passing test fails, with the tests that
       carried it and didn't pass. For a TD at `Enforced: no`, a visible notice gives its
@@ -2360,9 +2365,9 @@ command output, and never just says "tests pass".
     the document chooses for itself, so a 3.0 contract fails. Every `$ref` must resolve.
 
   **Check names.** Rulesets match a check by its job name. `ci.yml`'s jobs are `lint`,
-  `test` (one per operating system), `td-test-ids`, `coverage`, `mutation`,
-  `contract-lint`, `ip-literals` and `pr-size`, and its roll-up job **`ci`** fails unless
-  every one of them passed
+  `test` (one per operating system), `ppe` (S0b; §8.3), `td-test-ids`, `coverage`,
+  `mutation`, `contract-lint`, `ip-literals` and `pr-size`, and its roll-up job **`ci`**
+  fails unless every one of them passed
   (`pr-size` may be skipped on a push to `main`, where there's no pull request). The ruleset
   requires `ci`, not the individual jobs.
 
