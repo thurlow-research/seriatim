@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -90,6 +91,33 @@ def test_main_score_threshold(tmp_path, capsys):
     assert "below 75 %" in capsys.readouterr().out
     f.write_text("{}")
     assert mutation.main(["--score", str(f)]) == 1
+
+
+@pytest.mark.parametrize("outcome", ["passes", "mutmut fails", "raises"])
+def test_run_package_restores_pyproject(tmp_path, monkeypatch, outcome):
+    pdir = tmp_path / "node"
+    pdir.mkdir()
+    original = b'[tool.mutmut]\nonly_mutate = ["seriatim_node/*"]\nx = 1\n'
+    (pdir / "pyproject.toml").write_bytes(original)
+    seen = []
+
+    def fake_run(cmd, cwd, check):
+        seen.append((pdir / "pyproject.toml").read_text(encoding="utf-8"))
+        if outcome == "raises":
+            raise OSError("no uv")
+        return subprocess.CompletedProcess(cmd, 1 if outcome == "mutmut fails" else 0)
+
+    monkeypatch.setattr(mutation.subprocess, "run", fake_run)
+    monkeypatch.setattr(mutation, "staged", lambda pdir: contextlib.nullcontext())
+    monkeypatch.setattr(mutation, "generated_mutants", lambda pdir, files: 3)
+    monkeypatch.setattr(mutation, "score_file", lambda path: (90.0, 3))
+    if outcome == "passes":
+        assert mutation.run_package(str(pdir), ["seriatim_node/gate.py"]) == (90.0, 3)
+    else:
+        with pytest.raises((mutation.GateError, OSError)):
+            mutation.run_package(str(pdir), ["seriatim_node/gate.py"])
+    assert 'only_mutate = ["seriatim_node/gate.py"]' in seen[0]  # edited during the run
+    assert (pdir / "pyproject.toml").read_bytes() == original  # and restored after it
 
 
 def test_set_only_mutate():

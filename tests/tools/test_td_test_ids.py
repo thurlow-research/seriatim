@@ -185,6 +185,7 @@ def test_unenforced_td_prints_a_notice(tmp_path, monkeypatch, capsys):
     code, out = run(tmp_path, monkeypatch, capsys, [("a", ["C1"], None)])
     assert code == 0
     assert "TD-slice-1 (S1) is 'Enforced: no': 2 IDs, 1 discharged" in out
+    assert "missing IDs fail only once the TD says 'Enforced: yes'" in out
     assert "run on pull requests only" in out
 
 

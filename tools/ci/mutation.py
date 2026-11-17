@@ -169,7 +169,15 @@ def generated_mutants(pdir: Path, files: list[str]) -> int:
 def run_package(pkg: str, files: list[str]) -> tuple[float, int]:
     pdir = Path(pkg)
     pyproject = pdir / "pyproject.toml"
-    pyproject.write_text(set_only_mutate(pyproject.read_text(encoding="utf-8"), files))
+    original = pyproject.read_bytes()
+    pyproject.write_text(set_only_mutate(original.decode("utf-8"), files), encoding="utf-8")
+    try:
+        return _mutate(pkg, pdir, files)
+    finally:
+        pyproject.write_bytes(original)  # a local run leaves the clone as it found it
+
+
+def _mutate(pkg: str, pdir: Path, files: list[str]) -> tuple[float, int]:
     print(f"mutating in {pkg}/: {', '.join(files)}", flush=True)
     with staged(pdir):
         r = subprocess.run(["uv", "run", "--frozen", "mutmut", "run"], cwd=pdir, check=False)

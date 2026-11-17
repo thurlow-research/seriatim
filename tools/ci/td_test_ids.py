@@ -278,8 +278,8 @@ def main(argv: list[str] | None = None) -> int:
             if not td.enforced:
                 print(
                     f"::notice::{td.name} ({td.slice}) is 'Enforced: no': {len(td.ids)} IDs, "
-                    f"{len(td.ids) - len(missing)} discharged; the slice's first code PR "
-                    "sets 'Enforced: yes'"
+                    f"{len(td.ids) - len(missing)} discharged; missing IDs fail only once "
+                    "the TD says 'Enforced: yes'"
                 )
                 continue
             for tid in missing:
