@@ -836,7 +836,7 @@ also run on `windows-latest` and `macos-latest`.
 | H25 | Clean upstream errors pass through: 500 `{"error":"x"}`, 503 `text/plain` `oops` and 502 `text/html` → status, `content-type` and bytes unchanged; the slot is freed at once (the next request gets 200 with the fake clock not advanced) | 6, 25 |
 | H26 | Ungated stalls. `ungated_read_timeout_s=0.5`: `/api/show` with the fake stalling before the headers → 502 `UPSTREAM_PROTOCOL_ERROR` within the bound; stalling after the headers → aborted. A client disconnect during an ungated stream → the fake sees the upstream close. In every case the shared pool has no connection in use afterwards, and every gate slot stays `FREE` throughout. When the shared response's `aclose()` blocks → `upstream_close_failed` at `ERROR` within `close_timeout_s`, and the client is answered or aborted within `2 × close_timeout_s` | 20, 26 |
 | H27 | The `NODE_SATURATED` response from H14 in full: `Retry-After` equals `retry_after`, `X-Seriatim-Gate: ungated`, and `retryable` and `replay_safe` are the `ERROR_TABLE` values (`replay_safe: true`); the body validates against `ErrorEnvelope` | 20, 25 |
-| H28 | Request smuggling, over a raw socket: two different `Content-Length` headers; `Content-Length: 5, 6`; `Content-Length: -1`; `Transfer-Encoding: chunked` together with `Content-Length`; `Transfer-Encoding: gzip, chunked`; and a chunked body with a trailer and a second request hidden in it → the invalid framings (two different `Content-Length` values, a list value, `-1`, and `Transfer-Encoding` together with `Content-Length`; RFC 9112 §6.1 and §6.3) are each **refused with 400 and a closed connection**. The valid chunked body with a trailer is parsed as exactly one request, with the body its framing gives, and the hidden request is never seen as a request. `fake_ollama` never records a request the client didn't frame, and no slot is taken by one | 21, 2 |
+| H28 | Request smuggling, over a raw socket: two different `Content-Length` headers; `Content-Length: 5, 6`; `Content-Length: -1`; `Transfer-Encoding: chunked` together with `Content-Length`; `Transfer-Encoding: gzip, chunked`; and a chunked body with a trailer and a second request hidden in it → the invalid framings (two different `Content-Length` values, a list value, `-1`, and `Transfer-Encoding` together with `Content-Length`; RFC 9112 §6.1 and §6.3) are each **refused with 400 and a closed connection**. `Transfer-Encoding: gzip, chunked` is validly framed, but the sidecar supports no transfer coding except `chunked`. h11 refuses it, and uvicorn 0.54 (h11) answers every h11 protocol error with **400 and a closed connection**, so that is its exact result too. RFC 9112 §6.1 says a server SHOULD send 501 here, and 400 is still a refusal; the test asserts 400, so a uvicorn upgrade that changes it is caught. The valid chunked body with a trailer is parsed as exactly one request, with the body its framing gives, and the hidden request is never seen as a request. `fake_ollama` never records a request the client didn't frame, and no slot is taken by one | 21, 2 |
 | H29 | A refused request, then another on the same keep-alive socket: request 1 gets 429 (busy) after sending its 4 KiB body; request 2 follows on the same socket → request 2 gets **either** its own real response (200 once the holder ends) **or** a closed connection with no second response. A 400 (from request 1's body bytes being parsed as a request) fails the test. The same after a 413 | 3, 21 |
 | B1 | Request 1 is held at upstream; request 2 (`/api/chat`) → 429 within the bound, with `Retry-After: 15` and `X-Seriatim-Gate: busy`. The body validates against `ErrorEnvelope`: `error_code: GPU_BUSY`, `retryable: true`, `replay_safe: true`, `retry_after: 15`, `source: sidecar`, `busy_for_s ≥ 0`. `fake_ollama` recorded **one** request | 3, 4, 25 |
 | B2 | Request 1 ends cleanly → a new request 2 gets 200 at once | 10 |
@@ -984,13 +984,15 @@ cancellation and closing, and blob streaming.
 | S1-11 | Blob uploads | `proxy.py` (`body_stream`), `test_http.py` | H10, E6, E12–E14 | 6 |
 | S1-12 | Process and singleton | `app.py` (`main`, `acquire_singleton`), `test_config.py`, `test_process.py` | C8, R1–R9 | 6 |
 | S1-13 | Request log, Seriatim's headers on every response, health under load | `app.py` (the log fields on every path), `test_http.py` | L1–L3, K-OAS2, H19, HL8 | 8, 9, 10, 11 |
-| S1-14 | The PPE sidecar and enforcement | `ppe/compose.yaml` (`node-a`), `tests/behaviour/test_sidecar.py`; `Enforced: yes` | P1–P7 | 12, 13 |
+| S1-14 | The PPE sidecar and enforcement | `ppe/compose.yaml` (`node-a`), `tests/behaviour/test_sidecar.py`; `Enforced: yes` | P1–P7 | 1–13 (all) |
 
 "needs" lists the PRs that must merge first; dependencies through them count too (S1-6
 needs S1-5, which needs S1-1 to S1-4). PRs with no dependency between them may be open at
 the same time when they touch different files. S1-1, S1-2 and S1-4 are independent. S1-7 to
-S1-11 all build on S1-6 and all change `proxy.py`, so they go one at a time. S1-14 closes #34
-and #15.
+S1-11 all build on S1-6 and all change `proxy.py`, so they go one at a time. S1-14 needs
+**every** earlier PR, not only 12 and 13: it sets `Enforced: yes`, so all 138 IDs must pass,
+and S1-7's IDs (H3, H9, H11, H15–H18, H20, H21, H24) are in no other PR's chain. S1-14
+closes #34 and #15.
 
 **Why each ID sits where it does**, for the ones the review asked about:
 - **K-OAS1 and K3** compare the contract with `gate.py`'s tables, so both are in S1-3,
