@@ -115,16 +115,16 @@ in `gate.py` and checked against the route probe (K3).
    a `ConfigError` that names `SERIATIM_NODE_<FIELD>`, mapped from the error's `loc`.
 4. **Upstream URL.** `ollama_url` must meet all of these:
    - the scheme is `http`;
-   - the port is explicit;
+   - the port is explicit, and 1–65535 (`:0` is refused);
    - the path is empty or `/`;
    - there is no query, fragment or user info;
    - the host is an IP literal in `127.0.0.0/8`, or `::1`.
 
    `localhost` is a name, not a literal, so it is refused. No name resolution ever happens.
 5. **Listen address.** If `listen_host` is not a loopback literal and `allow_unauthenticated`
-   is false, raise `ConfigError`. When it is true, log a `WARNING` at startup. As for
-   `ollama_url`, a name is not a literal: `localhost` is refused too, and so is any
-   non-loopback IPv6 address, including `::` (C11).
+   is false, raise `ConfigError`. When it is true, `load_settings` logs a `WARNING`, so it
+   appears at startup. As for `ollama_url`, a name is not a literal: `localhost` is refused
+   too, and so is any non-loopback IPv6 address, including `::` (C11).
 6. **Lock directory.** A `lock_dir` other than `default_lock_dir()` is accepted only when
    `allow_unauthenticated` is true, which is the PPE and test mode. Otherwise it raises
    `ConfigError`. Two production sidecars therefore always meet at the same lock file, and
@@ -776,7 +776,7 @@ also run on `windows-latest` and `macos-latest`.
 | C4 | `OLLAMA_URL` → `ConfigError` for: `http://192.0.2.5:11435`, `http://example.com:11435`, `http://localhost:11435`, `http://0.0.0.0:11435`, `https://127.0.0.1:11435`, `http://127.0.0.1:11435/x`, `http://127.0.0.1:11435/?a`, `http://127.0.0.1:11435/#f`, `http://u:p@127.0.0.1:11435`, `http://127.0.0.1` (no port). Accepted: `http://[::1]:11435` and `http://127.0.0.2:11435`. `load_settings({})` with `SERIATIM_NODE_SLOTS=5` set in the real `os.environ` still gives `slots == 1` | 1, 23 |
 | C5 | `LISTEN_HOST=0.0.0.0` without `ALLOW_UNAUTHENTICATED` → `ConfigError`; with it, accepted, and a `WARNING` is captured. `LOCK_DIR=/tmp/x` without `ALLOW_UNAUTHENTICATED` → `ConfigError`; with it, accepted | 15, 12b |
 | C6 | `SERIATIM_NODE_SLOTZ=1` → `ConfigError` naming it. `SERIATIM_APP_ID=1`, `SERIATIM_CONFIG_DIR=/x` and `SERIATIM_GW_FOO=1` are ignored | 23 |
-| C7 | `SERIATIM_NODE_CONFIG=/nonexistent.toml` → `ConfigError`; a malformed TOML file → `ConfigError` | 23 |
+| C7 | `SERIATIM_NODE_CONFIG=/nonexistent.toml` → `ConfigError`; a malformed TOML file, including one that is not valid UTF-8 (TOML must be), → `ConfigError` naming `SERIATIM_NODE_CONFIG` | 23 |
 | C8 | `main()` with invalid config exits 2 and prints the key. With valid config it calls `uvicorn.run` with `workers=1` and `http="h11"` (monkeypatched) | 21, 23 |
 | C9 | Ranges and types C3 doesn't cover → `ConfigError` naming the variable. `LISTEN_PORT` = `0`, `65536`, `x`; `ID` = `Node`, `-a`, 33 characters, empty; `CONNECT_TIMEOUT_S` and `CLOSE_TIMEOUT_S` = `0`, `61`; `UNGATED_READ_TIMEOUT_S` = `0`, `3601`; `MAX_BODY_BYTES=1023`; `BODY_TIMEOUT_S` = `0`, `3601`; `HEALTH_PROBE_TIMEOUT_S` = `0`, `31`; `LOG_LEVEL` = `debug`, `TRACE`. Every float field also refuses `nan`, `inf` and `-inf`. The boundary values (`1`, `65535`, `60`, `3600`, `1024`, `30`) are accepted | 23 |
 | C10 | `SERIATIM_NODE_CONFIG` names a file that exists but can't be read (POSIX, mode `000`; skipped on Windows and as root) → `ConfigError` naming `SERIATIM_NODE_CONFIG`. A `.env` file in the working directory with `SERIATIM_NODE_SLOTS=5` → ignored: `slots == 1` | 23 |
