@@ -1,4 +1,8 @@
-"""HTTP-level tests (TD-slice-1 §8.3). S1-1: the error table against the contract (K-OAS3)."""
+"""HTTP-level tests (TD-slice-1 §8.3).
+
+S1-1: the error table against the contract (K-OAS3). S1-3: the contract against `classify()`
+(K-OAS1).
+"""
 
 from __future__ import annotations
 
@@ -8,8 +12,10 @@ from pathlib import Path
 import jsonschema
 import pytest
 import yaml
+from openapi_spec_validator import OpenAPIV31SpecValidator, validate
 
 from seriatim_node.app import ERROR_TABLE, ErrorCode, ErrorFactory, ErrorSpec, main
+from seriatim_node.gate import BLOB_RE, Kind, Route, Scope, classify
 
 # Resolved from this file, so the same path works when mutmut copies tests/ and contract/
 # into node/ (tools/ci/mutation.py).
@@ -97,6 +103,17 @@ def test_gpu_busy_matches_appendix_a(envelope_validator):
     envelope_validator.validate(json.loads(body))
 
 
+# Written out from TD §5 and SPEC REQ-37, not imported from app.py, so the test is independent.
+TD5_FIXED_GATE = {
+    ErrorCode.GPU_BUSY: "busy",
+    ErrorCode.NODE_STARTING: "refused",
+    ErrorCode.NODE_OFFLINE: "refused",
+    ErrorCode.EXPOSURE_UNVERIFIED: "refused",
+    ErrorCode.OLLAMA_EXPOSED: "refused",
+    ErrorCode.NUM_CTX_EXCEEDS_LIMIT: "refused",
+}
+
+
 @pytest.mark.parametrize("code", [c for c in ErrorCode if ERROR_TABLE[c].status is not None])
 @pytest.mark.parametrize("gate_value", ["acquired", "ungated"])
 def test_every_response_code_uses_the_table(code, gate_value, envelope_validator):
@@ -113,6 +130,9 @@ def test_every_response_code_uses_the_table(code, gate_value, envelope_validator
         "node": "node-a",
     }
     headers = _headers(raw)
+    # TD §5 fixes X-Seriatim-Gate for these codes; every other code sends the caller's value
+    # (#71 review). Adding a code to the fixed-gate table by mistake fails here.
+    assert headers["x-seriatim-gate"] == TD5_FIXED_GATE.get(code, gate_value)
     assert "retry-after" not in headers
     assert headers["content-length"] == str(len(body))
     assert headers["x-request-id"] == "rid"
@@ -228,3 +248,107 @@ def test_node_id_comes_from_the_factory():
     )
     assert json.loads(body)["node"] == "node-b"
     assert _headers(raw)["x-seriatim-node"] == "node-b"
+
+
+# --- K-OAS1: the contract is valid and agrees with classify() ------------------------------
+
+HTTP_METHODS = ("get", "head", "post", "put", "delete", "options", "patch", "trace")
+SAMPLE_DIGEST = "sha256:" + "0123456789abcdef" * 4
+# Paths S1 serves itself (TD §2.2 SERIATIM_ROUTES); the rest of /seriatim/* comes later.
+S1_SERIATIM_PATHS = {"/seriatim/health"}
+
+
+def _refs(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "$ref":
+                yield v
+            else:
+                yield from _refs(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _refs(v)
+
+
+def _resolve(doc, ref: str):
+    assert ref.startswith("#/"), f"only local $refs are used: {ref}"
+    node = doc
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        assert isinstance(node, dict) and part in node, f"unresolved $ref {ref}"
+        node = node[part]
+    return node
+
+
+def _operations(contract):
+    for path, item in contract["paths"].items():
+        for method in HTTP_METHODS:
+            if method in item:
+                yield path, method.upper(), item[method]
+
+
+def _raw(path: str) -> bytes:
+    return path.replace("{digest}", SAMPLE_DIGEST).encode()
+
+
+def _is_seriatims(path: str) -> bool:
+    return path == "/seriatim" or path.startswith("/seriatim/") or path == "/models/select"
+
+
+@pytest.mark.td("K-OAS1")
+def test_k_oas1_contract_is_valid_openapi_3_1(contract):
+    assert contract["openapi"].startswith("3.1")
+    validate(contract, cls=OpenAPIV31SpecValidator)
+
+
+@pytest.mark.td("K-OAS1")
+def test_k_oas1_every_ref_resolves(contract):
+    refs = set(_refs(contract))
+    assert refs, "the contract uses $refs"
+    for ref in refs:
+        _resolve(contract, ref)
+
+
+@pytest.mark.td("K-OAS1")
+def test_k_oas1_ollama_paths_agree_with_classify(contract):
+    checked = 0
+    for path, method, op in _operations(contract):
+        if _is_seriatims(path):
+            continue
+        route = classify(method, _raw(path))
+        assert route.known, (method, path)
+        assert route.kind.value == op["x-seriatim-gate"], (method, path)
+        assert route.scope.value == op["x-seriatim-scope"], (method, path)
+        checked += 1
+    assert checked == 21  # every pair of TD §2.2 rules 2 to 4, the blob routes once each
+
+
+@pytest.mark.td("K-OAS1")
+def test_k_oas1_blob_parameter_matches_blob_re(contract):
+    params = contract["paths"]["/api/blobs/{digest}"]["parameters"]
+    (digest,) = [p for p in params if p["name"] == "digest"]
+    assert BLOB_RE.pattern.decode() == "^/api/blobs/" + digest["schema"]["pattern"][1:]
+
+
+@pytest.mark.td("K-OAS1")
+def test_k_oas1_seriatim_paths_declare_a_scope(contract):
+    for path, method, op in _operations(contract):
+        if not _is_seriatims(path):
+            continue
+        assert "x-seriatim-gate" not in op, (method, path)
+        assert op["x-seriatim-scope"] in {"none", "infer", "admin"}, (method, path)
+        if path in S1_SERIATIM_PATHS:
+            route = classify(method, _raw(path))
+            assert route == Route(Kind.SERIATIM, Scope(op["x-seriatim-scope"]), True, 200)
+
+
+@pytest.mark.td("K-OAS1")
+def test_k_oas1_unknown_endpoint_agrees_with_rule_5(contract):
+    rule = contract["x-seriatim-unknown-endpoint"]
+    for method, path in [("GET", b"/api/unknown"), ("OPTIONS", b"/api/tags"), ("post", b"/")]:
+        route = classify(method, path)
+        assert (route.kind.value, route.scope.value, route.known) == (
+            rule["x-seriatim-gate"],
+            rule["x-seriatim-scope"],
+            False,
+        )
