@@ -94,7 +94,7 @@ def _read_file(path: str) -> dict[str, Any]:
             data = tomllib.load(f)
     except OSError as e:
         raise ConfigError(f"{CONFIG_VAR}: cannot read {path!r} ({e})") from None
-    except tomllib.TOMLDecodeError as e:
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:  # TOML must be UTF-8
         raise ConfigError(f"{CONFIG_VAR}: {path!r} is not valid TOML: {e}") from None
     for key in data:
         if key not in FIELDS:

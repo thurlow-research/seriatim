@@ -238,6 +238,13 @@ def test_malformed_config_file(tmp_path):
 
 
 @pytest.mark.td("C7")
+def test_config_file_not_utf8(tmp_path):
+    path = tmp_path / "bad.toml"
+    path.write_bytes(b'id = "a\xff"\n')  # TOML must be UTF-8; tomllib raises UnicodeDecodeError
+    assert "not valid TOML" in str(refused({P + "CONFIG": str(path)}, P + "CONFIG"))
+
+
+@pytest.mark.td("C7")
 def test_config_path_is_a_directory(tmp_path):
     refused({P + "CONFIG": str(tmp_path)}, P + "CONFIG")
 
