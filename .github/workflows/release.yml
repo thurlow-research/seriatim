@@ -1,0 +1,118 @@
+# Release (SPEC REQ-68; ADR-001 §10 S0a; #10). The only way a release is made.
+# A pushed tag vX.Y.Z or vX.Y.Z-rc.N whose commit is on main, with __version__ already bumped to
+# X.Y.Z or X.Y.ZrcN by pull request, is built read-only, then published from the `release`
+# environment after the maintainer approves: attest, draft, upload, publish.
+# Event values reach steps only through env:, never inside run:.
+# From S10: the gateway image, and with it packages: write on the publish job (pushed by digest).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.11.19"
+  UV_PYTHON: "3.12"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      # Full history, so the reachability check can see main (refs/remotes/origin/main).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag is vX.Y.Z or vX.Y.Z-rc.N
+        id: tag
+        env:
+          REF: ${{ github.ref }}
+        run: python3 -I tools/ci/release_checks.py tag --ref "$REF" --github-output "$GITHUB_OUTPUT"
+      - name: The tag's commit is on main and __version__ equals the tag
+        env:
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: >-
+          python3 -I tools/ci/release_checks.py source --ref "$REF" --sha "$SHA"
+          --main-ref refs/remotes/origin/main --init node/seriatim_node/__init__.py
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv build --package seriatim-node --no-sources --out-dir "$RUNNER_TEMP/dist"
+      - name: The wheel and sdist carry the tag's version; write SHA256SUMS
+        env:
+          REF: ${{ github.ref }}
+        run: >-
+          python3 -I tools/ci/release_checks.py dist --ref "$REF"
+          --sums "$RUNNER_TEMP/dist/SHA256SUMS" "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job with write permissions, and only after the maintainer approves it in the
+  # `release` environment, which accepts only v* tags (SPEC §7.9).
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.build.outputs.tag }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/assets
+      - name: The assets still match SHA256SUMS
+        working-directory: ${{ runner.temp }}/assets
+        run: sha256sum --check --strict SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/assets/*
+      # Immutable releases take no assets once published, so: draft, upload, then publish.
+      - name: Create the release as a draft
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" "${flags[@]}" \
+            --notes "Built by release.yml from $SHA. Verify every asset against SHA256SUMS and its build-provenance attestation before installing (SPEC REQ-68a)."
+      - name: Upload every asset and SHA256SUMS
+        run: gh release upload "$TAG" "$RUNNER_TEMP"/assets/*
+      - name: Publish it
+        run: gh release edit "$TAG" --draft=false
+      - name: It is published, on the right channel, with every asset
+        working-directory: ${{ runner.temp }}/assets
+        run: |
+          files="$(find . -maxdepth 1 -type f ! -name '.*' -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')"
+          want="false $PRERELEASE $files"
+          got="$(gh release view "$TAG" --json isDraft,isPrerelease,assets \
+            --jq '"\(.isDraft) \(.isPrerelease) \([.assets[].name] | sort | join(" ")) "')"
+          if [ "$got" != "$want" ]; then
+            echo "::error::release $TAG is '$got', expected '$want'"
+            exit 1
+          fi
+          echo "release: $TAG published ($got)"

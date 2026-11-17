@@ -1691,8 +1691,16 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
 
 - **REQ-68. Release workflow.** `.github/workflows/release.yml` is the only way a release is
   made. It runs on CI only; nothing is published from a laptop.
-  - **Tags from `main` only.** It runs on a pushed tag, and refuses, failing closed, any tag
-    whose commit is not reachable from `main`.
+  - **Tags from `main` only.** It runs on a pushed `v*` tag, and refuses, failing closed, any
+    tag whose commit is not reachable from `main`, and any tag not named exactly `vX.Y.Z` or
+    `vX.Y.Z-rc.N` (ASCII digits, no leading zeros, `N` from 1). These checks, and the
+    version checks below, run in a build job with read permission only, before anything is
+    published (`tools/ci/release_checks.py`).
+  - **The version is set before tagging.** The package version is the static `__version__`
+    in `node/seriatim_node/__init__.py`, bumped by a normal pull request before the tag is
+    pushed. The build fails unless it, and the built wheel's and sdist's names and metadata,
+    are the tag's version: `X.Y.Z`, or the PEP 440 form `X.Y.ZrcN` for an rc. Nothing is
+    rewritten at build time.
   - **What it builds:** the sdist and wheels, and from S10 the gateway container image.
   - **What it publishes:** a GitHub Release with a SHA-256 checksum for every asset, and a
     build-provenance attestation (`actions/attest-build-provenance`) for each. The image
@@ -1707,14 +1715,18 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
       one, so a tag names one commit forever. The repository's immutable-releases setting
       also stops a published release's assets from being replaced (§7.9).
     - **Credentials:** only `release.yml`'s publish job holds write permissions
-      (`contents: write`, `packages: write`, `id-token: write`, `attestations: write`), and
+      (`contents: write`, `id-token: write`, `attestations: write`, and from S10, for the
+      image, `packages: write`; until then it doesn't have it), and
       it runs in the `release` environment, which the maintainer must approve and which
       accepts only `v*` tags. That approval applies to every `v*` tag, rc included. Every
       other workflow has no write permission to contents or packages, and no personal token
       publishes anything.
     - **Publishing order,** because immutable releases can't take assets once published:
-      `release.yml` creates the release as a draft, uploads every asset and its checksum
-      list, attests them, and only then publishes it (as a pre-release for an rc).
+      `release.yml` attests every asset and the checksum list, creates the release as a
+      draft, uploads them, and only then publishes it (as a pre-release for an rc), then
+      checks that it is published on the right channel with every asset. If a step fails
+      after the draft exists, the run stops there; the maintainer deletes the draft and
+      re-runs it.
 - **REQ-68a. Installers verify before installing.** The install scripts (REQ-57, REQ-58),
   the gateway deployment and the follower (REQ-69) install a release only after all of
   these hold, for the **exact tag they expect**. Any failure is a hard stop.
