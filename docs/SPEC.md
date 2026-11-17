@@ -2212,8 +2212,13 @@ command output, and never just says "tests pass".
         after its expiry. Any other key, an unknown tool or a malformed id also fails.
       - **The lint** (`tools/ci/security_ignore.py lint`, job `ignore-lint`) checks that
         file, and every `# nosec` comment in the tracked Python files, read as comment
-        tokens. The required form is `# nosec B603 # <reason>`: Bandit reads test ids only up
-        to the second `#`, so the reason after it never reaches Bandit as a test name.
+        tokens. The required form is `# nosec B603 # <reason>` (several ids are separated by
+        `, `): Bandit reads test ids only up to the second `#`, so the reason after it never
+        reaches Bandit as a test name. The lint finds suppressions with Bandit's own patterns,
+        so every comment Bandit would honour is checked, including forms such as `nosecB602`.
+        It fails on any other form, and on a test id the pinned Bandit doesn't know: Bandit
+        drops unknown ids, and a suppression left with none silences every finding on its
+        line. A test checks the lint's patterns and id list against the installed Bandit.
       - **How exceptions reach the tools.** `security_ignore.py exec` checks the file again,
         so an expired entry fails every scanner job, then adds each tool's own arguments:
         Bandit `--skip`, pip-audit `--ignore-vuln`, Trivy `--ignorefile`.
