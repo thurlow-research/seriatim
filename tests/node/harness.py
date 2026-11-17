@@ -15,6 +15,7 @@ down") and started later on the same socket.
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import threading
 import time
@@ -29,6 +30,8 @@ from seriatim_node.config import Settings, load_settings
 from seriatim_node.gate import Gate, SlotState
 
 LOOPBACK = "127.0.0.1"
+# TD §7 "Timing": an elapsed-time assertion may overrun its target by this much.
+TIMING_BOUND_S = 0.5 if os.environ.get("CI") == "true" else 0.1
 STALL_LIMIT_S = 30.0  # a stalled fake gives up after this, so teardown can never hang
 
 

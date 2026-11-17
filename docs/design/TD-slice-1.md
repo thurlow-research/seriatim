@@ -371,6 +371,11 @@ Gated requests have `read=None` and `write=None`. Their only bound is the hold l
   as the `fake_ollama` and `sidecar` fixtures. Servers run in a thread, on a socket the
   harness binds first. That lets a test hold a port closed ("Ollama is down") and later
   start the fake on it (HL6).
+- **HL6 uses a stub gate for the four-fault order.** A real `Gate` can't hold an overdue
+  lease while it is `starting`: `try_acquire` returns `Starting` until the quarantine ends,
+  and time only moves forward. So the full four-reason order is tested against a stub that
+  reports each fault as a flag. A second HL6 case uses the real `Gate` and `Lease` for the
+  three faults that can coexist, and a third checks `starting` on a new real gate.
 
 **`main()`** runs these steps:
 1. `load_settings()`. On `ConfigError`, print the message to stderr and exit 2.
@@ -911,7 +916,7 @@ also run on `windows-latest` and `macos-latest`.
 | HL3 | Upstream `/api/version` returns each of: 500; 200 `not json`; 200 `[]`; 200 `{}`; 200 `{"version":""}`; 200 `{"version":7}` → each gives 503 with `["ollama_bad_response"]` | 18 |
 | HL4 | An injected overdue lease → `slot_overdue`; an injected stuck slot → `slot_stuck`. The body never contains the version string | 18 |
 | HL5 | The probe connects, then stalls: once before the headers and once in the middle of the body → 503 `["ollama_unreachable"]` within `health_probe_timeout_s` plus the bound | 18 |
-| HL6 | Several faults at once: upstream down, an overdue lease, a stuck slot and the startup quarantine → `reasons` is exactly `["ollama_unreachable", "slot_overdue", "slot_stuck", "starting"]`. Clearing each fault in turn removes only its reason, and the rest stay in order | 18 |
+| HL6 | Several faults at once: upstream down, an overdue lease, a stuck slot and the startup quarantine → `reasons` is exactly `["ollama_unreachable", "slot_overdue", "slot_stuck", "starting"]`. Clearing each fault in turn removes only its reason, and the rest stay in order. A real gate can't be overdue while starting, so this order uses a stub gate. With the real `Gate` (2 slots: one lease overdue, one `stuck()`) and upstream down → `["ollama_unreachable", "slot_overdue", "slot_stuck"]`. Starting Ollama removes only `ollama_unreachable`, and finishing the overdue lease removes only `slot_overdue`. `slot_stuck` stays, because a `STUCK` slot is never freed before a restart. A new real gate reports `["starting"]` | 18 |
 | HL7 | Normal use is not a fault: slots 2, one `HELD` within its limit and one `DRAINING` → 200 `{"status":"ok"}` | 18 |
 | HL8 | Two cases. **Stalled:** 200 concurrent health requests while the fake stalls `/api/version` past `health_probe_timeout_s` → **every** response is 503 `["ollama_unreachable"]` within `health_probe_timeout_s` plus the bound; none is 200 and none is 500. **Not stalled:** 200 concurrent health requests on a fake that answers → every response is 200. In both cases, a gated `/api/chat` sent meanwhile gets 200 | 18 |
 | HL9 | Health requests are logged at `DEBUG` only: at `LOG_LEVEL=INFO`, 10 health requests add no log line; at `DEBUG`, each adds exactly one | 22 |
@@ -1045,7 +1050,9 @@ closes #34 and #15.
 **Why each ID sits where it does**, for the ones the review asked about:
 - **K-OAS1 and K3** compare the contract with `gate.py`'s tables, so both are in S1-3,
   which needs S1-1.
-- **H23, HL4, HL6 and HL7** use `Gate` and `Lease`, so S1-5 needs S1-4.
+- **H23, HL4, HL6 and HL7** use `Gate` and `Lease`, so S1-5 needs S1-4. (HL6's four-fault
+  order uses a stub gate, because a real gate can't be overdue while starting; its other
+  cases use the real one.)
 - **HL8** sends a gated request during the health load, so it waits for S1-6 (in S1-13).
 - **H25 and the other "freed at once" assertions** need admission and the `finally`, which
   are both in S1-6.

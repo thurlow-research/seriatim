@@ -18,6 +18,7 @@ import jsonschema
 import pytest
 import yaml
 from harness import (
+    TIMING_BOUND_S,
     FakeOllama,
     all_free,
     drip_body,
@@ -788,7 +789,7 @@ def test_hl5_stalled_probe(behaviour, fake_ollama, sidecar, health_validator):
     resp = _health(car, health_validator)
     elapsed = time.perf_counter() - started
     assert resp.status_code == 503 and _reasons(resp) == ["ollama_unreachable"]
-    assert 0.4 < elapsed < 0.5 + 1.5
+    assert 0.4 < elapsed < 0.5 + TIMING_BOUND_S
     fake_ollama.release.set()
 
 
@@ -827,6 +828,30 @@ def test_hl6_every_fault_in_order(sidecar, health_validator):
         gate.is_starting = False
         resp = _health(car, health_validator)
         assert resp.status_code == 200 and resp.json() == {"status": "ok"}
+    finally:
+        fake.stop()
+
+
+@pytest.mark.td("HL6")
+def test_hl6_real_gate_faults_in_order(sidecar, health_validator):
+    """The faults a real Gate can hold at once: it can't be overdue while starting."""
+    down = reserve_socket()
+    gate, clock = ready_gate(slots=2, max_hold_s=10)
+    car = sidecar(f"http://127.0.0.1:{down.getsockname()[1]}", gate=gate)
+    overdue = gate.try_acquire("/api/chat", "overdue")
+    stuck = gate.try_acquire("/api/chat", "stuck")
+    clock.advance(10 + 30 + 1)  # past max_hold_s plus overdue()'s 30 s grace
+    assert stuck.stuck()
+    order = ["ollama_unreachable", "slot_overdue", "slot_stuck"]
+    assert _reasons(_health(car, health_validator)) == order
+    fake = FakeOllama()
+    fake.script("GET", "/api/version", VERSION_OK)
+    fake.start(down)  # Ollama comes up on the same port
+    try:
+        assert _reasons(_health(car, health_validator)) == order[1:]
+        assert overdue.finish(clean=True)
+        resp = _health(car, health_validator)  # STUCK is never freed before a restart
+        assert resp.status_code == 503 and _reasons(resp) == ["slot_stuck"]
     finally:
         fake.stop()
 
