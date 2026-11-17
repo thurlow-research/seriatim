@@ -911,8 +911,8 @@ A log line, one per request:
       `junit-test-ubuntu`) and this TD's `Enforced:` line (SPEC REQ-63). While this TD says
       `Enforced: no` it prints a notice. S1's first code PR sets `Enforced: yes` and marks
       each test with its §8 ID, `@pytest.mark.td("<ID>")`. P1 to P7 run in the `ppe` job,
-      not in the `test` leg, so they can be discharged only once `td-test-ids` also reads
-      the `ppe` job's JUnit (S0b);
+      not in the `test` leg; from S0b, `td-test-ids` also reads that job's JUnit
+      (`junit-ppe`, SPEC REQ-63);
     - `private-terms` (S0a part 1b), in its own workflow, as SPEC REQ-63 specifies for pull
       requests from forks.
   - **The mutation job** (`tools/ci/mutation.py`).

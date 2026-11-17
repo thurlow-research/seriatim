@@ -40,6 +40,8 @@ mutants/
 
 # --- PPE / Docker local runtime ---
 ppe/data/
+# Names the one designated CPU-only host where local PPE runs are allowed (SPEC §8.3).
+ppe/.allowed-host
 ppe/logs/
 *.log
 
