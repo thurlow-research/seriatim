@@ -201,6 +201,20 @@ def test_mask(raw, expected, count):
     assert cf.mask(raw, HOST) == (expected, count)
 
 
+def test_a_name_or_ip_split_across_chunks_is_still_masked():
+    # #29 review, fix 1: masking runs on the joined body, then the boundaries are restored.
+    text = f"on {HOST} at {LEAK_IP} done".encode()
+    cut_host, cut_ip = text.index(HOST.encode()) + 4, text.index(LEAK_IP.encode()) + 3
+    pieces = [text[:cut_host], text[cut_host:cut_ip], text[cut_ip:]]
+    raw = {"status": 200, "headers": [], "chunks": pieces}
+    response, masked = cf.record(raw, HOST)
+    body = base64.b64decode(response["body_b64"])
+    assert masked == 2
+    assert HOST.encode() not in body and LEAK_IP.encode() not in body
+    assert body == f"on {'h' * len(HOST)} at xx.x.x.x done".encode()
+    assert response["chunks"] == [len(p) for p in pieces]
+
+
 def test_a_short_hostname_is_not_masked():
     assert cf.mask(b"ab abc", "ab") == (b"ab abc", 0)
 
@@ -239,6 +253,33 @@ def test_only_the_routers_own_404_means_absent(ollama, tmp_path):
     assert not cf.router_404({"status": 200, "chunks": [b"404 page not found"]})
 
 
+def test_a_missing_head_route_is_absent(ollama, tmp_path):
+    # #29 review, fix 3: a HEAD answer has no body, so any 404 means the route is absent.
+    pairs = json.loads(cf.ROUTE_PAIRS.read_text())
+    pairs["gated_admin"].append(["HEAD", "/api/not-a-route"])
+    f = tmp_path / "pairs.json"
+    f.write_text(json.dumps(pairs))
+    probe = {(p["method"], p["path"]): p for p in cf.capture(ollama, HOST, f)["route_probe"]}
+    assert probe[("HEAD", "/api/not-a-route")]["exists"] is False
+    assert probe[("HEAD", "/")]["exists"] is True
+    assert probe[("HEAD", "/api/blobs/sha256:<64 hex>")]["exists"] is True
+
+
+@pytest.mark.parametrize(
+    ("method", "status", "body", "exists"),
+    [
+        ("HEAD", 404, b"", False),
+        ("HEAD", 200, b"", True),
+        ("HEAD", 405, b"", True),
+        ("GET", 404, b"404 page not found", False),
+        ("GET", 404, b'{"error":"not found"}', True),
+        ("POST", 500, b'{"error":"unauthorized"}', True),
+    ],
+)
+def test_route_exists(method, status, body, exists):
+    assert cf.route_exists(method, {"status": status, "chunks": [body]}) is exists
+
+
 def test_route_pairs_are_the_req5_pairs():
     """route-pairs.json is copied from SPEC REQ-5: every pair is named there, and vice versa."""
     spec = (ROOT / "docs/SPEC.md").read_text(encoding="utf-8")
@@ -268,6 +309,7 @@ def test_a_capture_matches_itself_and_values_may_differ(captured):
     fresh = copy.deepcopy(captured)
     ex = by_id(fresh)["chat.nostream"]
     ex["response"]["body_b64"] = base64.b64encode(b'{"ok":false}').decode()
+    ex["response"]["chunks"] = [len(b'{"ok":false}')]
     assert cf.compare(captured, fresh) == []
 
 
@@ -299,6 +341,35 @@ def test_compare_reports_each_shape_change(captured, edit, message):
     edit(fresh)
     diffs = cf.compare(captured, fresh)
     assert any(message in d for d in diffs), diffs
+
+
+@pytest.mark.parametrize(
+    ("chunks", "ok"),
+    [(None, True), ("none", False), ("short", False), ("zero", False), ("long", False)],
+)
+def test_compare_checks_chunks_describe_the_body(captured, chunks, ok):
+    # #29 review, fix 2: the replay follows these boundaries, so they must add up.
+    fresh = copy.deepcopy(captured)
+    r = by_id(fresh)["chat.stream"]["response"]
+    size = sum(r["chunks"])
+    r["chunks"] = {
+        None: r["chunks"], "none": [], "short": [size - 1], "zero": [0, size], "long": [size, 1],
+    }[chunks]  # fmt: skip
+    diffs = cf.compare(captured, fresh)
+    expected = (
+        f"exchange chat.stream (fresh): chunks {r['chunks']} don't add up to its {size}-byte body"
+    )
+    assert (expected in diffs) is not ok, diffs
+    assert cf.compare(fresh, captured) == ([] if ok else [expected.replace("fresh", "committed")])
+
+
+def test_an_empty_body_has_no_chunks(captured):
+    fresh = copy.deepcopy(captured)
+    r = by_id(fresh)["version"]["response"]
+    r["body_b64"], r["chunks"] = "", []
+    assert not any("chunks" in d for d in cf.compare(fresh, fresh))
+    r["chunks"] = [0]
+    assert any("chunks [0] don't add up to its 0-byte body" in d for d in cf.compare(fresh, fresh))
 
 
 def test_shapes():

@@ -1,8 +1,9 @@
 # TD — Slice 1: contract, sidecar gate, 429 and passthrough
 
-**Status:** revision 6, for review. **Date:** 2026-11-16. Revision 5 updates Appendix B
+**Status:** revision 7, for review. **Date:** 2026-11-17. Revision 5 updates Appendix B
 to the mutation layout S0a built (PR #13); revision 6 adds the enforcement line below and
-the `td-test-ids` job to Appendix B (#16).
+the `td-test-ids` job to Appendix B (#16); revision 7 says what "exists" means for `HEAD` in
+the route probe (Appendix B, S0b; #29).
 
 Enforced: no
 
@@ -975,5 +976,7 @@ A log line, one per request:
     - **What "exists" means.** The pair is recorded as `exists: true` unless the response
       is the router's own not-found answer: HTTP 404 with the plain-text body
       `404 page not found`. A JSON 404 such as "model not found" comes from a handler, so it
-      proves the route exists. The script removes anything machine-specific (no IPs, no host names) and writes
+      proves the route exists. A `HEAD` answer has no body to tell the two apart, so for
+      `HEAD` any 404 means the route is absent (the blob is created first, so a 404 there
+      means the route has gone). The script removes anything machine-specific (no IPs, no host names) and writes
     `tests/fixtures/ollama-0.40.16.json`.

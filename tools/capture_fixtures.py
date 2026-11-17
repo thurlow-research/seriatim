@@ -18,17 +18,20 @@ It adds `ollama_version`, the digest of every PPE model, and a **route probe** o
 in `tests/fixtures/route-pairs.json`: each pair is sent a valid request and recorded as
 `exists: true` unless the answer is the router's own not-found (HTTP 404 with the plain
 body `404 page not found`). A JSON 404 such as "model not found" comes from a handler, so it
-proves the route exists. The probe's side effects are undone: the copy and the created
+proves the route exists. A HEAD answer has no body, so for HEAD any 404 means absent (the
+blob is POSTed first). The probe's side effects are undone: the copy and the created
 model are deleted.
 
 **Cleaning.** Anything machine-specific (this host's name, IPv4 literals) is masked with
-characters of the same length, so lengths and chunk boundaries stay true. The number of
+characters of the same length, in the joined body, so a name split across two chunks is
+caught too, and lengths and chunk boundaries stay true. The number of
 masked spans is recorded as `masked`.
 
 **compare** checks the shape of a committed capture against a fresh one, as the `ppe` job
 does: the same exchange ids, statuses, content types, chunked or not, and JSON structure
 (object keys and value types, recursively; for NDJSON, the set of line shapes), and the same
-route probe. Values may differ; shapes may not. It prints every difference.
+route probe. Values may differ; shapes may not. In both files every response's chunk
+lengths must be positive and add up to its body. It prints every difference.
 """
 
 from __future__ import annotations
@@ -172,29 +175,36 @@ def exchange(conn_factory, method: str, path: str, body: str | None) -> dict:
 
 
 def record(raw: dict, hostname: str) -> tuple[dict, int]:
-    """The response as stored: body base64, chunk lengths, after masking."""
-    masked = 0
-    pieces = []
-    for piece in raw["chunks"]:
-        cleaned, n = mask(piece, hostname)
-        pieces.append(cleaned)
-        masked += n
+    """The response as stored: body base64, chunk lengths, after masking.
+
+    The joined body is masked, not each piece, so a name split across two chunks is still
+    caught. Masking keeps lengths, so the original chunk boundaries still hold.
+    """
+    lengths = [len(p) for p in raw["chunks"]]
+    body, masked = mask(b"".join(raw["chunks"]), hostname)
     headers = []
     for k, v in raw["headers"]:
         cleaned, n = mask(v.encode("latin-1"), hostname)
         headers.append([k, cleaned.decode("latin-1")])
         masked += n
-    body = b"".join(pieces)
     return {
         "status": raw["status"],
         "headers": headers,
         "body_b64": base64.b64encode(body).decode(),
-        "chunks": [len(p) for p in pieces],
+        "chunks": lengths,
     }, masked
 
 
 def router_404(raw: dict) -> bool:
     return raw["status"] == 404 and b"".join(raw["chunks"]).strip() == ROUTER_404
+
+
+def route_exists(method: str, raw: dict) -> bool:
+    """False only for the router's own not-found. A HEAD answer has no body to tell a JSON
+    404 from the router's, so for HEAD any 404 means absent (the blob is POSTed first)."""
+    if method == "HEAD":
+        return raw["status"] != 404
+    return not router_404(raw)
 
 
 def _json(raw: dict) -> object:
@@ -291,7 +301,7 @@ def capture(url: str, hostname: str | None = None, pairs_file: Path = ROUTE_PAIR
                     "method": method,
                     "path": template,
                     "status": raw["status"],
-                    "exists": not router_404(raw),
+                    "exists": route_exists(method, raw),
                 }
             )
     finally:
@@ -368,8 +378,24 @@ def exchange_shape(ex: dict) -> dict:
     }
 
 
+def chunk_problems(data: dict, label: str) -> list[str]:
+    """Every response whose chunk lengths don't describe its body: each must be positive and
+    they must sum to the body's length (an empty body has none). The replay follows them."""
+    out = []
+    for ex in data.get("exchanges", []):
+        r = ex["response"]
+        size = len(base64.b64decode(r["body_b64"]))
+        chunks = r["chunks"]
+        if not all(isinstance(c, int) and c > 0 for c in chunks) or sum(chunks) != size:
+            out.append(
+                f"exchange {ex['id']} ({label}): chunks {chunks} don't add up to its "
+                f"{size}-byte body"
+            )
+    return out
+
+
 def compare(committed: dict, fresh: dict) -> list[str]:
-    diffs = []
+    diffs = chunk_problems(committed, "committed") + chunk_problems(fresh, "fresh")
     for key in ("format", "ollama_version"):
         if committed.get(key) != fresh.get(key):
             diffs.append(f"{key}: committed {committed.get(key)!r}, fresh {fresh.get(key)!r}")

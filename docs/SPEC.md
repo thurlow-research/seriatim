@@ -2008,7 +2008,9 @@ command output, and never just says "tests pass".
     `ollama-a` (format: TD-slice-1 App. B). Every `ppe` run captures afresh, uploads the
     capture as the artifact `ppe-capture`, and fails unless the committed file matches it
     in shape: the same exchanges, statuses, content types, chunking and JSON structure, and
-    the same route probe, with every REQ-5 pair present. The committed file is a reviewed
+    the same route probe, with every REQ-5 pair present. In both files every response's
+    chunk lengths must be positive and add up to its body (an empty body has none), because
+    the replay follows them. The committed file is a reviewed
     copy of a CI capture, never edited by hand.
 - **Probe fixtures, not hardware (REQ-16).** Capacity tests replay recorded probe output
   under `tests/fixtures/probes/`, one directory per shape:
