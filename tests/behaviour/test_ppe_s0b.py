@@ -1,18 +1,32 @@
 """S0b's PPE checks, run only by the `ppe` job against a PPE started with `ppe/ppe up --ci`.
 
 Issue #9, answer 5(a): Ollama answers, and the three micro-models are present with their real
-`parameter_size` metadata (SPEC §8.3, Models). S1 adds P1-P7 here; S0b part 2 (#26) adds the
-fixture shape check. Black-box over HTTP (REQ-62): the base URL comes from SERIATIM_PPE_URL.
+`parameter_size` metadata (SPEC §8.3, Models), and the committed fixtures still match a fresh
+capture in shape (answer 5(a), step 3; #26). S1 adds P1-P7 here. Black-box over HTTP (REQ-62):
+the base URL comes from SERIATIM_PPE_URL. The fresh capture is written to
+SERIATIM_PPE_CAPTURE_OUT, which the job uploads as the artifact `ppe-capture`.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
+import sys
 import urllib.request
+from pathlib import Path
 
 import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+FIXTURES = ROOT / "tests" / "fixtures" / "ollama-0.40.16.json"
+_spec = importlib.util.spec_from_file_location(
+    "capture_fixtures", ROOT / "tools" / "capture_fixtures.py"
+)
+capture_fixtures = importlib.util.module_from_spec(_spec)
+sys.modules["capture_fixtures"] = capture_fixtures
+_spec.loader.exec_module(capture_fixtures)
 
 pytestmark = pytest.mark.behaviour
 
@@ -60,3 +74,22 @@ def test_no_model_is_an_ollama_cp_alias():
     # An alias shares its source's digest and metadata, so the sizes would not be real.
     models = {m["name"]: m["digest"] for m in get("/api/tags")["models"] if m["name"] in SIZES}
     assert len(set(models.values())) == len(SIZES), models
+
+
+def test_the_committed_fixtures_match_a_fresh_capture():
+    # Last in this file: the route probe creates and deletes models (it cleans up after itself).
+    fresh = capture_fixtures.capture(BASE_URL)
+    out = os.environ.get("SERIATIM_PPE_CAPTURE_OUT")
+    if out:
+        Path(out).write_text(json.dumps(fresh, indent=1) + "\n", encoding="utf-8")
+    print(
+        f"captured {len(fresh['exchanges'])} exchanges, {len(fresh['route_probe'])} route "
+        f"pairs, {fresh['masked']} masked"
+    )
+    absent = [p for p in fresh["route_probe"] if not p["exists"]]
+    assert not absent, f"REQ-5 pairs the router doesn't know: {absent}"
+    assert FIXTURES.exists(), (
+        f"{FIXTURES.name} is not committed yet: commit this run's ppe-capture artifact (#26)"
+    )
+    committed = json.loads(FIXTURES.read_text(encoding="utf-8"))
+    assert capture_fixtures.compare(committed, fresh) == []
