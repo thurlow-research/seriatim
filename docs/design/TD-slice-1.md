@@ -242,6 +242,18 @@ the caller, not a background task (invariant 4).
 **`Lease.finish(clean=True)`** sets the slot to `FREE`. **`finish(clean=False)`** sets it to
 `DRAINING`, with `drain_until = clock() + drain_s`.
 
+**Details fixed by the code (S1-4).**
+- **Construction.** `Gate` also refuses `retry_after_s < 1` and `max_hold_s ≤ 0`, as well as the
+  `slots < 1` and `drain_s ≤ 0` of G10. NaN counts as invalid.
+- **Arguments.** `Gate` takes plain arguments, not `Settings`, so `gate.py` does not import
+  `config.py`.
+- **`busy_for_s` and `overdue()`** count `HELD` slots only. A `STUCK` slot is reported by
+  `any_stuck()` (`slot_stuck`), never as busy time or as overdue.
+- **What `slots()` shows.** A `STUCK` slot keeps its holder there. A `DRAINING` or `FREE` slot
+  has none.
+- **Old leases.** A lease ends at most once: after `finish` or `stuck`, every later call returns
+  `False` and changes nothing. So an old lease can never free a slot that a newer lease now holds.
+
 ### 2.3 `proxy.py`
 
 ```python
