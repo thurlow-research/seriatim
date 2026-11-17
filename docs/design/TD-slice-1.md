@@ -961,7 +961,10 @@ order. Each has its own issue, a sub-issue of #34. Each leaves `main` releasable
 and ships the tests for exactly the IDs listed. **Every behaviour an ID asserts is delivered
 by its PR or by one in that PR's "needs"** (checked row by row). A PR may add a stub that a
 later PR completes, but never one that a test depends on. Modules grow across PRs: for
-example, `app.py` starts in S1-1 with the error table.
+example, `app.py` starts in S1-1 with the error table. Once `app.py` exists,
+`python -m seriatim_node` and the `seriatim-node` script call its `main()`. So until S1-12,
+`main()` is a placeholder that keeps the S0a behaviour: it prints S0a's message and exits 2.
+No TD ID depends on that placeholder.
 
 The proxy's request lifecycle (§3.3: admission, the body read, the watcher, the relay, the
 hold limit, and the shielded `finally` with its close proof, clean end, drain and `STUCK`)

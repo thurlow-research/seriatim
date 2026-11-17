@@ -1,0 +1,758 @@
+# Seriatim contract (ADR-001 D8 and Appendix A): the source of truth for every Seriatim-owned
+# endpoint, header, status and error code. Linted by tools/ci/contract_lint.py; the error
+# table in node/seriatim_node/app.py must equal x-seriatim-codes (TD-slice-1 K-OAS3).
+openapi: 3.1.0
+info:
+  title: Seriatim
+  version: 0.2.0
+  summary: One-at-a-time GPU gate for Ollama (sidecar + gateway contract)
+  license: { name: MIT, identifier: MIT }
+servers:
+  - url: http://127.0.0.1:11434
+    description: sidecar
+  - url: http://127.0.0.1:8434
+    description: gateway (example port)
+security:
+  - bearer: []
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+
+  # Machine-readable form of ADR-001 §5.4 (checked by K-OAS3). status null = in-stream only.
+  x-seriatim-codes:
+    GPU_BUSY:                  { status: 429, retryable: true,  replay_safe: true }
+    BAD_PATH:                  { status: 400, retryable: false, replay_safe: true }
+    AUTH_AMBIGUOUS:            { status: 400, retryable: false, replay_safe: true }
+    BAD_REQUEST_BODY:          { status: 400, retryable: false, replay_safe: true }
+    NUM_CTX_AMBIGUOUS:         { status: 400, retryable: false, replay_safe: true }
+    NUM_CTX_UNSUPPORTED_ROUTE: { status: 400, retryable: false, replay_safe: true }
+    NODE_REQUIRED:             { status: 400, retryable: false, replay_safe: true }
+    UNKNOWN_TASK:              { status: 400, retryable: false, replay_safe: true }
+    AUTH_MISSING:              { status: 401, retryable: false, replay_safe: true }
+    AUTH_INVALID:              { status: 401, retryable: false, replay_safe: true }
+    FORBIDDEN_SCOPE:           { status: 403, retryable: false, replay_safe: true }
+    NOT_FOUND:                 { status: 404, retryable: false, replay_safe: true }
+    MODEL_NOT_FOUND:           { status: 404, retryable: false, replay_safe: true }
+    METHOD_NOT_ALLOWED:        { status: 405, retryable: false, replay_safe: true }
+    REQUEST_BODY_TIMEOUT:      { status: 408, retryable: true,  replay_safe: true }
+    UPLOAD_INTERRUPTED:        { status: 408, retryable: true,  replay_safe: false }
+    BODY_TOO_LARGE:            { status: 413, retryable: false, replay_safe: true }
+    NUM_CTX_EXCEEDS_LIMIT:     { status: 422, retryable: false, replay_safe: true }
+    MODEL_SIZE_UNKNOWN:        { status: 422, retryable: false, replay_safe: true }
+    MODEL_NOT_ELIGIBLE:        { status: 422, retryable: false, replay_safe: true }
+    INTERNAL:                  { status: 500, retryable: true,  replay_safe: false }
+    UPSTREAM_UNAVAILABLE:      { status: 502, retryable: true,  replay_safe: true }
+    UPSTREAM_PROTOCOL_ERROR:   { status: 502, retryable: true,  replay_safe: false }
+    NODE_STARTING:             { status: 503, retryable: true,  replay_safe: true }
+    NODE_OFFLINE:              { status: 503, retryable: false, replay_safe: true }
+    EXPOSURE_UNVERIFIED:       { status: 503, retryable: true,  replay_safe: true }
+    OLLAMA_EXPOSED:            { status: 503, retryable: false, replay_safe: true }
+    NODE_SATURATED:            { status: 503, retryable: true,  replay_safe: true }
+    DISCOVERY_INCOMPLETE:      { status: 503, retryable: true,  replay_safe: true }
+    SIZE_POLICY_MISSING:       { status: 503, retryable: false, replay_safe: true }
+    GPU_OFFLINE:               { status: 503, retryable: false, replay_safe: true }
+    FLEET_UNAVAILABLE:         { status: 503, retryable: true,  replay_safe: true }
+    LOCK_HOLD_EXCEEDED:        { status: 504, retryable: true,  replay_safe: false }
+    HTTP_VERSION_UNSUPPORTED:  { status: 505, retryable: false, replay_safe: true }
+    UPSTREAM_STREAM_BROKEN:    { status: null, retryable: true, replay_safe: false }
+
+  headers:
+    Retry-After:
+      description: Whole seconds before retrying.
+      required: true
+      schema: { type: string, pattern: '^[0-9]+$' }
+    X-Seriatim-Gate:
+      schema: { type: string, enum: [acquired, ungated, busy, refused] }
+    X-Seriatim-Node:
+      schema: { type: string, pattern: '^[a-z0-9][a-z0-9-]{0,31}$' }
+    X-Seriatim-Partial:
+      schema: { type: string }
+    X-Request-Id:
+      schema: { type: string, pattern: '^[A-Za-z0-9._-]{1,128}$' }
+    X-Rerouted-From:
+      schema: { type: string }
+    X-Reroute-Reason:
+      schema: { type: string, enum: [busy, offline, starting, saturated, exposure, num_ctx_limit, unreachable] }
+
+  schemas:
+    ErrorCode:
+      type: string
+      enum: [GPU_BUSY, BAD_PATH, AUTH_AMBIGUOUS, BAD_REQUEST_BODY, NUM_CTX_AMBIGUOUS,
+             NUM_CTX_UNSUPPORTED_ROUTE, NODE_REQUIRED, UNKNOWN_TASK, AUTH_MISSING, AUTH_INVALID,
+             FORBIDDEN_SCOPE, NOT_FOUND, MODEL_NOT_FOUND, METHOD_NOT_ALLOWED,
+             REQUEST_BODY_TIMEOUT, UPLOAD_INTERRUPTED, BODY_TOO_LARGE, NUM_CTX_EXCEEDS_LIMIT, MODEL_SIZE_UNKNOWN,
+             MODEL_NOT_ELIGIBLE, INTERNAL, UPSTREAM_UNAVAILABLE, UPSTREAM_PROTOCOL_ERROR, NODE_STARTING,
+             EXPOSURE_UNVERIFIED, OLLAMA_EXPOSED, NODE_SATURATED, DISCOVERY_INCOMPLETE,
+             GPU_OFFLINE, FLEET_UNAVAILABLE, LOCK_HOLD_EXCEEDED, HTTP_VERSION_UNSUPPORTED, UPSTREAM_STREAM_BROKEN,
+             SIZE_POLICY_MISSING, NODE_OFFLINE]
+    ErrorEnvelope:
+      description: Every error Seriatim itself produces.
+      type: object
+      required: [error, error_code, retryable, replay_safe, source]
+      properties:
+        error: { type: string, description: Human-readable; same key Ollama uses }
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        retryable: { type: boolean }
+        replay_safe: { type: boolean, description: True only if Ollama never received the request }
+        retry_after: { type: integer, minimum: 0 }
+        source: { type: string, enum: [sidecar, gateway] }
+        node: { type: string }
+        busy_for_s: { type: number, minimum: 0 }
+        limit: { type: integer, minimum: 1 }
+        hint: { type: string }
+        nodes:
+          description: >
+            Routing errors (SPEC REQ-32) only, including GPU_OFFLINE, which is now only ever a
+            routing error (the fleet-wide case is FLEET_UNAVAILABLE). One verdict for every
+            configured node. Reasons never carry the operator's offline reason or a key id.
+          type: array
+          items:
+            type: object
+            required: [id, verdict, reason]
+            properties:
+              id: { type: string }
+              verdict: { type: string, enum: [eligible, not_eligible, no_size_policy, size_unknown, model_absent, discovery_unknown, offline, unhealthy] }
+              lists_model: { type: [boolean, 'null'], description: null means unknown (SPEC REQ-32) }
+              rule_verdict: { type: [string, 'null'], enum: [eligible, not_eligible, no_size_policy, size_unknown, null], description: the rules applied to last known metadata; set for offline and unhealthy nodes; null unless lists_model is true (SPEC REQ-32) }
+              reason: { type: string, description: a fixed reason such as listed_only, offline_admin or admin_state_reconciling; never operator text or a key id }
+            additionalProperties: false
+            if:
+              not: { required: [lists_model], properties: { lists_model: { const: true } } }
+            then:
+              properties: { rule_verdict: { const: null } }
+      additionalProperties: false
+      allOf:
+        - if:
+            properties:
+              error_code: { enum: [DISCOVERY_INCOMPLETE, MODEL_NOT_FOUND, GPU_OFFLINE, SIZE_POLICY_MISSING, MODEL_SIZE_UNKNOWN, MODEL_NOT_ELIGIBLE] }
+              source: { const: gateway }
+            required: [error_code, source]
+          then:
+            required: [nodes]
+            properties: { nodes: { minItems: 1 } }
+    UpstreamError:
+      description: >
+        An error produced by Ollama, passed through unchanged (status and bytes). Seriatim does
+        not constrain it; Ollama's usual shape is shown for client authors.
+      type: object
+      properties:
+        error: { type: string }
+    StreamErrorRecord:
+      description: >
+        Final NDJSON line, or SSE data payload, sent only when framing is safe (SPEC REQ-24);
+        always followed by an aborted connection.
+      type: object
+      required: [error, error_code]
+      properties:
+        error: { type: string }
+        error_code: { type: string, enum: [UPSTREAM_STREAM_BROKEN, LOCK_HOLD_EXCEEDED] }
+      additionalProperties: false
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, degraded, offline] }
+        reasons:
+          type: array
+          items:
+            type: string
+            enum: [ollama_unreachable, ollama_bad_response, slot_overdue, slot_stuck,
+                   starting, ollama_exposed, exposure_unverified, no_healthy_node,
+                   offline_admin]
+      additionalProperties: false
+    Slot:
+      type: object
+      required: [state]
+      properties:
+        state: { type: string, enum: [free, held, draining, stuck] }
+        path: { type: [string, 'null'], description: null for infer keys (redacted) }
+        model: { type: [string, 'null'], description: null for infer keys (redacted) }
+        request_id: { type: [string, 'null'], description: null for infer keys (redacted) }
+        started_at: { type: [string, 'null'], format: date-time }
+        elapsed_s: { type: [number, 'null'], minimum: 0 }
+        drain_remaining_s: { type: [number, 'null'], minimum: 0 }
+    NodeStatus:
+      type: object
+      required: [node, version, starting, admin_state, slots, capacity, loaded_models, ollama]
+      properties:
+        node: { type: string }
+        admin_state: { $ref: '#/components/schemas/AdminState' }
+        version: { type: string }
+        starting: { type: boolean }
+        slots: { type: array, items: { $ref: '#/components/schemas/Slot' } }
+        capacity: { $ref: '#/components/schemas/Capacity' }
+        loaded_models:
+          description: Ollama /api/ps "models", unchanged; null (with loaded_models_error) if unavailable.
+          type: [array, 'null']
+          items: { type: object }
+        loaded_models_error: { type: string }
+        ollama:
+          type: object
+          required: [reachable, exposure]
+          properties:
+            reachable: { type: boolean }
+            version: { type: [string, 'null'] }
+            exposure: { type: string, enum: [local_only, exposed, unverified] }
+    SeriatimModels:
+      description: Per-node model detail (SPEC REQ-38), kept off the standard /api/tags.
+      type: object
+      required: [models, partial]
+      properties:
+        models:
+          type: array
+          items:
+            type: object
+            required: [name, nodes, digests_differ]
+            properties:
+              name: { type: string }
+              digests_differ: { type: boolean }
+              nodes:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  required: [id, digest, size, parameter_size, modified_at]
+                  properties:
+                    id: { type: string }
+                    digest: { type: string }
+                    size: { type: integer, minimum: 0 }
+                    parameter_size: { type: [string, 'null'] }
+                    modified_at: { type: string }
+                  additionalProperties: false
+            additionalProperties: false
+        partial: { type: array, items: { type: string }, description: nodes that did not answer }
+      additionalProperties: false
+    SelectRequest:
+      type: object
+      required: [task]
+      properties:
+        task: { type: string }
+        context_tokens: { type: integer, minimum: 1 }
+      additionalProperties: false
+    AdminState:
+      description: The node's admin offline/online switch (SPEC REQ-19a). The sidecar is the source of truth.
+      type: object
+      required: [offline, reason, since, changed_by, epoch, revision]
+      properties:
+        offline: { type: boolean }
+        epoch: { type: string, pattern: '^[0-9a-f]{32}$', description: new on init-state and on every recovery from lost or unreadable state (SPEC REQ-19a) }
+        revision: { type: integer, minimum: 0, description: persisted; starts at 0 in each epoch and increments on every committed change; ordered only within an epoch }
+        reason: { type: [string, 'null'], maxLength: 200, description: null for infer keys (redacted) }
+        since: { type: [string, 'null'], format: date-time }
+        changed_by: { type: [string, 'null'], description: key id, never the key; null for infer keys (redacted) }
+      additionalProperties: false
+    AdminOfflineRequest:
+      description: >
+        No body, {} and {"reason": null} all mean no reason (SPEC REQ-19a). The pattern is a
+        portable subset check with ECMA-262 semantics, where $ matches only at the end.
+        Python's re lets $ match before a final newline, so "x\n" passes it there. The
+        authoritative rule is x-seriatim-reason-chars, which the contract tests (K-OAS)
+        enforce at the endpoint, with cases for a trailing newline, control, format and
+        non-ASCII space characters.
+      x-seriatim-reason-chars: every character in Unicode general category L, M, N, P or S, or U+0020
+      type: object
+      properties:
+        reason:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 200
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
+      additionalProperties: false
+    Capacity:
+      description: >
+        Measured capacity (SPEC REQ-16). Information only in Phase 1; routing uses the
+        operator's rules. Figures are null unless measured; never estimated. Every failure,
+        on any platform, is source unavailable. Arithmetic that JSON Schema can't express is
+        checked by the contract tests (K-CAP): free_bytes <= total_bytes and usable_bytes <=
+        total_bytes on each device, and on NVIDIA the top-level usable_bytes equals the
+        largest device's.
+      type: object
+      required: [source, usable_bytes, devices, default_num_ctx, kv_cache_type, flash_attention, measured_at]
+      properties:
+        source: { type: string, enum: [nvidia-smi, apple-metal, none, unavailable] }
+        basis:
+          type: [string, 'null']
+          enum: [free_plus_ollama, free_plus_ps, free_only, recommended_working_set, wired_limit, null]
+        transition: { type: boolean, description: nvidia-smi only; inventories disagreed on every retry }
+        usable_bytes: { type: [integer, 'null'], minimum: 0, description: largest device on NVIDIA }
+        error: { type: string }
+        warnings: { type: array, items: { type: string } }
+        total_bytes: { type: [integer, 'null'], minimum: 0 }
+        wired_limit_mb: { type: [integer, 'null'], minimum: 0, description: apple-metal only; 0 when unset }
+        memory_pressure: { type: [string, 'null'], enum: [normal, warn, critical, null], description: apple-metal only; null when unreadable or unmapped }
+        pressure_error: { type: string }
+        default_num_ctx: { type: [integer, 'null'], minimum: 1 }
+        kv_cache_type: { type: [string, 'null'], description: as configured; reported only }
+        flash_attention: { type: [boolean, 'null'] }
+        measured_at: { type: string, format: date-time }
+        devices:
+          type: array
+          items:
+            type: object
+            required: [index, uuid, name, total_bytes, used_bytes, free_bytes, ollama_used_bytes, usable_bytes, basis]
+            properties:
+              index: { type: integer, minimum: 0 }
+              uuid: { type: string, description: as reported by nvidia-smi (sanitised in fixtures) }
+              name: { type: string }
+              total_bytes: { type: integer, minimum: 0 }
+              used_bytes: { type: integer, minimum: 0 }
+              free_bytes: { type: integer, minimum: 0 }
+              ollama_used_bytes: { type: [integer, 'null'], minimum: 0, description: attributed (free_plus_ollama), credited from /api/ps (free_plus_ps), or null (free_only) }
+              usable_bytes: { type: integer, minimum: 0 }
+              basis: { type: string, enum: [free_plus_ollama, free_plus_ps, free_only] }
+            additionalProperties: false
+      allOf:
+        - if: { properties: { source: { const: nvidia-smi } } }
+          then:
+            required: [basis]
+            properties:
+              usable_bytes: { type: integer }
+              basis: { enum: [free_plus_ollama, free_plus_ps, free_only] }
+              devices: { minItems: 1 }
+        - if: { properties: { source: { const: apple-metal } } }
+          then:
+            required: [basis, total_bytes, wired_limit_mb, memory_pressure]
+            properties:
+              usable_bytes: { type: integer }
+              total_bytes: { type: integer }
+              basis: { enum: [recommended_working_set, wired_limit] }
+              devices: { maxItems: 0 }
+        - if: { properties: { source: { enum: [none, unavailable] } } }
+          then:
+            properties:
+              usable_bytes: { type: 'null' }
+              basis: { type: 'null' }
+              devices: { maxItems: 0 }
+        - if: { properties: { source: { const: unavailable } } }
+          then:
+            required: [error]
+        - if:
+            required: [source, memory_pressure]
+            properties: { source: { const: apple-metal }, memory_pressure: { type: 'null' } }
+          then:
+            required: [pressure_error]
+    SelectResponse:
+      type: object
+      required: [model, node, eligibility_basis, reasons, alternatives]
+      properties:
+        model: { type: string }
+        node: { type: string, description: always eligible (SPEC REQ-39) }
+        eligibility_basis: { type: string, enum: [eligible_nodes, unlimited, max_params_b] }
+        context_tokens: { type: integer, minimum: 1, description: echoed; does not affect the choice in Phase 1 }
+        reasons: { type: array, items: { type: string } }
+        alternatives:
+          description: Every other configured node, for the chosen model.
+          type: array
+          items:
+            type: object
+            required: [node, verdict, reason]
+            properties:
+              node: { type: string }
+              verdict: { type: string, enum: [eligible, not_eligible, no_size_policy, size_unknown, model_absent, discovery_unknown, offline, unhealthy] }
+              reason: { type: string }
+            additionalProperties: false
+      additionalProperties: false
+
+  responses:
+    NodeAdminResult:
+      description: The sidecar confirmed the change (SPEC REQ-42a).
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [node, admin_state]
+            properties:
+              node: { type: string }
+              admin_state: { $ref: '#/components/schemas/AdminState' }
+            additionalProperties: false
+    Busy:
+      description: >
+        Either Seriatim's admission 429 (X-Seriatim-Gate busy, ErrorEnvelope with GPU_BUSY;
+        Ollama did not receive the request) or Ollama's own 429 passed through
+        (X-Seriatim-Gate acquired, UpstreamError). Only the first triggers spill-over.
+      headers:
+        Retry-After: { description: Always present on the admission 429, schema: { type: string, pattern: '^[0-9]+$' } }
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+              - $ref: '#/components/schemas/UpstreamError'
+    Unavailable:
+      description: >
+        Seriatim 503 (NODE_STARTING, EXPOSURE_UNVERIFIED, NODE_SATURATED, DISCOVERY_INCOMPLETE
+        and FLEET_UNAVAILABLE carry Retry-After; OLLAMA_EXPOSED, SIZE_POLICY_MISSING,
+        NODE_OFFLINE and GPU_OFFLINE do not), or Ollama's own 503 passed through.
+      headers:
+        Retry-After: { schema: { type: string, pattern: '^[0-9]+$' } }
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+              - $ref: '#/components/schemas/UpstreamError'
+    Error:
+      description: >
+        A Seriatim-produced error (ADR-001 §5.4), or, on proxied routes, Ollama's own error
+        with the same status passed through. A body with error_code is Seriatim's.
+      headers:
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/ErrorEnvelope'
+              - $ref: '#/components/schemas/UpstreamError'
+    Unauthorized:
+      description: Missing or invalid key.
+      headers:
+        WWW-Authenticate: { schema: { type: string, const: Bearer } }
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    Passthrough:
+      description: >
+        Ollama's response: status and body bytes unchanged. Its JSON is arbitrary and is not
+        constrained here; Ollama's own errors usually have the shape of UpstreamError, shown
+        for client authors only. Streams are forwarded incrementally; a mid-stream failure
+        ends with a StreamErrorRecord when framing is safe, then an aborted connection.
+      headers:
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content:
+        application/json: {}
+        application/x-ndjson: {}
+        text/event-stream: {}
+        text/plain: {}
+        application/octet-stream: {}
+    MergedView:
+      description: >
+        A gateway merged view (SPEC REQ-38): exactly Ollama's or OpenAI's response shape, with
+        no added fields, validated against the shape S0b recorded from the pinned Ollama
+        version. A partial result is flagged only by X-Seriatim-Partial. At the sidecar the
+        same route is a plain Passthrough, with X-Seriatim-Node naming the node; the gateway
+        sends no X-Seriatim-Node on a merged view, which has no single node.
+      headers:
+        X-Seriatim-Partial: { $ref: '#/components/headers/X-Seriatim-Partial' }
+        X-Seriatim-Node: { $ref: '#/components/headers/X-Seriatim-Node' }
+        X-Seriatim-Gate: { $ref: '#/components/headers/X-Seriatim-Gate' }
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+      content:
+        application/json: {}
+
+  x-seriatim-gated-operation: &gated
+    x-seriatim-gate: gated
+    x-seriatim-scope: infer
+    requestBody:
+      description: Opaque Ollama request; forwarded byte-for-byte. The sidecar may read
+        `num_ctx` and `options.num_ctx` (SPEC REQ-8, REQ-9); the gateway reads `model`
+        (SPEC REQ-32). Neither ever rewrites the body.
+      content: { application/json: {} }
+    responses:
+      '200': { $ref: '#/components/responses/Passthrough' }
+      '400': { $ref: '#/components/responses/Error' }
+      '401': { $ref: '#/components/responses/Unauthorized' }
+      '403': { $ref: '#/components/responses/Error' }
+      '404': { $ref: '#/components/responses/Error' }
+      '408': { $ref: '#/components/responses/Error' }
+      '413': { $ref: '#/components/responses/Error' }
+      '422': { $ref: '#/components/responses/Error' }
+      '429': { $ref: '#/components/responses/Busy' }
+      '500': { $ref: '#/components/responses/Error' }
+      '502': { $ref: '#/components/responses/Error' }
+      '503': { $ref: '#/components/responses/Unavailable' }
+      '504': { $ref: '#/components/responses/Error' }
+      '505': { $ref: '#/components/responses/Error' }
+      default: { $ref: '#/components/responses/Passthrough' }
+  x-seriatim-ungated-operation: &ungated
+    x-seriatim-gate: ungated
+    x-seriatim-scope: infer
+    responses:
+      '200': { $ref: '#/components/responses/Passthrough' }
+      '400': { $ref: '#/components/responses/Error' }
+      '401': { $ref: '#/components/responses/Unauthorized' }
+      '403': { $ref: '#/components/responses/Error' }
+      '404': { $ref: '#/components/responses/Error' }
+      '408': { $ref: '#/components/responses/Error' }
+      '413': { $ref: '#/components/responses/Error' }
+      '502': { $ref: '#/components/responses/Error' }
+      '503': { $ref: '#/components/responses/Unavailable' }
+      '505': { $ref: '#/components/responses/Error' }
+      default: { $ref: '#/components/responses/Passthrough' }
+  x-seriatim-merged-operation: &merged
+    x-seriatim-gate: ungated
+    x-seriatim-scope: infer
+    x-seriatim-gateway-merge: REQ-38
+    responses:
+      '200': { $ref: '#/components/responses/MergedView' }
+      '400': { $ref: '#/components/responses/Error' }
+      '401': { $ref: '#/components/responses/Unauthorized' }
+      '403': { $ref: '#/components/responses/Error' }
+      '404': { $ref: '#/components/responses/Error' }
+      '408': { $ref: '#/components/responses/Error' }
+      '413': { $ref: '#/components/responses/Error' }
+      '502': { $ref: '#/components/responses/Error' }
+      '503': { $ref: '#/components/responses/Unavailable' }
+      '505': { $ref: '#/components/responses/Error' }
+      default: { $ref: '#/components/responses/Passthrough' }
+  x-seriatim-admin-operation: &admin
+    x-seriatim-gate: ungated
+    x-seriatim-scope: admin
+    responses:
+      '200': { $ref: '#/components/responses/Passthrough' }
+      '400': { $ref: '#/components/responses/Error' }
+      '401': { $ref: '#/components/responses/Unauthorized' }
+      '403': { $ref: '#/components/responses/Error' }
+      '404': { $ref: '#/components/responses/Error' }
+      '408': { $ref: '#/components/responses/Error' }
+      '413': { $ref: '#/components/responses/Error' }
+      '502': { $ref: '#/components/responses/Error' }
+      '503': { $ref: '#/components/responses/Unavailable' }
+      '505': { $ref: '#/components/responses/Error' }
+      default: { $ref: '#/components/responses/Passthrough' }
+
+# Unlisted method+path pairs are gated and need the admin scope (SPEC REQ-5).
+x-seriatim-unknown-endpoint: { x-seriatim-gate: gated, x-seriatim-scope: admin }
+
+paths:
+  /seriatim/health:
+    get:
+      x-seriatim-roles: [sidecar, gateway]
+      x-seriatim-scope: none
+      security: []
+      responses:
+        '200': { description: Healthy, content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }
+        '503': { description: Degraded, content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }
+  /seriatim/status:
+    get:
+      x-seriatim-roles: [sidecar]
+      x-seriatim-scope: infer
+      x-seriatim-redaction: For infer keys, admin_state.reason, admin_state.changed_by and every slot's path, model and request_id are null (SPEC REQ-5).
+      responses:
+        '200': { description: Node status, content: { application/json: { schema: { $ref: '#/components/schemas/NodeStatus' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '505': { $ref: '#/components/responses/Error' }
+  /seriatim/admin/offline:
+    post:
+      x-seriatim-roles: [sidecar]
+      x-seriatim-scope: admin
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: '#/components/schemas/AdminOfflineRequest' } } }
+      responses:
+        '200': { description: The resulting state, content: { application/json: { schema: { $ref: '#/components/schemas/AdminState' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '505': { $ref: '#/components/responses/Error' }
+  /seriatim/admin/online:
+    post:
+      x-seriatim-roles: [sidecar]
+      x-seriatim-scope: admin
+      responses:
+        '200': { description: The resulting state, content: { application/json: { schema: { $ref: '#/components/schemas/AdminState' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '505': { $ref: '#/components/responses/Error' }
+  /seriatim/admin/nodes/{id}/offline:
+    post:
+      x-seriatim-roles: [gateway]
+      x-seriatim-scope: admin
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: '#/components/schemas/AdminOfflineRequest' } } }
+      responses:
+        '200': { $ref: '#/components/responses/NodeAdminResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+        '505': { $ref: '#/components/responses/Error' }
+  /seriatim/admin/nodes/{id}/online:
+    post:
+      x-seriatim-roles: [gateway]
+      x-seriatim-scope: admin
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200': { $ref: '#/components/responses/NodeAdminResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+        '505': { $ref: '#/components/responses/Error' }
+  /seriatim/nodes:
+    get:
+      x-seriatim-roles: [gateway]
+      x-seriatim-scope: infer
+      x-seriatim-redaction: For infer keys, each admin_state.reason and changed_by, and the embedded status's slot details, are null (SPEC REQ-5).
+      responses:
+        '200':
+          description: Per-node health and status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [nodes, config]
+                properties:
+                  config:
+                    description: Live-reload state (SPEC REQ-45)
+                    type: object
+                    required: [loaded_at]
+                    properties:
+                      loaded_at: { type: string, format: date-time }
+                      last_error: { type: [string, 'null'] }
+                      last_error_at: { type: [string, 'null'], format: date-time }
+                  nodes:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, healthy, admin_state, reconciling, priority, size_policy, eligible_for_models, capacity, loaded, ollama_version, warnings, last_check, status]
+                      properties:
+                        id: { type: string }
+                        healthy: { type: boolean }
+                        admin_state:
+                          description: As last reported by the node's sidecar; null if never read.
+                          oneOf:
+                            - $ref: '#/components/schemas/AdminState'
+                            - type: 'null'
+                        priority: { type: integer }
+                        size_policy: { type: string, enum: [unlimited, listed_only, max_params_b, none], description: the node's own rule; eligible-nodes lists are in eligible_for_models }
+                        ollama_version: { type: [string, 'null'] }
+                        max_params_b: { type: [number, 'null'] }
+                        eligible_for_models: { type: array, items: { type: string }, description: models whose eligible-nodes list names this node }
+                        capacity:
+                          description: The node's last Capacity report, shown next to the configured rules; null if it could not be read.
+                          oneOf:
+                            - $ref: '#/components/schemas/Capacity'
+                            - type: 'null'
+                        capacity_error: { type: string, description: required when capacity is null }
+                        loaded:
+                          description: From the node's /api/ps. size_vram < size means part of the model is on the CPU.
+                          type: [array, 'null']
+                          items:
+                            type: object
+                            required: [model, size, size_vram]
+                            properties:
+                              model: { type: string }
+                              size: { type: integer, minimum: 0 }
+                              size_vram: { type: integer, minimum: 0 }
+                        warnings: { type: array, items: { type: string } }
+                        reconciling: { type: boolean, description: true while the gateway reconciles a new epoch; the node is out of routing (SPEC REQ-42a) }
+                        last_check: { type: [string, 'null'], format: date-time, description: null until the first check of a new node }
+                        status:
+                          description: The node's last status, fetched with its admin key and redacted for infer keys; null if never read.
+                          oneOf:
+                            - $ref: '#/components/schemas/NodeStatus'
+                            - type: 'null'
+                      allOf:
+                        - if: { properties: { capacity: { type: 'null' } }, required: [capacity] }
+                          then: { required: [capacity_error] }
+                        - if: { properties: { size_policy: { const: max_params_b } } }
+                          then:
+                            required: [max_params_b]
+                            properties: { max_params_b: { type: number, exclusiveMinimum: 0 } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '505': { $ref: '#/components/responses/Error' }
+  /seriatim/models:
+    get:
+      x-seriatim-roles: [gateway]
+      x-seriatim-scope: infer
+      responses:
+        '200': { description: Per-node model detail, content: { application/json: { schema: { $ref: '#/components/schemas/SeriatimModels' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        '505': { $ref: '#/components/responses/Error' }
+  /models/select:
+    get:
+      x-seriatim-roles: [gateway]
+      x-seriatim-scope: infer
+      parameters:
+        - { name: task, in: query, required: true, schema: { type: string } }
+        - { name: context_tokens, in: query, schema: { type: integer, minimum: 1 } }
+      responses:
+        '200': { description: Selection, content: { application/json: { schema: { $ref: '#/components/schemas/SelectResponse' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        '505': { $ref: '#/components/responses/Error' }
+    post:
+      x-seriatim-roles: [gateway]
+      x-seriatim-scope: infer
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SelectRequest' } } } }
+      responses:
+        '200': { description: Selection, content: { application/json: { schema: { $ref: '#/components/schemas/SelectResponse' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Error' }
+        '408': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        '505': { $ref: '#/components/responses/Error' }
+
+  # Ungated, infer scope. At the sidecar these are raw passthrough. At the gateway,
+  # /api/tags, /api/ps, /api/version and /v1/models are merged (SPEC REQ-38), but each body
+  # has exactly Ollama's or OpenAI's schema, with no added fields; a partial result is
+  # flagged only by X-Seriatim-Partial. Per-node detail is on /seriatim/models and
+  # /seriatim/nodes.
+  # At the gateway, / answers 200 "Ollama is running" if at least one node is healthy, else 503.
+  /:            { get: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] }, head: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
+  /api/tags:    { get: { <<: *merged, x-seriatim-roles: [sidecar, gateway] } }
+  /api/ps:      { get: { <<: *merged, x-seriatim-roles: [sidecar, gateway] } }
+  /api/version: { get: { <<: *merged, x-seriatim-roles: [sidecar, gateway] } }
+  /api/show:    { post: { <<: *ungated, x-seriatim-roles: [sidecar, gateway] } }
+  /v1/models:   { get: { <<: *merged, x-seriatim-roles: [sidecar, gateway] } }
+
+  # Gated inference, infer scope (REQ-5).
+  /api/generate:        { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
+  /api/chat:            { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
+  /api/embed:           { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
+  /api/embeddings:      { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
+  /v1/chat/completions: { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
+  /v1/completions:      { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
+  /v1/embeddings:       { post: { <<: *gated, x-seriatim-roles: [sidecar, gateway] } }
+
+  # Ungated, admin scope (REQ-14). Through the gateway they need X-Seriatim-Node (REQ-41).
+  /api/pull:   { post: { <<: *admin, x-seriatim-roles: [sidecar, gateway] } }
+  /api/push:   { post: { <<: *admin, x-seriatim-roles: [sidecar, gateway] } }
+  # create converts and quantises models, which loads the machine, so it is gated (admin scope).
+  /api/create: { post: { <<: *gated, x-seriatim-scope: admin, x-seriatim-roles: [sidecar, gateway] } }
+  /api/copy:   { post: { <<: *admin, x-seriatim-roles: [sidecar, gateway] } }
+  /api/delete: { delete: { <<: *admin, x-seriatim-roles: [sidecar, gateway] } }
+  /api/blobs/{digest}:
+    parameters:
+      - { name: digest, in: path, required: true, schema: { type: string, pattern: '^sha256:[0-9a-f]{64}$' } }
+    head: { <<: *admin, x-seriatim-roles: [sidecar, gateway] }
+    post: { <<: *admin, x-seriatim-roles: [sidecar, gateway] }
