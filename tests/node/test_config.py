@@ -13,6 +13,8 @@ from seriatim_node import config
 from seriatim_node.config import ConfigError, Settings, default_lock_dir, load_settings
 
 P = "SERIATIM_NODE_"
+# The tests feed this to the validator to check it is refused; nothing binds to it.
+ALL_INTERFACES = "0.0.0.0"  # nosec B104 # a test input for the listen-address check, never bound
 FLOAT_FIELDS = [name for name, f in Settings.model_fields.items() if f.annotation is float]
 
 
@@ -122,7 +124,7 @@ def test_out_of_range_or_wrong_type(key, value):
         "http://192.0.2.5:11435",
         "http://example.com:11435",
         "http://localhost:11435",
-        "http://0.0.0.0:11435",
+        f"http://{ALL_INTERFACES}:11435",
         "https://127.0.0.1:11435",
         "http://127.0.0.1:11435/x",
         "http://127.0.0.1:11435/?a",
@@ -169,10 +171,10 @@ def test_the_real_environment_is_never_read(monkeypatch):
 
 @pytest.mark.td("C5")
 def test_non_loopback_listen_needs_allow_unauthenticated(caplog):
-    refused(env(listen_host="0.0.0.0"), P + "LISTEN_HOST")
+    refused(env(listen_host=ALL_INTERFACES), P + "LISTEN_HOST")
     with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
-        s = load_settings(env(listen_host="0.0.0.0", allow_unauthenticated="true"))
-    assert s.listen_host == "0.0.0.0"
+        s = load_settings(env(listen_host=ALL_INTERFACES, allow_unauthenticated="true"))
+    assert s.listen_host == ALL_INTERFACES
     assert s.allow_unauthenticated is True
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert [w.getMessage() for w in warnings] == [
@@ -348,7 +350,7 @@ def test_dotenv_is_ignored(tmp_path, monkeypatch):
 
 @pytest.mark.td("C11")
 @pytest.mark.parametrize(
-    "host", ["192.0.2.10", "::", "example.com", "localhost", "0.0.0.0", "::ffff:127.0.0.1", ""]
+    "host", ["192.0.2.10", "::", "example.com", "localhost", ALL_INTERFACES, "::ffff:127.0.0.1", ""]
 )
 def test_listen_host_refused(host):
     err = refused(env(listen_host=host), P + "LISTEN_HOST")
