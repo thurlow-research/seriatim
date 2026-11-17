@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -92,13 +93,17 @@ def test_every_problem_is_reported(tmp_path):
     [
         f"call()  {NOSEC} B603 # fixed argument list",
         f"call()  {NOSEC} B603, B607 # fixed argument list",
-        f"call()  {NOSEC} # reviewed: constant input",
-        f"call()  {NOSEC.upper()} B310 #why",
+        f"call()  {NOSEC} B603 , B607 # spaces either side of the comma",
+        f"call()  # see below {NOSEC} B603 # after other comment text",
+        f"call()  {NOSEC.upper()} B310 #not a suppression: Bandit reads lowercase only",
         f"s = '{NOSEC} B603'  # a string, not a comment",
     ],
 )
-def test_nosec_with_a_reason_passes(line):
+def test_well_formed_nosec_passes(line):
     assert si.nosec_problems("x.py", line + "\n") == []
+
+
+FORM = "x.py:2: '# nosec' must name known test ids and give a reason, as '# nosec B603 # <reason>'"
 
 
 @pytest.mark.parametrize(
@@ -109,12 +114,86 @@ def test_nosec_with_a_reason_passes(line):
         f"call()  {NOSEC} B603 - fixed list",
         f"call()  {NOSEC} B603 #",
         f"call()  {NOSEC}: B603 fixed list",
+        f"call()  {NOSEC}: B603 # a colon Bandit accepts",
+        # Bandit 1.9.4 reads these as suppressions too (#25 review):
+        f"call()  {NOSEC}B602 # no space",
+        f"call()  {NOSEC}urity review pending",
+        f"call()  {NOSEC} b602 # lowercase id, which Bandit drops",
+        # No id: Bandit suppresses every finding on the line (#25 re-review).
+        f"call()  {NOSEC} # reviewed: constant input",
+        f"call()  {NOSEC} # B603: an id after the second # is reason text",
+        f"call()  {NOSEC} subprocess_popen_with_shell_equals_true # a test name, not an id",
     ],
 )
-def test_nosec_without_a_reason_fails(line):
-    assert si.nosec_problems("x.py", "a = 1\n" + line + "\n") == [
-        "x.py:2: '# nosec' needs a reason on the same line, as '# nosec B603 # <reason>'"
+def test_malformed_nosec_fails(line):
+    assert si.nosec_problems("x.py", "a = 1\n" + line + "\n") == [FORM]
+
+
+@pytest.mark.parametrize(
+    ("ids", "unknown"),
+    [("B999", "B999"), ("B602, B999", "B999"), ("B000, B998", "B000, B998")],
+)
+def test_nosec_with_an_unknown_test_id_fails(ids, unknown):
+    # Bandit drops unknown ids; with none left, it suppresses every finding on the line.
+    assert si.nosec_problems("x.py", f"a = 1\ncall()  {NOSEC} {ids} # reason\n") == [
+        f"x.py:2: '# nosec' names {unknown}, which Bandit 1.9.4 doesn't know; Bandit "
+        "ignores unknown ids, so it could suppress every finding on the line"
     ]
+
+
+def test_nosec_ids_without_a_space_after_the_comma_fail():
+    # Bandit captures only the last id of "B602,B603", so B602 would not be suppressed.
+    assert si.nosec_problems("x.py", f"call()  {NOSEC} B602,B603 # reason\n") == [
+        "x.py:1: Bandit reads this '# nosec' as ['B603'], not ['B602', 'B603']; "
+        "separate test ids with ', '"
+    ]
+
+
+def test_bandit_regexes_and_ids_match_the_installed_bandit():
+    bandit_manager = pytest.importorskip("bandit.core.manager")
+    from bandit.core import extension_loader
+
+    assert pytest.importorskip("bandit").__version__ == "1.9.4"
+    assert si.BANDIT_NOSEC.pattern == bandit_manager.NOSEC_COMMENT.pattern
+    assert si.BANDIT_NOSEC.flags == bandit_manager.NOSEC_COMMENT.flags
+    assert si.BANDIT_NOSEC_TESTS.pattern == bandit_manager.NOSEC_COMMENT_TESTS.pattern
+    assert si.BANDIT_NOSEC_TESTS.flags == bandit_manager.NOSEC_COMMENT_TESTS.flags
+    m = extension_loader.MANAGER
+    known = set(m.plugins_by_id) | set(m.blacklist_by_id) | set(m.builtin)
+    assert known == si.BANDIT_TEST_IDS
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        "# nosec B602 # r",
+        "# nosec B602, B603 # r",
+        "# nosec # r",
+        "# nosec # B602 # r",
+        "# see below # nosec B603 # r",
+        "# nosecB602 # r",
+        "# nosec B999 # r",
+        "# nosec B602,B603 # r",
+        "# nosec: B602 # r",
+        "# not a suppression",
+    ],
+)
+def test_lint_agrees_with_bandit_on_what_is_suppressed(comment):
+    bandit_manager = pytest.importorskip("bandit.core.manager")
+    bandit_read = bandit_manager._parse_nosec_comment(comment)
+    problem = si.nosec_comment_problem(comment)
+    if bandit_read is None:
+        assert problem is None
+        return
+    m = si.BANDIT_NOSEC.search(comment)
+    form = si.NOSEC_FORM.match(comment, m.start())
+    if problem is None:
+        # Accepted: at least one id, and Bandit skips exactly the ids written.
+        written = set(re.findall(r"B[0-9]{3}", form.group("ids")))
+        assert written and bandit_read == written
+    else:
+        # Rejected only for a malformed comment, or one Bandit reads differently.
+        assert form is None or bandit_read != set(re.findall(r"B[0-9]{3}", form.group("ids")))
 
 
 def test_untokenizable_source_fails():

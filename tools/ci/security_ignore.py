@@ -16,12 +16,18 @@
 An entry with a missing, empty or unknown field, an unknown tool, a malformed id, an expiry
 that isn't a TOML date, or an expiry in the past fails the check. So does any other key.
 
-**Inline suppressions** need a reason on the same line, after a second `#`:
+**Inline suppressions** need known test ids and a reason on the same line, after a second `#`:
 
     call()  # nosec B603 # the arguments are a fixed list
+    call()  # nosec B603, B607 # the same, for two tests
 
 Bandit reads the test ids up to the second `#`, so the reason never reaches it as a test
-name. Only real comments count, read with `tokenize`; a string that contains the text doesn't.
+name. The lint finds suppressions exactly as Bandit 1.9.4 does (its regexes are copied below),
+so a form Bandit accepts, such as `nosecB602`, or `nosec` inside a longer word, can't slip
+past. It then fails on anything but the form above: on a suppression with no test id
+(`# nosec # <reason>`), and on any id Bandit doesn't know. Bandit drops unknown ids, and a
+suppression left with no known id silences every finding on its line. Only real comments
+count, read with `tokenize`; a string that contains the text doesn't.
 
 **exec** checks the ignore file first, so an expired exception fails every scanner job too.
 Then it runs the command with the tool's exceptions added: Bandit `--skip`, pip-audit
@@ -52,8 +58,23 @@ ID_RE = {
     "trivy": re.compile(r"^[A-Z][A-Z0-9]*(-[A-Za-z0-9]+)+$"),
 }
 FIELDS = {"tool", "id", "reason", "expires"}
-NOSEC_RE = re.compile(r"#\s*nosec\b(?P<rest>.*)$", re.I)
-NOSEC_OK_RE = re.compile(r"^\s*(?:[A-Z][0-9]{3}(?:\s*,\s*[A-Z][0-9]{3})*)?\s*#\s*\S")
+# Bandit 1.9.4, bandit/core/manager.py, copied verbatim: how Bandit finds a suppression
+# and reads its test ids (only the last id of a comma run without spaces is captured).
+BANDIT_NOSEC = re.compile(r"#\s*nosec:?\s*(?P<tests>[^#]+)?#?")
+BANDIT_NOSEC_TESTS = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
+# The one form the lint accepts, from where Bandit's match starts. At least one test id is
+# required: Bandit reads a suppression without one as covering every test on its line.
+NOSEC_FORM = re.compile(r"#\s*nosec(?P<ids>\s+B[0-9]{3}(?:\s*,\s*B[0-9]{3})*)\s*#\s*\S")
+NOSEC_FORM_HINT = "'# nosec B603 # <reason>'"
+# Every test id Bandit 1.9.4 knows (plugins, blacklist, builtin). A test compares this with
+# the installed Bandit, so a Bandit upgrade fails CI until this list is updated.
+BANDIT_TEST_IDS = frozenset(
+    "B001 B101 B102 B103 B104 B105 B106 B107 B108 B110 B112 B113 B201 B202 B301 B302 B303 "
+    "B304 B305 B306 B307 B308 B310 B311 B312 B313 B314 B315 B316 B317 B318 B319 B321 B323 "
+    "B324 B401 B402 B403 B404 B405 B406 B407 B408 B409 B411 B412 B413 B415 B501 B502 B503 "
+    "B504 B505 B506 B507 B508 B509 B601 B602 B603 B604 B605 B606 B607 B608 B609 B610 B611 "
+    "B612 B613 B614 B615 B701 B702 B703 B704".split()
+)
 
 
 class IgnoreError(Exception):
@@ -104,22 +125,40 @@ def load(path: Path = IGNORE_FILE, on: dt.date | None = None) -> list[dict]:
     return entries
 
 
+def nosec_comment_problem(comment: str) -> str | None:
+    """Why this comment is not an acceptable suppression, or None if Bandit sees none in it."""
+    m = BANDIT_NOSEC.search(comment)
+    if not m:
+        return None
+    form = NOSEC_FORM.match(comment, m.start())
+    if not form:
+        return f"'# nosec' must name known test ids and give a reason, as {NOSEC_FORM_HINT}"
+    written = re.findall(r"B[0-9]{3}", form.group("ids"))
+    unknown = sorted(set(written) - BANDIT_TEST_IDS)
+    if unknown:
+        return (
+            f"'# nosec' names {', '.join(unknown)}, which Bandit 1.9.4 doesn't know; Bandit "
+            "ignores unknown ids, so it could suppress every finding on the line"
+        )
+    read = {t.group(1) for t in BANDIT_NOSEC_TESTS.finditer(m.group("tests") or "")}
+    if read != set(written):
+        return (
+            f"Bandit reads this '# nosec' as {sorted(read)}, not {sorted(set(written))}; "
+            "separate test ids with ', '"
+        )
+    return None
+
+
 def nosec_problems(path: str, source: str) -> list[str]:
-    """Every `# nosec` comment in source that gives no reason after a second `#`."""
+    """Every comment Bandit would treat as a suppression that isn't in the accepted form."""
     problems = []
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
     except (tokenize.TokenError, SyntaxError) as e:
         return [f"{path}: cannot tokenize: {e}"]
     for tok in tokens:
-        if tok.type != tokenize.COMMENT:
-            continue
-        m = NOSEC_RE.search(tok.string)
-        if m and not NOSEC_OK_RE.match(m.group("rest")):
-            problems.append(
-                f"{path}:{tok.start[0]}: '# nosec' needs a reason on the same line, as "
-                "'# nosec B603 # <reason>'"
-            )
+        if tok.type == tokenize.COMMENT and (why := nosec_comment_problem(tok.string)):
+            problems.append(f"{path}:{tok.start[0]}: {why}")
     return problems
 
 
@@ -138,7 +177,7 @@ def lint() -> list[str]:
     for path in tracked_python():
         problems += nosec_problems(path, Path(path).read_text(encoding="utf-8"))
     if not problems:
-        print(f"{IGNORE_FILE}: {len(entries)} exception(s), every '# nosec' gives a reason")
+        print(f"{IGNORE_FILE}: {len(entries)} exception(s), every '# nosec' is well formed")
     return problems
 
 
