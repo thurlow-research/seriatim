@@ -1,7 +1,7 @@
-"""The GPU gate: slots, leases, the startup quarantine and the drain (TD-slice-1 §2.2, §3).
+"""Path safety, route classification, and the GPU gate (TD-slice-1 §2.2, §3).
 
-Path safety and classification (`check_raw_path`, `classify` and the route tables) are added
-here by S1-3.
+`check_raw_path` and `classify` work on the raw path bytes and never decode them (SPEC
+REQ-20a, REQ-5). The gate holds the slots, leases, the startup quarantine and the drain.
 
 Every method is synchronous and never awaits, so admission is atomic on the single event
 loop (TD §3.2). Times are monotonic (`clock`); the wall clock (`wall`) is only recorded in
@@ -11,10 +11,136 @@ loop (TD §3.2). Times are monotonic (`clock`); the wall clock (`wall`) is only 
 from __future__ import annotations
 
 import math
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
+
+# --- Path safety (SPEC REQ-20a) ------------------------------------------------------------
+
+
+class PathError(ValueError):
+    """The raw request path is refused before any routing (400 `BAD_PATH`)."""
+
+
+# Compared with the lower-cased raw path, so `%2E` and `%2e` are both refused.
+_FORBIDDEN_ESCAPES = (b"%2e", b"%2f", b"%5c", b"%00")
+
+
+def check_raw_path(raw_path: bytes) -> None:
+    """Raise PathError unless raw_path is safe to route and forward unchanged."""
+    if not raw_path.startswith(b"/"):
+        raise PathError("the path must start with /")
+    if b"//" in raw_path:
+        raise PathError("the path contains //")
+    if b"\\" in raw_path:
+        raise PathError("the path contains a backslash")
+    if any(b < 0x20 or b == 0x7F for b in raw_path):
+        raise PathError("the path contains a control byte")
+    if any(seg in (b".", b"..") for seg in raw_path.split(b"/")):
+        raise PathError("the path contains a . or .. segment")
+    lowered = raw_path.lower()
+    for escape in _FORBIDDEN_ESCAPES:
+        if escape in lowered:
+            raise PathError(f"the path contains {escape.decode()}")
+
+
+# --- Classification (SPEC REQ-5) -----------------------------------------------------------
+
+
+class Kind(StrEnum):
+    SERIATIM = "seriatim"
+    UNGATED = "ungated"
+    GATED = "gated"
+
+
+class Scope(StrEnum):
+    NONE = "none"
+    INFER = "infer"
+    ADMIN = "admin"
+
+
+@dataclass(frozen=True)
+class Route:
+    kind: Kind
+    scope: Scope  # used from S2; S1 records it in the log only
+    known: bool  # False for unlisted pairs (gated + admin)
+    seriatim_status: int | None  # 200 known, 404 unknown path, 405 wrong method (SERIATIM only)
+
+
+# Every table holds (method, raw_path); paths are compared as bytes, never decoded.
+SERIATIM_ROUTES: Mapping[bytes, frozenset[str]] = MappingProxyType(
+    {b"/seriatim/health": frozenset({"GET"})}
+)
+UNGATED_INFER: frozenset[tuple[str, bytes]] = frozenset(
+    {
+        ("GET", b"/"),
+        ("HEAD", b"/"),
+        ("GET", b"/api/tags"),
+        ("GET", b"/api/ps"),
+        ("GET", b"/api/version"),
+        ("POST", b"/api/show"),
+        ("GET", b"/v1/models"),
+    }
+)
+UNGATED_ADMIN: frozenset[tuple[str, bytes]] = frozenset(  # plus HEAD/POST on BLOB_RE
+    {
+        ("POST", b"/api/pull"),
+        ("POST", b"/api/push"),
+        ("POST", b"/api/copy"),
+        ("DELETE", b"/api/delete"),
+    }
+)
+GATED_INFER: frozenset[tuple[str, bytes]] = frozenset(
+    {
+        ("POST", b"/api/generate"),
+        ("POST", b"/api/chat"),
+        ("POST", b"/api/embed"),
+        ("POST", b"/api/embeddings"),
+        ("POST", b"/v1/chat/completions"),
+        ("POST", b"/v1/completions"),
+        ("POST", b"/v1/embeddings"),
+    }
+)
+GATED_ADMIN: frozenset[tuple[str, bytes]] = frozenset({("POST", b"/api/create")})
+BLOB_RE = re.compile(rb"^/api/blobs/sha256:[0-9a-f]{64}$")  # used with fullmatch
+BLOB_METHODS = frozenset({"HEAD", "POST"})
+
+_UNGATED_INFER = Route(Kind.UNGATED, Scope.INFER, True, None)
+_UNGATED_ADMIN = Route(Kind.UNGATED, Scope.ADMIN, True, None)
+_GATED_INFER = Route(Kind.GATED, Scope.INFER, True, None)
+_GATED_ADMIN = Route(Kind.GATED, Scope.ADMIN, True, None)
+_UNKNOWN = Route(Kind.GATED, Scope.ADMIN, False, None)
+
+
+def classify(method: str, raw_path: bytes) -> Route:
+    """Classify a request by its exact method and raw path (TD §2.2 rules 1 to 5).
+
+    Call it only after `check_raw_path` has passed. Methods are compared exactly, as h11
+    delivers them, so `post` is not `POST` and falls to rule 5.
+    """
+    if raw_path == b"/seriatim" or raw_path.startswith(b"/seriatim/"):
+        methods = SERIATIM_ROUTES.get(raw_path)
+        if methods is None:
+            return Route(Kind.SERIATIM, Scope.NONE, False, 404)
+        if method not in methods:
+            return Route(Kind.SERIATIM, Scope.NONE, False, 405)
+        return Route(Kind.SERIATIM, Scope.NONE, True, 200)
+    pair = (method, raw_path)
+    if pair in UNGATED_INFER:
+        return _UNGATED_INFER
+    if pair in UNGATED_ADMIN or (method in BLOB_METHODS and BLOB_RE.fullmatch(raw_path)):
+        return _UNGATED_ADMIN
+    if pair in GATED_INFER:
+        return _GATED_INFER
+    if pair in GATED_ADMIN:
+        return _GATED_ADMIN
+    return _UNKNOWN
+
+
+# --- The gate (TD §3) ----------------------------------------------------------------------
 
 
 class SlotState(StrEnum):

@@ -1,18 +1,35 @@
-"""`Gate` and `Lease` (TD-slice-1 §2.2, §3.1, §3.2; tests G1 to G12 of §8.2).
-
-The path tests (K1 to K6) are added by S1-3.
-"""
+"""`gate.py` (TD-slice-1 §2.2, §3.1, §3.2): the gate (G1 to G12) and the path rules (K1 to K6)."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+from pathlib import Path
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from seriatim_node.gate import Busy, Gate, HolderInfo, Lease, SlotState, SlotView, Starting
+from seriatim_node.gate import (
+    GATED_ADMIN,
+    GATED_INFER,
+    UNGATED_ADMIN,
+    UNGATED_INFER,
+    Busy,
+    Gate,
+    HolderInfo,
+    Kind,
+    Lease,
+    PathError,
+    Route,
+    Scope,
+    SlotState,
+    SlotView,
+    Starting,
+    check_raw_path,
+    classify,
+)
 
 
 class Clock:
@@ -341,3 +358,259 @@ def test_g12_busy_for_is_the_oldest_holder_and_ignores_stuck():
     lease(gate, rid="new")
     clock.advance(3.0)
     assert gate.try_acquire("/api/chat", "x") == Busy(retry_after_s=2, busy_for_s=5.0)
+
+
+# --- Path safety and classification (K1 to K6) ---------------------------------------------
+
+# Resolved from this file, so the same path works when mutmut copies tests/ into node/.
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+HEX64 = "0123456789abcdef" * 4
+BLOB = b"/api/blobs/sha256:" + HEX64.encode()
+
+UI = Route(Kind.UNGATED, Scope.INFER, True, None)
+UA = Route(Kind.UNGATED, Scope.ADMIN, True, None)
+GI = Route(Kind.GATED, Scope.INFER, True, None)
+GA = Route(Kind.GATED, Scope.ADMIN, True, None)
+UNKNOWN = Route(Kind.GATED, Scope.ADMIN, False, None)
+
+K1_KNOWN = [
+    ("GET", b"/", UI),
+    ("HEAD", b"/", UI),
+    ("GET", b"/api/tags", UI),
+    ("GET", b"/api/ps", UI),
+    ("GET", b"/api/version", UI),
+    ("POST", b"/api/show", UI),
+    ("GET", b"/v1/models", UI),
+    ("POST", b"/api/pull", UA),
+    ("POST", b"/api/push", UA),
+    ("POST", b"/api/copy", UA),
+    ("DELETE", b"/api/delete", UA),
+    ("HEAD", BLOB, UA),
+    ("POST", BLOB, UA),
+    ("POST", b"/api/generate", GI),
+    ("POST", b"/api/chat", GI),
+    ("POST", b"/api/embed", GI),
+    ("POST", b"/api/embeddings", GI),
+    ("POST", b"/v1/chat/completions", GI),
+    ("POST", b"/v1/completions", GI),
+    ("POST", b"/v1/embeddings", GI),
+    ("POST", b"/api/create", GA),
+]
+K1_UNKNOWN = [
+    ("OPTIONS", b"/api/tags"),
+    ("GET", b"/api/chat"),
+    ("POST", b"/api/chat/"),
+    ("POST", b"/API/CHAT"),
+    ("post", b"/api/chat"),
+    ("PUT", b"/api/chat"),
+    ("POST", b"/api/blobs"),
+    ("POST", b"/api/blobs/sha256:XYZ"),
+    ("GET", b"/api/unknown"),
+    ("POST", b"/api/new-feature"),
+]
+
+
+@pytest.mark.td("K1")
+@pytest.mark.parametrize(("method", "path", "route"), K1_KNOWN)
+def test_k1_listed_pairs(method, path, route):
+    assert classify(method, path) == route
+
+
+@pytest.mark.td("K1")
+@pytest.mark.parametrize(("method", "path"), K1_UNKNOWN)
+def test_k1_unlisted_pairs_are_gated_admin_unknown(method, path):
+    assert classify(method, path) == UNKNOWN
+
+
+@pytest.mark.td("K1")
+@pytest.mark.parametrize(
+    ("method", "path", "status", "known"),
+    [
+        ("GET", b"/seriatim/health", 200, True),
+        ("POST", b"/seriatim/health", 405, False),
+        ("HEAD", b"/seriatim/health", 405, False),
+        ("GET", b"/seriatim/nope", 404, False),
+        ("GET", b"/seriatim", 404, False),
+        ("GET", b"/seriatim/", 404, False),
+    ],
+)
+def test_k1_seriatim_paths(method, path, status, known):
+    assert classify(method, path) == Route(Kind.SERIATIM, Scope.NONE, known, status)
+
+
+START = "the path must start with /"
+DOUBLE = "the path contains //"
+BACKSLASH = "the path contains a backslash"
+CONTROL = "the path contains a control byte"
+DOTS = "the path contains a . or .. segment"
+
+K2_REFUSED = [
+    (b"/api/chat/../show", DOTS),
+    (b"/api/./chat", DOTS),
+    (b"/api//chat", DOUBLE),
+    (b"/api/%2e%2e/show", "the path contains %2e"),
+    (b"/api/%2E%2e/show", "the path contains %2e"),
+    (b"/api%2fchat", "the path contains %2f"),
+    (b"/api%2Fchat", "the path contains %2f"),
+    (b"/api%5cchat", "the path contains %5c"),
+    (b"/api%5Cchat", "the path contains %5c"),
+    (b"/api\\chat", BACKSLASH),
+    (b"/api/chat%00", "the path contains %00"),
+    (b"/api/chat\x01", CONTROL),
+    (b"api/chat", START),
+    (b"//api/chat", DOUBLE),
+    (b"", START),
+    (b"/..", DOTS),
+    (b"/.", DOTS),
+    (b"/api/..", DOTS),
+]
+
+
+@pytest.mark.td("K2")
+@pytest.mark.parametrize(("path", "message"), K2_REFUSED)
+def test_k2_unsafe_paths_raise(path, message):
+    with pytest.raises(PathError) as e:
+        check_raw_path(path)
+    assert str(e.value) == message
+
+
+@pytest.mark.td("K2")
+@pytest.mark.parametrize(
+    "path", [BLOB, b"/api/show%20x", b"/", b"/api/chat", b"/a.b/..c/.d", b"/api/%41"]
+)
+def test_k2_safe_paths_pass(path):
+    assert check_raw_path(path) is None
+
+
+_SAFE_SEGMENT = st.text(alphabet="abcxyz019-_~:", min_size=1, max_size=6).map(str.encode)
+_BAD_SEGMENT = st.sampled_from([b".", b".."])
+_BAD_ESCAPE = st.sampled_from([b"%2e", b"%2E", b"%2f", b"%2F", b"%5c", b"%5C", b"%00"])
+
+
+@pytest.mark.td("K2")
+@settings(max_examples=300)
+@given(
+    before=st.lists(_SAFE_SEGMENT, max_size=4),
+    after=st.lists(_SAFE_SEGMENT, max_size=4),
+    bad=_BAD_SEGMENT,
+)
+def test_k2_any_dot_segment_raises(before, after, bad):
+    with pytest.raises(PathError):
+        check_raw_path(b"/" + b"/".join([*before, bad, *after]))
+
+
+@pytest.mark.td("K2")
+@settings(max_examples=300)
+@given(
+    head=st.lists(_SAFE_SEGMENT, min_size=1, max_size=4),
+    tail=st.text(alphabet="abc-", max_size=4).map(str.encode),
+    escape=_BAD_ESCAPE,
+)
+def test_k2_any_listed_escape_raises(head, tail, escape):
+    with pytest.raises(PathError):
+        check_raw_path(b"/" + b"/".join(head) + escape + tail)
+
+
+def _route_pairs() -> dict[str, set[tuple[str, bytes]]]:
+    data = json.loads((FIXTURES / "route-pairs.json").read_text(encoding="utf-8"))
+    return {
+        cls: {(m, p.encode()) for m, p in data[cls]}
+        for cls in ("ungated_infer", "ungated_admin", "gated_infer", "gated_admin")
+    }
+
+
+@pytest.mark.td("K3")
+def test_k3_tables_equal_the_route_pairs_fixture():
+    pairs = _route_pairs()
+    blob = {(m, BLOB) for m in ("HEAD", "POST")}
+    assert set(UNGATED_INFER) == pairs["ungated_infer"]
+    placeholder = {(m, p) for m, p in pairs["ungated_admin"] if b"<64 hex>" in p}
+    assert {m for m, _ in placeholder} == {"HEAD", "POST"}
+    assert set(UNGATED_ADMIN) == pairs["ungated_admin"] - placeholder
+    assert all(classify(m, p) == UA for m, p in blob)
+    assert set(GATED_INFER) == pairs["gated_infer"]
+    assert set(GATED_ADMIN) == pairs["gated_admin"]
+
+
+@pytest.mark.td("K3")
+def test_k3_every_pair_exists_in_the_route_probe():
+    probe = json.loads((FIXTURES / "ollama-0.40.16.json").read_text(encoding="utf-8"))
+    seen = {(r["method"], r["path"]): r["exists"] for r in probe["route_probe"]}
+    for cls, pairs in _route_pairs().items():
+        for method, path in pairs:
+            assert seen.get((method, path.decode())) is True, (cls, method, path)
+
+
+@pytest.mark.td("K4")
+@pytest.mark.parametrize("byte", [*range(0x20), 0x7F])
+def test_k4_every_forbidden_byte_raises(byte):
+    with pytest.raises(PathError) as e:
+        check_raw_path(b"/api/chat" + bytes([byte]))
+    assert str(e.value) == CONTROL
+
+
+@pytest.mark.td("K4")
+@pytest.mark.parametrize("byte", [0x20, 0x7E, 0x80, 0xFF])
+def test_k4_bytes_outside_the_forbidden_set_pass(byte):
+    check_raw_path(b"/api/chat" + bytes([byte]))  # the boundaries of `< 0x20` and `== 0x7f`
+
+
+@pytest.mark.td("K4")
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", b"/api/chat%41"),
+        ("POST", b"/api/chat%252e"),
+        ("POST", b"/api/%252e%252e/show"),
+        ("POST", b"/api/chat%20"),
+        ("GET", b"/api/tags%20"),
+    ],
+)
+def test_k4_allowed_escapes_classify_by_raw_bytes(method, path):
+    check_raw_path(path)
+    assert classify(method, path) == UNKNOWN
+
+
+@pytest.mark.td("K5")
+@pytest.mark.parametrize("method", ["HEAD", "POST"])
+@pytest.mark.parametrize(
+    "digest",
+    [HEX64[:63], HEX64 + "0", HEX64.upper(), HEX64 + "/"],
+    ids=["63-hex", "65-hex", "upper-case", "trailing-slash"],
+)
+def test_k5_malformed_digests_are_unknown(method, digest):
+    path = b"/api/blobs/sha256:" + digest.encode()
+    check_raw_path(path)
+    assert classify(method, path) == UNKNOWN
+
+
+@pytest.mark.td("K5")
+@pytest.mark.parametrize("method", ["HEAD", "POST"])
+def test_k5_trailing_newline_is_refused_and_never_a_blob(method):
+    path = BLOB + b"\n"
+    with pytest.raises(PathError):
+        check_raw_path(path)
+    assert classify(method, path) == UNKNOWN  # fullmatch: `$` never matches before a \n
+
+
+@pytest.mark.td("K5")
+@pytest.mark.parametrize("method", ["HEAD", "POST"])
+def test_k5_exact_digest_is_ungated_admin(method):
+    assert classify(method, BLOB) == UA
+
+
+@pytest.mark.td("K5")
+@pytest.mark.parametrize("method", ["GET", "DELETE", "PUT", "head", "post"])
+def test_k5_other_methods_on_a_blob_are_unknown(method):
+    assert classify(method, BLOB) == UNKNOWN
+
+
+@pytest.mark.td("K6")
+@pytest.mark.parametrize(
+    "path", [b"/seriatimx", b"/seriatim-health", b"/Seriatim/health", b"/SERIATIM/health"]
+)
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_k6_look_alikes_are_forwarded_gated(method, path):
+    route = classify(method, path)
+    assert route == UNKNOWN
+    assert route.kind is not Kind.SERIATIM
