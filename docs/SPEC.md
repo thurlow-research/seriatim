@@ -751,7 +751,9 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 
   *Tests:* C8, H28.
 - **REQ-22. Logs.**
-  - One JSON line per request, with the fields given in TD-slice-1 Appendix A.
+  - One JSON line per request, with the fields given in TD-slice-1 Appendix A. Health
+    requests (`/seriatim/health`) are logged at `DEBUG`, so at the default `INFO` level a
+    load balancer's polling adds no lines (TD-slice-1 HL9).
   - Never a request or response body, and never a credential.
 
   *Tests:* L1–L3, H18, HL9.

@@ -10,7 +10,7 @@ the route probe (Appendix B, S0b; #29); revision 8 adds the 57 scenarios of #15 
 Enforced: no
 
 (The `td-test-ids` check, SPEC REQ-63, reads this line. S1's code ships as the series of
-small PRs in §9. The **last** one, S1-13, sets it to `yes`, and from then on every ID in §8
+small PRs in §9. The **last** one, S1-14, sets it to `yes`, and from then on every ID in §8
 needs a passing test marked `@pytest.mark.td("<ID>")`. Each earlier PR marks the tests of the
 IDs it delivers, as §9 lists them.)
 **Implements:** SPEC REQ-1 to REQ-7, REQ-10 to REQ-12b, REQ-15 (pre-auth form), REQ-18
@@ -396,7 +396,11 @@ exception type.
  8      Starting → 503 NODE_STARTING, Retry-After, X-Seriatim-Gate: refused; return  # body never read
  9      lease ← r
 10  try:
-10a     if lease: req_client ← new_gated_client()        # inside the try: a failure still ends the lease (E16)
+10a     if lease: req_client ← new_gated_client()        # inside the try (E16); req_client is None from line 2
+                                                     #   until this returns. An exception here is outside
+                                                     #   _exchange's guard: line 16 catches it as Internal,
+                                                     #   (b) frees the lease (nothing was sent) and (c)
+                                                     #   sends 500 INTERNAL
 11      with anyio.move_on_after(deadline_remaining(lease)) as hold:      # inf when ungated
 12          async with anyio.create_task_group() as tg:
 13              await self._exchange(..., outcome, tg)       # never raises Exception; stops before
@@ -500,7 +504,9 @@ steps:
      but only if the upstream response was **framed**: it had a `content-length` that the
      received bytes matched; or it was chunked and ended with the terminating chunk; or it
      has no body by HTTP's rules, because the request was `HEAD` or the status is 1xx, 204 or
-     304 (S21).
+     304 (S21). The bodyless rule is checked **first**: a `HEAD` response's `Content-Length`
+     describes the body a `GET` would have had, so it is never compared with the bytes
+     received, and a 204 or 304 needs no length or chunking.
    - A response with neither is close-delimited, and ends when Ollama closes the connection.
      A crash would look the same as a normal end. So such a response is treated as broken at
      its end: an in-stream record if framing allows, an abort, and a drain. Ollama, a Go
@@ -830,8 +836,8 @@ also run on `windows-latest` and `macos-latest`.
 | H25 | Clean upstream errors pass through: 500 `{"error":"x"}`, 503 `text/plain` `oops` and 502 `text/html` → status, `content-type` and bytes unchanged; the slot is freed at once (the next request gets 200 with the fake clock not advanced) | 6, 25 |
 | H26 | Ungated stalls. `ungated_read_timeout_s=0.5`: `/api/show` with the fake stalling before the headers → 502 `UPSTREAM_PROTOCOL_ERROR` within the bound; stalling after the headers → aborted. A client disconnect during an ungated stream → the fake sees the upstream close. In every case the shared pool has no connection in use afterwards, and every gate slot stays `FREE` throughout. When the shared response's `aclose()` blocks → `upstream_close_failed` at `ERROR` within `close_timeout_s`, and the client is answered or aborted within `2 × close_timeout_s` | 20, 26 |
 | H27 | The `NODE_SATURATED` response from H14 in full: `Retry-After` equals `retry_after`, `X-Seriatim-Gate: ungated`, and `retryable` and `replay_safe` are the `ERROR_TABLE` values (`replay_safe: true`); the body validates against `ErrorEnvelope` | 20, 25 |
-| H28 | Request smuggling, over a raw socket: two different `Content-Length` headers; `Content-Length: 5, 6`; `Content-Length: -1`; `Transfer-Encoding: chunked` together with `Content-Length`; `Transfer-Encoding: gzip, chunked`; and a chunked body with a trailer and a second request hidden in it → each is refused by the HTTP layer with a 400 and a closed connection, or parsed as exactly one request with the body its framing gives. `fake_ollama` never records a request the client didn't frame, and no slot is taken by one | 21, 2 |
-| H29 | A refused request, then another on the same keep-alive socket: request 1 gets 429 (busy) after sending its 4 KiB body; request 2 follows on the same socket → it is parsed as its own request (200 once the holder ends), or the server closes the connection. Request 1's body bytes are never read as a request. The same after a 413 | 3, 21 |
+| H28 | Request smuggling, over a raw socket: two different `Content-Length` headers; `Content-Length: 5, 6`; `Content-Length: -1`; `Transfer-Encoding: chunked` together with `Content-Length`; `Transfer-Encoding: gzip, chunked`; and a chunked body with a trailer and a second request hidden in it → the invalid framings (two different `Content-Length` values, a list value, `-1`, and `Transfer-Encoding` together with `Content-Length`; RFC 9112 §6.1 and §6.3) are each **refused with 400 and a closed connection**. The valid chunked body with a trailer is parsed as exactly one request, with the body its framing gives, and the hidden request is never seen as a request. `fake_ollama` never records a request the client didn't frame, and no slot is taken by one | 21, 2 |
+| H29 | A refused request, then another on the same keep-alive socket: request 1 gets 429 (busy) after sending its 4 KiB body; request 2 follows on the same socket → request 2 gets **either** its own real response (200 once the holder ends) **or** a closed connection with no second response. A 400 (from request 1's body bytes being parsed as a request) fails the test. The same after a 413 | 3, 21 |
 | B1 | Request 1 is held at upstream; request 2 (`/api/chat`) → 429 within the bound, with `Retry-After: 15` and `X-Seriatim-Gate: busy`. The body validates against `ErrorEnvelope`: `error_code: GPU_BUSY`, `retryable: true`, `replay_safe: true`, `retry_after: 15`, `source: sidecar`, `busy_for_s ≥ 0`. `fake_ollama` recorded **one** request | 3, 4, 25 |
 | B2 | Request 1 ends cleanly → a new request 2 gets 200 at once | 10 |
 | B3 | Raw socket: request 1 is held; request 2 sends only the headers, with `Content-Length: 10485760` → the 429 arrives without any body being sent | 3 |
@@ -862,11 +868,11 @@ also run on `windows-latest` and `macos-latest`.
 | HL5 | The probe connects, then stalls: once before the headers and once in the middle of the body → 503 `["ollama_unreachable"]` within `health_probe_timeout_s` plus the bound | 18 |
 | HL6 | Several faults at once: upstream down, an overdue lease, a stuck slot and the startup quarantine → `reasons` is exactly `["ollama_unreachable", "slot_overdue", "slot_stuck", "starting"]`. Clearing each fault in turn removes only its reason, and the rest stay in order | 18 |
 | HL7 | Normal use is not a fault: slots 2, one `HELD` within its limit and one `DRAINING` → 200 `{"status":"ok"}` | 18 |
-| HL8 | 200 concurrent health requests on a fake that stalls `/api/version` → each gets 200, or 503 with known reasons, within `health_probe_timeout_s` plus the bound. None gets a 500, and a gated `/api/chat` sent meanwhile gets 200 | 18 |
+| HL8 | Two cases. **Stalled:** 200 concurrent health requests while the fake stalls `/api/version` past `health_probe_timeout_s` → **every** response is 503 `["ollama_unreachable"]` within `health_probe_timeout_s` plus the bound; none is 200 and none is 500. **Not stalled:** 200 concurrent health requests on a fake that answers → every response is 200. In both cases, a gated `/api/chat` sent meanwhile gets 200 | 18 |
 | HL9 | Health requests are logged at `DEBUG` only: at `LOG_LEVEL=INFO`, 10 health requests add no log line; at `DEBUG`, each adds exactly one | 22 |
 | L1 | After H1, B1, E1 and S4: one JSON log line each, with the fields in Appendix A. No line contains the body marker string, the `Authorization` value or the `X-API-Key` value | 22, 13 |
 | L2 | Exactly one log line per request, with the `status`, `outcome`, `bytes_in`, `bytes_out` and `slot_end` of §5, on every path: 400, 404, 405, 413 before and after admission, 408, 429, 503 `NODE_STARTING`, a disconnect while sending the body (E7), `upload_interrupted` (E12), `hold_exceeded` (S7), a stuck close (F4) and a shutdown (S11) | 22 |
-| L3 | Nothing secret reaches the log: the request has `Cookie: c=<marker>` and the query `?key=<marker>&token=<marker>`; the response has `Set-Cookie: s=<marker>`; and an internal error (E15) is raised while the body holds the marker → no log line contains the marker. The query string is never logged (`path` is the path only) | 22, 13 |
+| L3 | Nothing secret reaches the log: the request has `Cookie: c=<marker>` and the query `?key=<marker>&token=<marker>`; the response has `Set-Cookie: s=<marker>`; and an internal error (E15) is raised while the body holds the marker; and an upstream error on a request with `?key=<marker>` (E1's closed port), since an exception message can carry the URL → no log line contains the marker, **traceback included**. The query string is never logged (`path` is the path only) | 22, 13 |
 | K-OAS1 | `contract/openapi.yaml` passes `openapi-spec-validator` (OpenAPI 3.1), and every `$ref` resolves (checked separately, because the validator accepts an unresolved one). Every Ollama path's `x-seriatim-gate` and `x-seriatim-scope` agree with `classify()` (Seriatim's own `/seriatim/*` and `/models/select` paths are not Ollama routes and have no `x-seriatim-gate`, but each must declare `x-seriatim-scope`: `none`, `infer` or `admin`, and the ones S1 serves must agree with `classify()`); `x-seriatim-unknown-endpoint` agrees with rule 5 | 5, G7 |
 | K-OAS2 | Every collected error body validates against `ErrorEnvelope`, in-stream records against `StreamErrorRecord`, and health bodies against `Health` | 25 |
 | K-OAS3 | `set(ErrorCode)` equals the contract's `ErrorCode.enum`, and `ERROR_TABLE` equals `x-seriatim-codes` (status, `retryable` and `replay_safe` for each code) | 25 |
@@ -895,7 +901,7 @@ also run on `windows-latest` and `macos-latest`.
 | S18 | Upstream sends the headers (NDJSON, chunked), then resets before any body → the client gets the headers, one record line, then an abort (an empty tail is a record boundary) | 24 |
 | S19 | Boundaries split across chunks, then a reset. NDJSON `{"a"` + `:1}` + `\n` → a record. SSE `data: x\n` + `\n` → a record. SSE `data: x\n\n` one byte per chunk → a record. NDJSON ending `{"a":1}` + `\n{"b"` → no record, only an abort | 24 |
 | S20 | Broken chunked framing from `raw_upstream`: a malformed chunk-size line; and a response that closes without the terminating `0\r\n\r\n` → never a clean end: aborted, the slot drains, log `upstream_error` | 24, 10 |
-| S21 | Bodyless responses are complete: a clean `HEAD /` (with `Content-Length` and no body), and a gated request that gets 204, or 304 → the client sees a complete response, and the gated slot is freed with no drain | 6, 10 |
+| S21 | Bodyless responses are complete: a clean `HEAD /` whose response has a **non-zero** `Content-Length` (`1234`) and no body; and a gated request that gets 204, or 304, each sent with **no** `Content-Length` and not chunked → the client sees a complete response, and the gated slot is freed with no drain. (Revision 7's rule fails each case: the `HEAD` length doesn't match the bytes received, and the 204 and 304 look close-delimited) | 6, 10 |
 | F1 | **Fault at connect.** The `raw_upstream` fake closes at once after accepting → 502 `UPSTREAM_PROTOCOL_ERROR` with `replay_safe: false`; the slot drains (a connection was made, so bytes may have arrived) | 26, 10 |
 | F2 | **Fault during the write.** The `raw_upstream` fake stops reading a 32 MiB gated body, and the client disconnects during the write → the sidecar cancels the write, closes the socket (the fake sees EOF), and the slot drains; no 5xx is written to the gone client | 10 |
 | F3 | **Fault while waiting for headers.** The `raw_upstream` fake sends a malformed status line → 502 `UPSTREAM_PROTOCOL_ERROR`; the slot drains | 26 |
@@ -944,37 +950,63 @@ and the capture log. They import nothing from `seriatim_node`. They run in the r
 - **Size.** Each PR in the §9 series passes the PR-size check on its own. Together they
   touch the 13 files of §1.
 - **Per PR.** Each PR in §9 runs these gates on the files it changes: coverage, mutation on
-  the modules it adds or changes, and the PPE once S1-13 adds the sidecar container.
+  the modules it adds or changes, and the PPE once S1-14 adds the sidecar container.
 - **Review.** An independent review of the PR diff. Every real finding is fixed and listed,
   and every rejected one is given with its reason.
 
 ## 9. Delivery: the S1 PR series
 
-The code is too large for one PR under the size limit, so it ships as 13 small PRs, in this
+The code is too large for one PR under the size limit, so it ships as 14 small PRs, in this
 order. Each has its own issue, a sub-issue of #34. Each leaves `main` releasable and green,
-and ships the tests for exactly the IDs listed. A PR may add a stub that a later PR
-completes, but never one that a test depends on. Modules grow across PRs: for example,
-`app.py` starts in S1-1 with the error table.
+and ships the tests for exactly the IDs listed. **Every behaviour an ID asserts is delivered
+by its PR or by one in that PR's "needs"** (checked row by row). A PR may add a stub that a
+later PR completes, but never one that a test depends on. Modules grow across PRs: for
+example, `app.py` starts in S1-1 with the error table.
+
+The proxy's request lifecycle (§3.3: admission, the body read, the watcher, the relay, the
+hold limit, and the shielded `finally` with its close proof, clean end, drain and `STUCK`)
+is one PR, S1-6, because every gated test depends on all of it. The later proxy PRs add
+behaviour on top of it: header rules, request limits, in-stream records, the edge cases of
+cancellation and closing, and blob streaming.
 
 | PR | scope | files (new or changed) | TD IDs | needs |
 |---|---|---|---|---|
-| S1-1 | Contract and the error table | `contract/openapi.yaml`; `app.py` (`ErrorCode`, `ERROR_TABLE`, `ErrorFactory`) | K-OAS1, K-OAS3 | — |
+| S1-1 | Contract and the error table | `contract/openapi.yaml`; `app.py` (`ErrorCode`, `ERROR_TABLE`, `ErrorFactory`) | K-OAS3 | — |
 | S1-2 | Configuration | `config.py`, `test_config.py` | C1–C7, C9–C11 | — |
-| S1-3 | Path safety and classification | `gate.py` (`check_raw_path`, `classify`, the tables), `test_gate.py` | K1–K6 | — |
+| S1-3 | Path safety and classification | `gate.py` (`check_raw_path`, `classify`, the tables), `test_gate.py`, `test_http.py` (K-OAS1) | K1–K6, K-OAS1 | 1 |
 | S1-4 | The gate | `gate.py` (`Gate`, `Lease`), `test_gate.py` | G1–G12 | — |
-| S1-5 | Harness, dispatcher and health | `conftest.py`, `app.py` (`create_app`, the dispatcher, `X-Request-Id`, 505, `/seriatim/*`, health, `RequestLog`), `test_http.py` | H12, H22, H23, E2, HL1–HL9 | 1, 2, 3 |
-| S1-6 | Passthrough and headers | `proxy.py` (buffered relay, header rules, the ungated client), `test_http.py` | H1–H7, H9, H11, H15–H18, H20, H21, H24, H25 | 5 |
-| S1-7 | Admission and request limits | `proxy.py` (the gate, 429 and 503, body limits), `test_http.py` | B1–B7, E3, E4, E7–E11, H8, H19, H28, H29 | 4, 6 |
-| S1-8 | Streaming and errors after the headers | `proxy.py` (streaming, framing, records, upstream faults), `test_streaming.py`, `test_http.py` | S1–S10, S17–S21, H13, F1, F3, F5, E1, E5, E15 | 7 |
-| S1-9 | Cleanup, cancellation and the close proof | `proxy.py` (the shielded `finally`, `STUCK`, the ungated close), `test_streaming.py`, `test_http.py` | S11–S16, F2, F4, E16, H14, H26, H27 | 8 |
-| S1-10 | Blob uploads | `proxy.py` (`body_stream`), `test_http.py` | H10, E6, E12–E14 | 7 |
-| S1-11 | Process and singleton | `app.py` (`main`, `acquire_singleton`), `test_config.py`, `test_process.py` | C8, R1–R9 | 5 |
-| S1-12 | Request log | `app.py` (the log fields on every path), `test_http.py` | L1–L3, K-OAS2 | 9, 10 |
-| S1-13 | The PPE sidecar and enforcement | `ppe/compose.yaml` (`node-a`), `tests/behaviour/test_sidecar.py`; `Enforced: yes` | P1–P7 | 11, 12 |
+| S1-5 | Harness, dispatcher and health | `conftest.py`, `app.py` (`create_app`, the dispatcher, `X-Request-Id`, 505, `/seriatim/*`, health, `RequestLog`), `test_http.py` | H12, H22, H23, E2, HL1–HL7, HL9 | 1, 2, 3, 4 |
+| S1-6 | The proxy core and its lifecycle | `proxy.py` (§3.3 complete; the three clients; upstream error mapping before the headers; Seriatim's own response headers), `test_http.py`, `test_streaming.py` | H1, H2, H4–H8, H25, B1–B5, E1, S1–S5 | 5 |
+| S1-7 | Header rules | `proxy.py` (`upstream_headers`, `prune_httpx_defaults`, `downstream_headers` strip lists), `test_http.py` | H3, H9, H11, H15–H18, H20, H21, H24 | 6 |
+| S1-8 | Request limits | `proxy.py` (`read_body` limits and the total timeout, the size check before admission), `test_http.py` | E3, E4, E7–E11, B6, B7, H28, H29 | 6 |
+| S1-9 | Errors after the headers and upstream faults | `proxy.py` (`record_framing`, `stream_error_record`, the bodyless rule), `test_streaming.py`, `test_http.py` | S6–S10, S17–S21, H13, F1, F3, F5, E5, E15 | 6 |
+| S1-10 | Cancellation, the close proof and the ungated pool | `proxy.py` (cancellation and close edge cases, `PoolTimeout`, ungated timeouts), `test_streaming.py`, `test_http.py` | S11–S16, F2, F4, E16, H14, H26, H27 | 6 |
+| S1-11 | Blob uploads | `proxy.py` (`body_stream`), `test_http.py` | H10, E6, E12–E14 | 6 |
+| S1-12 | Process and singleton | `app.py` (`main`, `acquire_singleton`), `test_config.py`, `test_process.py` | C8, R1–R9 | 6 |
+| S1-13 | Request log, Seriatim's headers on every response, health under load | `app.py` (the log fields on every path), `test_http.py` | L1–L3, K-OAS2, H19, HL8 | 8, 9, 10, 11 |
+| S1-14 | The PPE sidecar and enforcement | `ppe/compose.yaml` (`node-a`), `tests/behaviour/test_sidecar.py`; `Enforced: yes` | P1–P7 | 12, 13 |
 
-"needs" lists the PRs that must merge first. PRs with no dependency between them may be open
-at the same time when they touch different files. S1-1 to S1-4 are independent. S1-13 closes
-#34 and #15.
+"needs" lists the PRs that must merge first; dependencies through them count too (S1-6
+needs S1-5, which needs S1-1 to S1-4). PRs with no dependency between them may be open at
+the same time when they touch different files. S1-1, S1-2 and S1-4 are independent. S1-7 to
+S1-11 all build on S1-6 and all change `proxy.py`, so they go one at a time. S1-14 closes #34
+and #15.
+
+**Why each ID sits where it does**, for the ones the review asked about:
+- **K-OAS1 and K3** compare the contract with `gate.py`'s tables, so both are in S1-3,
+  which needs S1-1.
+- **H23, HL4, HL6 and HL7** use `Gate` and `Lease`, so S1-5 needs S1-4.
+- **HL8** sends a gated request during the health load, so it waits for S1-6 (in S1-13).
+- **H25 and the other "freed at once" assertions** need admission and the `finally`, which
+  are both in S1-6.
+- **H19** covers every response class: 413 and 408 after admission (S1-8), the in-stream
+  paths (S1-9), `NODE_SATURATED` (S1-10) and 505 (S1-5). So it is in S1-13.
+- **R1 and R2** send gated requests through a real subprocess, so S1-12 needs S1-6.
+- **E14**'s gated case (a disconnect while waiting for headers) uses S1-6's watcher, so S1-11
+  needs S1-6 only.
+- **The drain assertions** in S1-8 to S1-11 rely on the shielded `finally`, which is in S1-6.
+- **L2** includes paths from S1-8 (E7), S1-9 (S7), S1-10 (F4, S11) and S1-11 (E12), so S1-13
+  needs all four.
 
 ## Appendix A — Data shapes
 
