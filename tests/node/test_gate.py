@@ -258,12 +258,14 @@ def test_g9_property_the_limit_holds(n, ops):
     [
         ({"slots": 0}, "slots must be at least 1"),
         ({"slots": -1}, "slots must be at least 1"),
+        ({"slots": float("nan")}, "slots must be at least 1"),
         ({"drain_s": 0}, "drain_s must be greater than 0"),
         ({"drain_s": -1.0}, "drain_s must be greater than 0"),
         ({"drain_s": float("nan")}, "drain_s must be greater than 0"),
         ({"max_hold_s": 0}, "max_hold_s must be greater than 0"),
         ({"max_hold_s": float("nan")}, "max_hold_s must be greater than 0"),
         ({"retry_after_s": 0}, "retry_after_s must be at least 1"),
+        ({"retry_after_s": float("nan")}, "retry_after_s must be at least 1"),
     ],
 )
 def test_g10_invalid_gate_settings_raise(kwargs, message):

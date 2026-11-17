@@ -108,9 +108,9 @@ class Gate:
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
     ) -> None:
-        if slots < 1:
+        if not slots >= 1:  # written so that NaN is refused too
             raise ValueError("slots must be at least 1")
-        if retry_after_s < 1:
+        if not retry_after_s >= 1:
             raise ValueError("retry_after_s must be at least 1")
         if not drain_s > 0:
             raise ValueError("drain_s must be greater than 0")
