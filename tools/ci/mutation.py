@@ -141,6 +141,8 @@ def staged(pdir: Path, root: Path = Path(".")) -> Iterator[None]:
     for _, dst in copies:
         if dst.exists():
             raise GateError(f"{dst} already exists; remove it before running the gate")
+    # mutmut keeps results in mutants/ and reuses them; start empty so the score is this run's.
+    shutil.rmtree(pdir / "mutants", ignore_errors=True)
     try:
         for src, dst in copies:
             shutil.copytree(src, dst)
