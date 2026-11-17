@@ -43,7 +43,7 @@ TD is merged before its code (ADR-001 §10).
 | 3 | `node/seriatim_node/gate.py` | `check_raw_path()`, `classify()`, `Gate`, `Lease` |
 | 4 | `node/seriatim_node/proxy.py` | `Proxy`: passthrough with streaming, disconnects, the hold limit, framing-safe errors and the shielded release |
 | 5 | `node/seriatim_node/app.py` | the dispatcher, `ErrorCode` and the error table, `/seriatim/health`, `RequestLog`, the singleton lock, `main()` |
-| 6 | `tests/node/conftest.py` | the real-socket harness: the sidecar and a fake Ollama on ephemeral ports, a fixture replayer and a raw-socket fake |
+| 6 | `tests/node/conftest.py` and `tests/node/harness.py` | the real-socket harness: the sidecar and a fake Ollama on ephemeral ports, a fixture replayer and a raw-socket fake (helpers in `harness.py`, fixtures in `conftest.py`) |
 | 7 | `tests/node/test_config.py` | C1 to C11 |
 | 8 | `tests/node/test_gate.py` | K1 to K6, G1 to G12 |
 | 9 | `tests/node/test_http.py` | H1 to H29, B1 to B7, E1 to E16, HL1 to HL9, L1 to L3, K-OAS1 to K-OAS3 |
@@ -349,6 +349,28 @@ Two of those settings deserve a note:
   built request.
 
 Gated requests have `read=None` and `write=None`. Their only bound is the hold limit.
+
+**Details fixed by the code (S1-5).**
+- **Order.** The HTTP-version check (§4, 505) runs right after step 2, before step 3, so a
+  1.0 request is refused whatever its path.
+- **What `create_app` takes.** In S1-5 it takes `gate` only, which tests inject. `client`
+  arrives with the shared ungated client in S1-6.
+- **Routes for the proxy.** Until S1-6, step 7 answers 500 `INTERNAL`
+  (`X-Seriatim-Gate: ungated`), contacts nothing and takes no slot. No TD ID depends on it.
+- **The health probe.** `health_probe_timeout_s` bounds the whole probe, as well as each
+  phase of the health client, so a slowly dripping body can't stretch it. Any
+  `httpx.TransportError` counts as `ollama_unreachable`: for example, a connection closed
+  before a response, because Ollama has not answered. A body that isn't UTF-8 is
+  `ollama_bad_response`.
+- **`RequestLog.emit(level=…, **fields)`.** `level` defaults to `INFO`, and a line is written
+  only at or above `log_level`. The line is `ts` (UTC, milliseconds, from an injectable wall
+  clock), `level`, `event`, the fields as given, then `node`. Health logs `outcome: ok` or `degraded`. The 505, `BAD_PATH` and missing
+  `raw_path` lines have no `path`, `kind`, `scope` or `known`, because the path wasn't
+  checked or classified. So an unsafe path is never logged.
+- **The harness.** The helpers are in `tests/node/harness.py`, and `conftest.py` exposes them
+  as the `fake_ollama` and `sidecar` fixtures. Servers run in a thread, on a socket the
+  harness binds first. That lets a test hold a port closed ("Ollama is down") and later
+  start the fake on it (HL6).
 
 **`main()`** runs these steps:
 1. `load_settings()`. On `ConfigError`, print the message to stderr and exit 2.
