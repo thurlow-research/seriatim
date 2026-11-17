@@ -77,10 +77,12 @@ jobs:
       - run: uv sync --frozen
       # The models (about 1.5 GB) are cached between runs (SPEC §8.3). The key names the Ollama
       # version and the models. A pull request's run writes only its own PR-scoped cache, so it
-      # never reaches the runs on main.
+      # never reaches the runs on main. Only models/ is cached: Ollama's own key pair
+      # (id_ed25519) beside it never goes into a cache.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        id: models
         with:
-          path: ppe/data/ollama
+          path: ppe/data/ollama/models
           key: ppe-models-ollama-0.40.16-qwen2.5-0.5b-1.5b-all-minilm-22m-v1
       - name: Start the PPE through the guard
         run: ppe/ppe up --ci
@@ -105,6 +107,14 @@ jobs:
       - name: Stop the PPE
         if: always()
         run: ppe/ppe down
+      # Ollama writes the models as root, some mode 0600, so the cache step (which runs as the
+      # runner user after this job's steps) could not read them. Only on a cache miss.
+      - name: Let the cache step read the models
+        if: always() && steps.models.outputs.cache-hit != 'true'
+        run: |
+          if [ -d ppe/data/ollama/models ]; then
+            sudo chown -R "$(id -u):$(id -g)" ppe/data/ollama/models
+          fi
 
   # Reads both reports from this run (#9): fails closed if test or ppe did not succeed, or
   # either report is missing, empty or malformed, even while every TD says 'Enforced: no'.

@@ -229,7 +229,9 @@ def up(ci: bool) -> None:
     compose("up", "-d", "--wait", file=EFFECTIVE)
     print(f"ppe: Ollama {wait_for_ollama()} answers on {OLLAMA_URL}", flush=True)
     for model in MODELS:
-        compose("exec", "-T", "ollama-a", "ollama", "pull", model, file=EFFECTIVE)
+        # Captured: the progress bars would fill the log. A failure still shows stderr.
+        compose("exec", "-T", "ollama-a", "ollama", "pull", model, file=EFFECTIVE, capture=True)
+        print(f"ppe: pulled {model}", flush=True)
     print(f"ppe: up, with {', '.join(MODELS)}", flush=True)
 
 
