@@ -1,0 +1,32 @@
+{
+  "source": "SPEC REQ-5, copied verbatim (S0b, #26). S1's K3 checks gate.py's sets against this file. The blob routes take a real digest in place of <64 hex>.",
+  "ungated_infer": [
+    ["GET", "/"],
+    ["HEAD", "/"],
+    ["GET", "/api/tags"],
+    ["GET", "/api/ps"],
+    ["GET", "/api/version"],
+    ["POST", "/api/show"],
+    ["GET", "/v1/models"]
+  ],
+  "ungated_admin": [
+    ["POST", "/api/pull"],
+    ["POST", "/api/push"],
+    ["POST", "/api/copy"],
+    ["DELETE", "/api/delete"],
+    ["HEAD", "/api/blobs/sha256:<64 hex>"],
+    ["POST", "/api/blobs/sha256:<64 hex>"]
+  ],
+  "gated_infer": [
+    ["POST", "/api/generate"],
+    ["POST", "/api/chat"],
+    ["POST", "/api/embed"],
+    ["POST", "/api/embeddings"],
+    ["POST", "/v1/chat/completions"],
+    ["POST", "/v1/completions"],
+    ["POST", "/v1/embeddings"]
+  ],
+  "gated_admin": [
+    ["POST", "/api/create"]
+  ]
+}

@@ -89,9 +89,20 @@ jobs:
       - name: S0b checks (tests/behaviour)
         env:
           SERIATIM_PPE_URL: http://127.0.0.1:11434
+          SERIATIM_PPE_CAPTURE_OUT: ${{ runner.temp }}/ollama-0.40.16.json
         run: >-
           uv run --frozen pytest -m behaviour tests/behaviour -rA
           --junitxml="$RUNNER_TEMP/junit-ppe.xml"
+      # The fresh capture, for review: committed as tests/fixtures/ollama-0.40.16.json when a
+      # fixture changes (#26; SPEC §8.1). The shape check above compares it with the committed
+      # file.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always()
+        with:
+          name: ppe-capture
+          path: ${{ runner.temp }}/ollama-0.40.16.json
+          if-no-files-found: warn
+          retention-days: 30
       - name: What ran
         if: always()
         run: |
