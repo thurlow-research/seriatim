@@ -2316,7 +2316,7 @@ command output, and never just says "tests pass".
       - **No cache** is used, so it cannot be poisoned, and the job has a timeout.
     - **What it reports.**
       - **Publicly** (the check result, the job log and the summary): only "Private-terms
-        check failed. The maintainer has been notified." No file, line, count or term, and
+        check failed. The maintainer can decrypt the report artifact." No file, line, count or term, and
         the output is the same for one match as for many. Workflow logs and artifacts of a
         public repository are readable by anyone, so they get nothing more.
       - **For the maintainer:** the match locations are encrypted to the maintainer's

@@ -33,7 +33,7 @@ import sys
 import tempfile
 from collections.abc import Iterable
 
-GENERIC_FAIL = "Private-terms check failed. The maintainer has been notified."
+GENERIC_FAIL = "Private-terms check failed. The maintainer can decrypt the report artifact."
 PASS = "Private-terms check passed."
 REPORT_SIZE = 64 * 1024
 TRUNCATED = b"\n[report truncated to 64 KiB]\n"

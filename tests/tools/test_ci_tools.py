@@ -492,5 +492,13 @@ def test_main_prints_only_the_generic_line_and_always_writes_a_report(
     assert capsys.readouterr().out == private_terms.GENERIC_FAIL + "\n"
 
 
+def test_generic_fail_line_is_the_spec_wording():
+    """REQ-63: the public failure line is fixed, names nothing, and claims no notification."""
+    assert private_terms.GENERIC_FAIL == (
+        "Private-terms check failed. The maintainer can decrypt the report artifact."
+    )
+    assert "notified" not in private_terms.GENERIC_FAIL
+
+
 def test_python_is_new_enough():
     assert sys.version_info >= (3, 12)
