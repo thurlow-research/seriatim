@@ -185,6 +185,17 @@ passed, with these rules applied in order:
 Methods are compared in upper case as h11 delivers them. Because h11 keeps the method's case,
 `post` is not `POST`, so it falls to rule 5 and is gated.
 
+**Details fixed by the code (S1-3).**
+- **`SERIATIM` routes** have scope `none`, and `known` is true only with status 200. A 404 or
+  405 is `known=False`.
+- **`BLOB_RE` is used with `fullmatch`.** With `match` or `search`, its `$` would also match
+  before a trailing `\n`. `check_raw_path` refuses that byte anyway, but `classify` doesn't
+  rely on that, so a digest followed by `\n` is never classified as a blob.
+- **`classify` doesn't call `check_raw_path`.** The dispatcher calls `check_raw_path` first
+  (S1-5). `classify` is total and never raises.
+- **`PathError` messages** name the rule that refused the path, for example "the path
+  contains %2e". K2 asserts each one.
+
 ```python
 class SlotState(StrEnum): FREE = "free"; HELD = "held"; DRAINING = "draining"; STUCK = "stuck"
 
