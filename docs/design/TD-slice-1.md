@@ -115,16 +115,16 @@ in `gate.py` and checked against the route probe (K3).
    a `ConfigError` that names `SERIATIM_NODE_<FIELD>`, mapped from the error's `loc`.
 4. **Upstream URL.** `ollama_url` must meet all of these:
    - the scheme is `http`;
-   - the port is explicit;
+   - the port is explicit, and 1–65535 (`:0` is refused);
    - the path is empty or `/`;
    - there is no query, fragment or user info;
    - the host is an IP literal in `127.0.0.0/8`, or `::1`.
 
    `localhost` is a name, not a literal, so it is refused. No name resolution ever happens.
 5. **Listen address.** If `listen_host` is not a loopback literal and `allow_unauthenticated`
-   is false, raise `ConfigError`. When it is true, log a `WARNING` at startup. As for
-   `ollama_url`, a name is not a literal: `localhost` is refused too, and so is any
-   non-loopback IPv6 address, including `::` (C11).
+   is false, raise `ConfigError`. When it is true, `load_settings` logs a `WARNING`, so it
+   appears at startup. As for `ollama_url`, a name is not a literal: `localhost` is refused
+   too, and so is any non-loopback IPv6 address, including `::` (C11).
 6. **Lock directory.** A `lock_dir` other than `default_lock_dir()` is accepted only when
    `allow_unauthenticated` is true, which is the PPE and test mode. Otherwise it raises
    `ConfigError`. Two production sidecars therefore always meet at the same lock file, and
