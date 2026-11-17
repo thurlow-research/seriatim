@@ -138,7 +138,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - The limit MUST hold under every interleaving of arrivals, completions, disconnects,
     errors, keep-alive reuse and cancellation.
 
-  *Tests:* G1–G10, B4, H8.
+  *Tests:* G1–G12, B4, H8, E16.
 - **REQ-3. Immediate admission 429.** When no slot is free, a gated request MUST get HTTP 429
   with all of these:
   - `Retry-After` in whole seconds: the configured value (default 15), or the time left in a
@@ -195,7 +195,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - **Paths are matched exactly.** No trailing-slash folding, no case folding and no segment
     collapsing.
 
-  *Tests:* K1, K2, H6, H7.
+  *Tests:* K1, K2, K5, K6, H6, H7, H22.
 - **REQ-6. Passthrough.**
   - The sidecar MUST forward the method, the raw path, the query string and the request body
     bytes unchanged.
@@ -263,12 +263,12 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - While a slot drains, `/seriatim/status` reports it, and new gated requests get the
     admission 429.
 
-  *Tests:* B2, S4–S9, E1, E3–E5, F1–F5.
+  *Tests:* B2, S4–S9, S11, S14–S16, S20, S21, E1, E3–E5, E7, E9, E15, F1–F5.
 - **REQ-11. No forced release.** The sidecar MUST NOT free a slot while the request holding it
   may still be talking to Ollama. A leaked slot shows up as a fault (REQ-18), never as two
   requests running at once.
 
-  *Tests:* G5, S7, F4.
+  *Tests:* G5, S7, S11–S13, F4, E16.
 - **REQ-12. Maximum hold.** A request MUST be cut off once it has held its slot for
   `SERIATIM_NODE_MAX_HOLD_S` seconds (default 1800).
   - Before the response headers were sent: HTTP 504 `LOCK_HOLD_EXCEEDED`.
@@ -300,7 +300,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - If the lock is held by another process, or cannot be created, the sidecar MUST exit with
     code 3 and a message.
 
-  *Tests:* R3, R4.
+  *Tests:* R3, R4, R6–R9.
 
 ### 4.2 Sidecar: authentication (slice S2)
 
@@ -518,7 +518,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     so an offline node with another fault shows both.
   - The body never contains versions, models or addresses.
 
-  *Tests:* HL1–HL4.
+  *Tests:* HL1–HL9, G11.
 - **REQ-19. Exposure check (ruling: fail closed).**
   - At startup and every 5 minutes, the sidecar tries to connect to Ollama's port on each of
     the host's non-loopback interface addresses, IPv4 and IPv6. IPv6 link-local addresses are
@@ -732,7 +732,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       `REQUEST_BODY_TIMEOUT`.
     - After the first byte, it gets 408 `UPLOAD_INTERRUPTED`, which is **not** replay-safe.
 
-  *Tests:* E3, E4, E6, H10.
+  *Tests:* E3, E4, E6–E13, B7, H10, H26, H27.
 - **REQ-20a. Path safety.** Before classifying, the sidecar MUST reject with 400 `BAD_PATH`
   any raw path that contains any of the following. The check is case-insensitive and runs
   before any decoding or normalisation:
@@ -741,7 +741,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - an empty segment (`//`);
   - a NUL byte or a control character (below `0x20`, or `0x7f`).
 
-  *Tests:* K2.
+  *Tests:* K2, K4.
 - **REQ-21. Single process, HTTP/1.1.** The lock is in-process state, so the sidecar runs as one
   process with one event loop. There is no setting for more workers. It serves HTTP/1.1 only
   (h11), and talks HTTP/1.1 only to Ollama. Any other HTTP version gets 505
@@ -749,12 +749,12 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   response ends when the connection closes, so an abort would look like a complete
   response.
 
-  *Tests:* C8.
+  *Tests:* C8, H28.
 - **REQ-22. Logs.**
   - One JSON line per request, with the fields given in TD-slice-1 Appendix A.
   - Never a request or response body, and never a credential.
 
-  *Test:* L1.
+  *Tests:* L1–L3, H18, HL9.
 - **REQ-23. Configuration.**
   - The sidecar reads only `SERIATIM_NODE_*` environment variables, plus an optional TOML file
     named by `SERIATIM_NODE_CONFIG`; environment variables take precedence. The gateway reads
@@ -764,7 +764,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     file MUST stop startup with exit code 2 and a message that names the key.
   - Only `.env.example`, with placeholder values, is committed.
 
-  *Tests:* C1–C7.
+  *Tests:* C1–C7, C9, C10.
 - **REQ-24. Errors after the response headers.** If Ollama fails, or the hold limit passes,
   after the headers were sent:
   - **Error record.** The sidecar MAY send one final error record, but only when it can be
@@ -779,7 +779,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 
   Either way, the client cannot mistake the response for a complete one.
 
-  *Tests:* S6, S7, S10.
+  *Tests:* S6, S7, S10, S17–S20.
 - **REQ-25. The error envelope.** Every error Seriatim produces uses the envelope in ADR-001
   §5.4:
   - `error` (a string, so Ollama clients still work), `error_code`, `retryable`,
@@ -790,7 +790,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   Errors from Ollama itself are passed through unchanged, as described in the contract's
   `UpstreamError`.
 
-  *Tests:* K-OAS2, K-OAS3.
+  *Tests:* K-OAS2, K-OAS3, H19, H25.
 - **REQ-26. Upstream failures.**
   - Connection refused or a connect timeout: 502 `UPSTREAM_UNAVAILABLE`, with
     `replay_safe: true`.
@@ -799,7 +799,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - An unexpected internal error: 500 `INTERNAL`, with `replay_safe: false`.
   - The slot follows REQ-10 in every case.
 
-  *Tests:* E1, E5, F1–F3.
+  *Tests:* E1, E5, E15, F1–F3, H23, H26.
 - **REQ-27. TLS (ruling Q6: optional in v1; slice S11).** Both the sidecar and the gateway
   accept a certificate and key file, and then serve HTTPS. The default is plain HTTP.
 

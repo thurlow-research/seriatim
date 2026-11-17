@@ -1,9 +1,11 @@
 # TD — Slice 1: contract, sidecar gate, 429 and passthrough
 
-**Status:** revision 7, for review. **Date:** 2026-11-17. Revision 5 updates Appendix B
+**Status:** revision 8, for review. **Date:** 2026-11-17. Revision 5 updates Appendix B
 to the mutation layout S0a built (PR #13); revision 6 adds the enforcement line below and
 the `td-test-ids` job to Appendix B (#16); revision 7 says what "exists" means for `HEAD` in
-the route probe (Appendix B, S0b; #29).
+the route probe (Appendix B, S0b; #29); revision 8 adds the 57 scenarios of #15 as tests
+(57 new IDs; Appendix C maps each one) and fixes the design gaps they found (Appendix C,
+"Design changes").
 
 Enforced: no
 
@@ -40,11 +42,11 @@ TD is merged before its code (ADR-001 §10).
 | 4 | `node/seriatim_node/proxy.py` | `Proxy`: passthrough with streaming, disconnects, the hold limit, framing-safe errors and the shielded release |
 | 5 | `node/seriatim_node/app.py` | the dispatcher, `ErrorCode` and the error table, `/seriatim/health`, `RequestLog`, the singleton lock, `main()` |
 | 6 | `tests/node/conftest.py` | the real-socket harness: the sidecar and a fake Ollama on ephemeral ports, a fixture replayer and a raw-socket fake |
-| 7 | `tests/node/test_config.py` | C1 to C8 |
-| 8 | `tests/node/test_gate.py` | K1 to K3, G1 to G10 |
-| 9 | `tests/node/test_http.py` | H1 to H14, B1 to B5, E1 to E6, HL1 to HL4, L1, K-OAS1 to K-OAS3 |
-| 10 | `tests/node/test_streaming.py` | S1 to S10, F1 to F5 |
-| 11 | `tests/node/test_process.py` | R1 to R5 (subprocess: startup quarantine, kill and restart, duplicate start) |
+| 7 | `tests/node/test_config.py` | C1 to C11 |
+| 8 | `tests/node/test_gate.py` | K1 to K6, G1 to G12 |
+| 9 | `tests/node/test_http.py` | H1 to H29, B1 to B7, E1 to E16, HL1 to HL9, L1 to L3, K-OAS1 to K-OAS3 |
+| 10 | `tests/node/test_streaming.py` | S1 to S21, F1 to F5 |
+| 11 | `tests/node/test_process.py` | R1 to R9 (subprocess: startup quarantine, kill and restart, duplicate start, the lock file) |
 | 12 | `tests/behaviour/test_sidecar.py` | P1 to P7 (black-box; the required `ppe` CI job) |
 | 13 | `ppe/compose.yaml` (modified) | adds the `node-a` sidecar container in `ollama-a`'s network namespace |
 
@@ -88,6 +90,9 @@ def default_lock_dir() -> Path           # %ProgramData%\seriatim\run | /Library
 def load_settings(environ: Mapping[str, str] = os.environ) -> Settings
 ```
 
+Every float setting must be finite: `nan`, `inf` and `-inf` are refused (`allow_inf_nan=False`;
+C9). Enum values are case-sensitive, so `LOG_LEVEL=debug` is refused.
+
 There is no `workers` setting (REQ-21), and no configurable allowlist. The allowlist is fixed
 in `gate.py` and checked against the route probe (K3).
 
@@ -115,7 +120,9 @@ in `gate.py` and checked against the route probe (K3).
 
    `localhost` is a name, not a literal, so it is refused. No name resolution ever happens.
 5. **Listen address.** If `listen_host` is not a loopback literal and `allow_unauthenticated`
-   is false, raise `ConfigError`. When it is true, log a `WARNING` at startup.
+   is false, raise `ConfigError`. When it is true, log a `WARNING` at startup. As for
+   `ollama_url`, a name is not a literal: `localhost` is refused too, and so is any
+   non-loopback IPv6 address, including `::` (C11).
 6. **Lock directory.** A `lock_dir` other than `default_lock_dir()` is accepted only when
    `allow_unauthenticated` is true, which is the PPE and test mode. Otherwise it raises
    `ConfigError`. Two production sidecars therefore always meet at the same lock file, and
@@ -274,8 +281,9 @@ def main() -> None
 before Starlette sees it. That is what lets it check the raw path first. For each request:
 1. `lifespan` messages go to the Starlette app. Its lifespan creates the `Gate` (which starts
    in quarantine) and the `httpx.AsyncClient`, and closes the client on shutdown.
-2. It sanitises `X-Request-Id`: the value is kept if it matches `^[A-Za-z0-9._-]{1,128}$`,
-   and otherwise replaced with a fresh `uuid4().hex`.
+2. It sanitises `X-Request-Id`: the value is kept if the request has **exactly one**
+   `X-Request-Id` header and its value matches `^[A-Za-z0-9._-]{1,128}$`. Otherwise (none,
+   several, or an invalid value) it is replaced with a fresh `uuid4().hex` (H18).
 3. It reads `scope["raw_path"]`. If the key is missing, that is a server fault, so it returns
    500 `INTERNAL` (fail closed). Uvicorn with h11 always sets it.
 4. `check_raw_path(raw_path)`. A `PathError` gives 400 `BAD_PATH`.
@@ -384,8 +392,9 @@ exception type.
  6      r ← gate.try_acquire(path, request_id)
  7      Busy     → 429 GPU_BUSY, Retry-After, X-Seriatim-Gate: busy; return   # body never read
  8      Starting → 503 NODE_STARTING, Retry-After, X-Seriatim-Gate: refused; return  # body never read
- 9      lease ← r; req_client ← new_gated_client()
+ 9      lease ← r
 10  try:
+10a     if lease: req_client ← new_gated_client()        # inside the try: a failure still ends the lease (E16)
 11      with anyio.move_on_after(deadline_remaining(lease)) as hold:      # inf when ungated
 12          async with anyio.create_task_group() as tg:
 13              await self._exchange(..., outcome, tg)       # never raises Exception; stops before
@@ -437,7 +446,9 @@ Cancellation is a `BaseException` in anyio, so `except Exception` never swallows
 steps:
 
 1. **Read the body.**
-   - Gated route: `body = await read_body(receive, limit, body_timeout_s)`.
+   - Gated route: `body = await read_body(receive, limit, body_timeout_s)`. The timeout
+     bounds the **whole** read, from the first `receive()` to the last, and is not reset by
+     each chunk (REQ-20: "has not fully arrived within"; E8).
    - Every other route is buffered the same way, except `POST /api/blobs/sha256:<hex>`.
    - **Blob uploads** can be gigabytes, so they are streamed with `content =
      body_stream(receive)`. Streaming skips the size limit, but the stream still has an idle
@@ -480,10 +491,14 @@ steps:
    - `await send(http.response.start)` with `downstream_headers(...)`, then
      `outcome.started = True`.
    - For each chunk of `resp.aiter_raw()`: `await send(http.response.body, chunk,
-     more_body=True)`, and `outcome.tail` keeps the last two bytes sent.
+     more_body=True)`, and `outcome.tail` keeps the last two bytes sent **of the whole
+     stream**, `(tail + chunk)[-2:]`, so a record boundary split across chunks (even
+     one-byte chunks) is still seen (S19).
    - When the iterator ends normally, it sets `outcome.upstream_done = True` and returns,
-     but only if the upstream response was **framed**: either it had a `content-length` that
-     the received bytes matched, or it was chunked and ended with the terminating chunk.
+     but only if the upstream response was **framed**: it had a `content-length` that the
+     received bytes matched; or it was chunked and ended with the terminating chunk; or it
+     has no body by HTTP's rules, because the request was `HEAD` or the status is 1xx, 204 or
+     304 (S21).
    - A response with neither is close-delimited, and ends when Ollama closes the connection.
      A crash would look the same as a normal end. So such a response is treated as broken at
      its end: an in-stream record if framing allows, an abort, and a drain. Ollama, a Go
@@ -535,7 +550,9 @@ when all of these hold:
 - **The node is not starting.** `gate.starting()` is false.
 
 Otherwise it returns 503 `{"status":"degraded","reasons":[…]}`. The reasons, in this order:
-- `ollama_unreachable`: connect error or timeout;
+- `ollama_unreachable`: a connect error or any timeout, including the health client's pool
+  timeout when many probes wait for its one connection (HL8). No probe error escapes as a
+  500;
 - `ollama_bad_response`: a status other than 200, a body that is not JSON or not an object,
   or a missing or empty `version`;
 - `slot_overdue`;
@@ -563,20 +580,24 @@ Then:
 - `content-length` is set from `body_len` when the body was buffered. For an ungated stream,
   the client's validated `content-length` is kept if it sent one; otherwise httpx sends the
   body chunked.
-- `x-request-id` is set to the sanitised id.
+- `x-request-id` is set to the sanitised id, after every `x-request-id` the client sent has
+  been removed.
 
 **Why `accept-encoding` is removed.** Ollama then never compresses. The sidecar does not
 decode, so this keeps in-stream error records safe to frame. It costs some bandwidth on
 loopback only.
 
 **Response headers** (`downstream_headers`). Removed:
-- the hop-by-hop headers;
+- the hop-by-hop headers, the same list as for requests, including every header named in
+  the **response's** own `Connection` (H15);
 - every `access-control-*` header (Seriatim serves no CORS; T11);
 - every `x-seriatim-*` header (T9);
 - the compatibility headers `x-resolved-model`, `x-model-digest`, `x-execution-device`,
   `x-rerouted-from`, `x-reroute-reason` and `x-context-clamped`;
-- `set-cookie` and `server`.
+- `set-cookie`, `server` and `x-request-id`, so a conflicting id from Ollama never reaches the
+  client (H18).
 
+Every other header is kept, and a repeated header keeps all its values, in order (H17).
 Kept unchanged: `content-type`, `content-length` and `content-encoding`. Then added:
 `x-seriatim-gate` (`acquired` if a slot was taken, otherwise `ungated`), `x-seriatim-node`
 and `x-request-id`. Without a `content-length`, uvicorn sends chunked encoding.
@@ -635,7 +656,7 @@ column shows the lease result for a gated request.
 | `ConnectError`, `ConnectTimeout` | 502 `UPSTREAM_UNAVAILABLE` (replay-safe) | — | freed | `upstream_unavailable` |
 | `PoolTimeout` (ungated pool full; gated requests have their own connection) | 503 `NODE_SATURATED` + `Retry-After` (replay-safe) | — | no slot | `saturated` |
 | `WriteError`, `ReadError`, `RemoteProtocolError`, other `httpx.TransportError` | 502 `UPSTREAM_PROTOCOL_ERROR` | record `UPSTREAM_STREAM_BROKEN` if framing allows, then abort | drains | `upstream_error` |
-| Hold limit passed | 504 `LOCK_HOLD_EXCEEDED` | record `LOCK_HOLD_EXCEEDED` if framing allows, then abort | drains | `hold_exceeded` (`CRITICAL`) |
+| Hold limit passed | 504 `LOCK_HOLD_EXCEEDED` | record `LOCK_HOLD_EXCEEDED` if framing allows, then abort | drains if sent upstream; freed if it passed while the body was still being read (E9) | `hold_exceeded` (`CRITICAL`) |
 | Client disconnect | nothing sent | nothing sent | drains | `client_disconnect` |
 | External cancellation (shutdown) | nothing sent | abort | drains | `cancelled` |
 | Ollama non-2xx (including 429) | passed through unchanged | — | freed (clean end) | `ok` (with `status`) |
@@ -749,6 +770,9 @@ also run on `windows-latest` and `macos-latest`.
 | C6 | `SERIATIM_NODE_SLOTZ=1` → `ConfigError` naming it. `SERIATIM_APP_ID=1`, `SERIATIM_CONFIG_DIR=/x` and `SERIATIM_GW_FOO=1` are ignored | 23 |
 | C7 | `SERIATIM_NODE_CONFIG=/nonexistent.toml` → `ConfigError`; a malformed TOML file → `ConfigError` | 23 |
 | C8 | `main()` with invalid config exits 2 and prints the key. With valid config it calls `uvicorn.run` with `workers=1` and `http="h11"` (monkeypatched) | 21, 23 |
+| C9 | Ranges and types C3 doesn't cover → `ConfigError` naming the variable. `LISTEN_PORT` = `0`, `65536`, `x`; `ID` = `Node`, `-a`, 33 characters, empty; `CONNECT_TIMEOUT_S` and `CLOSE_TIMEOUT_S` = `0`, `61`; `UNGATED_READ_TIMEOUT_S` = `0`, `3601`; `MAX_BODY_BYTES=1023`; `BODY_TIMEOUT_S` = `0`, `3601`; `HEALTH_PROBE_TIMEOUT_S` = `0`, `31`; `LOG_LEVEL` = `debug`, `TRACE`. Every float field also refuses `nan`, `inf` and `-inf`. The boundary values (`1`, `65535`, `60`, `3600`, `1024`, `30`) are accepted | 23 |
+| C10 | `SERIATIM_NODE_CONFIG` names a file that exists but can't be read (POSIX, mode `000`; skipped on Windows and as root) → `ConfigError` naming `SERIATIM_NODE_CONFIG`. A `.env` file in the working directory with `SERIATIM_NODE_SLOTS=5` → ignored: `slots == 1` | 23 |
+| C11 | `LISTEN_HOST` = `192.0.2.10`, `::`, `example.com` or `localhost`, without `ALLOW_UNAUTHENTICATED` → `ConfigError` naming it; `::1` and `127.0.0.2` are accepted | 15 |
 
 ### 8.2 `test_gate.py`
 
@@ -757,6 +781,9 @@ also run on `windows-latest` and `macos-latest`.
 | K1 | Table-driven `classify`, with the expected (kind, scope, known) for every pair in §2.2 rules 2 to 4, including `POST /api/create` → gated, admin, known. Also gated + admin + `known=False`: `OPTIONS /api/tags`, `GET /api/chat`, `POST /api/chat/`, `POST /API/CHAT`, `post /api/chat`, `PUT /api/chat`, `POST /api/blobs`, `POST /api/blobs/sha256:XYZ`, `GET /api/unknown`, `POST /api/new-feature`. `SERIATIM` gives 200 for `GET /seriatim/health`, 405 for `POST /seriatim/health`, 404 for `GET /seriatim/nope` and `GET /seriatim` | 5 |
 | K2 | `check_raw_path` raises for: `/api/chat/../show`, `/api/./chat`, `/api//chat`, `/api/%2e%2e/show`, `/api/%2E%2e/show`, `/api%2fchat`, `/api%2Fchat`, `/api%5cchat`, `/api\chat`, `/api/chat%00`, `/api/chat\x01`, `api/chat` and `//api/chat`. It accepts `/api/blobs/sha256:<hex>` and `/api/show%20x`. Hypothesis: any path containing a `.`/`..` segment or a listed escape raises | 20a |
 | K3 | The pairs in `UNGATED_INFER`, `UNGATED_ADMIN` and `GATED_INFER` equal `tests/fixtures/route-pairs.json`, and equal the contract's paths. Every pair is marked `exists: true` in the route probe in `tests/fixtures/ollama-0.40.16.json` (see Appendix B for what "exists" means) | 5 |
+| K4 | Every forbidden byte, not one sample: `/api/chat` followed by each of `0x00`–`0x1f` and `0x7f` (33 cases) → `PathError`. Allowed escapes pass unchanged and are classified by their raw bytes: `/api/chat%41`, `/api/chat%252e`, `/api/%252e%252e/show` and `/api/chat%20` pass `check_raw_path` and are gated, admin, `known=False` (never `/api/chat`) | 20a, 5 |
+| K5 | Blob digests. `HEAD` and `POST` on `/api/blobs/sha256:` followed by 63 hex digits, 65 hex digits, 64 upper-case hex digits, or 64 hex digits and `/` → gated, admin, `known=False`; 64 hex digits and `\n` → `PathError`. Exactly 64 lower-case hex digits → ungated, admin | 5, 20a |
+| K6 | Look-alikes of Seriatim's paths are not Seriatim's: `/seriatimx`, `/seriatim-health` and `/Seriatim/health` → gated, admin, `known=False` (REQ-5 rule 5: an unknown path is forwarded, gated), never `SERIATIM` | 5 |
 | G1 | After the quarantine (fake clock advanced by `drain_s`), `try_acquire` returns a `Lease`; the slot is `HELD` | 2 |
 | G2 | slots 1, one lease held → `Busy(retry_after_s=15, busy_for_s≥0)` | 2, 3 |
 | G3 | slots 2: two leases, the third is `Busy` | 2 |
@@ -767,6 +794,8 @@ also run on `windows-latest` and `macos-latest`.
 | G8 | A new `Gate` returns `Starting(retry_after_s=ceil(drain_s))` until `drain_s` passes; `starting()` is true until then | 12a |
 | G9 | Hypothesis: random sequences of acquire, finish(clean), finish(drain), stuck and clock steps (slots 1–4) keep `held + draining + stuck ≤ slots`, and never return a `Lease` while no slot is `FREE` | 2, 10, 11 |
 | G10 | `Gate(slots=0)` and `Gate(drain_s=0)` raise `ValueError` | 2, 10 |
+| G11 | Monotonic time only. With an injected monotonic clock and a separate wall clock, moving the wall clock by ±1 day changes nothing in `try_acquire`, the drain or `overdue()`. The overdue boundary is strict: a holder at exactly `max_hold_s + grace_s` is not overdue; one at that plus 1 ms is | 10, 18 |
+| G12 | slots 3: one `HELD`, two `DRAINING` with 4 s and 9 s left, `retry_after_s=1` → `Busy(retry_after_s=4)`, the **earliest** drain. Every slot `DRAINING` → `busy_for_s == 0` | 2, 3 |
 
 ### 8.3 `test_http.py`
 
@@ -786,22 +815,56 @@ also run on `windows-latest` and `macos-latest`.
 | H13 | A close-delimited upstream response (`raw_upstream`: no `content-length`, not chunked, then close) → treated as broken: the client's response is aborted, and the slot drains. A `Content-Length: 100` response cut at 50 bytes → aborted, and the slot drains. The client sends `X-Forwarded-For` and `Forwarded` → upstream receives neither | 6, 24 |
 | H14 | With the ungated pool full (16 held `/api/show` requests on a stalled fake), the 17th `/api/show` → 503 `NODE_SATURATED`; a gated `/api/chat` and the health probe still succeed | 20, 18 |
 | H12 | A raw-socket `HTTP/1.0` request to `/api/chat`, and one to `/api/tags` → 505 `HTTP_VERSION_UNSUPPORTED`; upstream received nothing; no slot taken | 21, 24 |
+| H15 | `Connection` with several mixed-case tokens, and in both directions: the client sends `Connection: Keep-Alive, X-A ,x-b` (and a second `Connection: X-C`) with `X-A`, `X-B` and `X-C` → upstream gets none of them. Upstream answers with `Connection: X-D, x-e`, `X-D` and `X-E` → the client gets none of them | 6 |
+| H16 | The full strip lists (§4, ADR-001 §5.3), table-driven. Request side: `Proxy-Authorization`, `TE`, `Trailer`, `Upgrade`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`, two `Authorization` headers, `AUTHORIZATION`, `x-API-key` and `X-SERIATIM-GATE` → none reaches upstream. Response side: `Proxy-Authenticate`, `Server`, `X-Resolved-Model`, `X-Model-Digest`, `X-Execution-Device`, `X-Rerouted-From`, `X-Reroute-Reason`, `X-Context-Clamped`, `X-Seriatim-Node` and `X-Request-Id` → none reaches the client from Ollama; Seriatim's own `X-Seriatim-*` and `X-Request-Id` appear exactly once | 6, 13 |
+| H17 | Repeated end-to-end headers survive: the client sends `X-Custom: a` and `X-Custom: b`; upstream answers with two `Link` headers → each side receives both values, in order | 6 |
+| H18 | `X-Request-Id`. A valid `abc-1.2_3` is echoed, forwarded and logged. Empty, 129 characters, `a b` and `a/b` are each replaced with a fresh 32-hex id, which is echoed, forwarded and logged instead. Two `X-Request-Id` headers → replaced. Values with CR or LF can't be sent over HTTP, so the sanitiser is also unit-tested with `a\r\nb` → replaced. Upstream answers with `X-Request-Id: upstream` → the client sees only the sidecar's id | 22, 6 |
+| H19 | Every response class carries exactly one `X-Seriatim-Node` (equal to `settings.id`), one `X-Request-Id` and the right `X-Seriatim-Gate` (§5): 200 gated (`acquired`); 200 ungated, health 200 and 503, 400 `BAD_PATH`, 404, 405, 413 before admission and 505 (`ungated`); 429 (`busy`); 503 `NODE_STARTING` (`refused`); 413 or 408 after a slot was taken, 502, 504 and 500 after a slot was taken (`acquired`); 503 `NODE_SATURATED` and 500 on an ungated route (`ungated`) | 25 |
+| H20 | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY=` are set in `os.environ`, pointing at a recording fake proxy → gated, ungated and health requests all reach `fake_ollama`, and the proxy records nothing | 1 |
+| H21 | Upstream answers `302` with `Location: http://192.0.2.1/x` → the client gets the 302 with `Location` unchanged; `fake_ollama` recorded one request, and nothing was sent to the `Location` | 6 |
+| H22 | Seriatim's own paths over real HTTP: `GET /seriatim/nope` and `GET /seriatim` → 404 `NOT_FOUND`; `POST /seriatim/health` → 405 `METHOD_NOT_ALLOWED` with `Allow: GET`. Each body validates against `ErrorEnvelope` and carries `X-Seriatim-Gate: ungated`; `fake_ollama` recorded nothing, and no slot was taken | 5 |
+| H23 | The ASGI app is called directly with a scope that has no `raw_path` → 500 `INTERNAL`; `fake_ollama` recorded nothing; every slot is still `FREE` | 26 |
+| H24 | In S1 the body is opaque bytes (S3's inspection does not exist yet): `{"a":`, `{"model":"a","model":"b"}`, the invalid UTF-8 `\xff\xfe`, and 1 KiB of random bytes sent to `/api/chat` → `fake_ollama` records identical bytes each time, and the sidecar adds no error of its own | 6, 7 |
+| H25 | Clean upstream errors pass through: 500 `{"error":"x"}`, 503 `text/plain` `oops` and 502 `text/html` → status, `content-type` and bytes unchanged; the slot is freed at once (the next request gets 200 with the fake clock not advanced) | 6, 25 |
+| H26 | Ungated stalls. `ungated_read_timeout_s=0.5`: `/api/show` with the fake stalling before the headers → 502 `UPSTREAM_PROTOCOL_ERROR` within the bound; stalling after the headers → aborted. A client disconnect during an ungated stream → the fake sees the upstream close. In every case the shared pool has no connection in use afterwards, and every gate slot stays `FREE` throughout. When the shared response's `aclose()` blocks → `upstream_close_failed` at `ERROR` within `close_timeout_s`, and the client is answered or aborted within `2 × close_timeout_s` | 20, 26 |
+| H27 | The `NODE_SATURATED` response from H14 in full: `Retry-After` equals `retry_after`, `X-Seriatim-Gate: ungated`, and `retryable` and `replay_safe` are the `ERROR_TABLE` values (`replay_safe: true`); the body validates against `ErrorEnvelope` | 20, 25 |
+| H28 | Request smuggling, over a raw socket: two different `Content-Length` headers; `Content-Length: 5, 6`; `Content-Length: -1`; `Transfer-Encoding: chunked` together with `Content-Length`; `Transfer-Encoding: gzip, chunked`; and a chunked body with a trailer and a second request hidden in it → each is refused by the HTTP layer with a 400 and a closed connection, or parsed as exactly one request with the body its framing gives. `fake_ollama` never records a request the client didn't frame, and no slot is taken by one | 21, 2 |
+| H29 | A refused request, then another on the same keep-alive socket: request 1 gets 429 (busy) after sending its 4 KiB body; request 2 follows on the same socket → it is parsed as its own request (200 once the holder ends), or the server closes the connection. Request 1's body bytes are never read as a request. The same after a 413 | 3, 21 |
 | B1 | Request 1 is held at upstream; request 2 (`/api/chat`) → 429 within the bound, with `Retry-After: 15` and `X-Seriatim-Gate: busy`. The body validates against `ErrorEnvelope`: `error_code: GPU_BUSY`, `retryable: true`, `replay_safe: true`, `retry_after: 15`, `source: sidecar`, `busy_for_s ≥ 0`. `fake_ollama` recorded **one** request | 3, 4, 25 |
 | B2 | Request 1 ends cleanly → a new request 2 gets 200 at once | 10 |
 | B3 | Raw socket: request 1 is held; request 2 sends only the headers, with `Content-Length: 10485760` → the 429 arrives without any body being sent | 3 |
 | B4 | slots 2: two held requests proceed and the third gets 429; after one finishes cleanly, a fourth gets 200 | 2 |
 | B5 | During startup quarantine: gated → 503 `NODE_STARTING` with `Retry-After ≤ drain_s` and `X-Seriatim-Gate: refused`, and the request body is never read; `GET /api/tags` → 200; health → 503 with `starting` | 12a, 18 |
+| B6 | Raw socket, `Expect: 100-continue` with `Content-Length: 10485760`: while busy → 429, and while starting → 503 `NODE_STARTING`. In both, no `100 Continue` is sent first, so the client never sends its body | 3, 12a |
+| B7 | The size check comes before admission: an honest `Content-Length` over `max_body_bytes` while every slot is `HELD` → 413, not 429; during the startup quarantine → 413, not 503 | 20, 3 |
 | E1 | `ollama_url` points at a closed port → 502 `UPSTREAM_UNAVAILABLE` with `replay_safe: true`; the next request also gets 502, not 429, because the slot was freed: nothing was sent | 26, 10 |
 | E2 | An unsafe raw path sent over a raw socket (`POST /api/chat/../show`) → 400 `BAD_PATH`; upstream received nothing | 20a |
 | E3 | `max_body_bytes=2048`: a 4096-byte body with an honest `Content-Length` → 413, and no slot was taken. The same body chunked, without a length → 413, and the slot was freed. Upstream received nothing | 20 |
 | E4 | `body_timeout_s=0.5`: a raw socket sends half the body and stalls → 408 `REQUEST_BODY_TIMEOUT`; the slot was freed | 20 |
 | E6 | A blob upload whose client stalls after 1 MiB has been forwarded → 408 `UPLOAD_INTERRUPTED` with `replay_safe: false`; the upstream connection is closed. A stall before the first chunk → 408 `REQUEST_BODY_TIMEOUT` with `replay_safe: true` | 20, 25 |
 | E5 | An unexpected exception inside the proxy (monkeypatch `downstream_headers` to raise) → 500 `INTERNAL` with a generic message; the traceback is in the log and not in the body; the slot drains (the request reached upstream) | 26 |
+| E7 | The client sends half of a gated body and closes → `fake_ollama` recorded nothing; the slot is `FREE` with no drain; log `outcome: client_disconnect`, `slot_end: free` | 10, 20 |
+| E8 | `body_timeout_s=1`: a raw socket sends one byte every 0.3 s → 408 `REQUEST_BODY_TIMEOUT` after about 1 s in total (the timeout is not reset by each chunk); the slot is freed | 20 |
+| E9 | `max_hold_s=1`, `body_timeout_s=30`: a gated body trickles in past 1 s → 504 `LOCK_HOLD_EXCEEDED`; `fake_ollama` recorded nothing; the slot is freed with no drain | 12, 10 |
+| E10 | `max_body_bytes=2048`: an empty body and a 2048-byte body are forwarded (200); 2049 bytes → 413, with an honest `Content-Length` and chunked | 20 |
+| E11 | Ungated buffered routes enforce the limits too: `POST /api/show`, `POST /api/pull` and `DELETE /api/delete` with a body over `max_body_bytes` → 413, and with a stalled body → 408 `REQUEST_BODY_TIMEOUT`; `fake_ollama` recorded nothing | 20 |
+| E12 | Blob upload disconnects. The client leaves before the first chunk → `fake_ollama` recorded no request; log `client_disconnect`. The client leaves after the first chunk was forwarded → the fake sees the upstream connection close; log `upload_interrupted` | 20, 25 |
+| E13 | A chunked blob upload with no `Content-Length`: 3 MiB in uneven chunks → the SHA-256 of the received bytes matches. An empty chunked upload → forwarded as an empty body, and the upstream status is passed through | 6, 20 |
+| E14 | One owner of `receive`: a wrapped `receive` fails the test if it is entered while another call is pending. A blob upload with a disconnect before, during and after the body, and a gated request with a disconnect while waiting for headers → no concurrent `receive()` calls | 10, 20 |
+| E15 | Internal errors before and after the response starts. `upstream_headers` is monkeypatched to raise on a gated request → 500 `INTERNAL`; `fake_ollama` recorded nothing; the slot is freed with no drain. The relay is made to raise after `http.response.start` → aborted; a wrapped `send` sees no second `http.response.start`; the slot drains | 26, 10 |
+| E16 | `new_gated_client` is monkeypatched to raise right after the slot is taken → 500 `INTERNAL`; the slot is `FREE` (the next request is admitted); the lease had exactly one effective end | 2, 11 |
 | HL1 | Upstream `/api/version` 200 `{"version":"0.40.16"}` → health 200 `{"status":"ok"}`, no other keys | 18 |
 | HL2 | Upstream down → 503 with `["ollama_unreachable"]` | 18 |
 | HL3 | Upstream `/api/version` returns each of: 500; 200 `not json`; 200 `[]`; 200 `{}`; 200 `{"version":""}`; 200 `{"version":7}` → each gives 503 with `["ollama_bad_response"]` | 18 |
 | HL4 | An injected overdue lease → `slot_overdue`; an injected stuck slot → `slot_stuck`. The body never contains the version string | 18 |
+| HL5 | The probe connects, then stalls: once before the headers and once in the middle of the body → 503 `["ollama_unreachable"]` within `health_probe_timeout_s` plus the bound | 18 |
+| HL6 | Several faults at once: upstream down, an overdue lease, a stuck slot and the startup quarantine → `reasons` is exactly `["ollama_unreachable", "slot_overdue", "slot_stuck", "starting"]`. Clearing each fault in turn removes only its reason, and the rest stay in order | 18 |
+| HL7 | Normal use is not a fault: slots 2, one `HELD` within its limit and one `DRAINING` → 200 `{"status":"ok"}` | 18 |
+| HL8 | 200 concurrent health requests on a fake that stalls `/api/version` → each gets 200, or 503 with known reasons, within `health_probe_timeout_s` plus the bound. None gets a 500, and a gated `/api/chat` sent meanwhile gets 200 | 18 |
+| HL9 | Health requests are logged at `DEBUG` only: at `LOG_LEVEL=INFO`, 10 health requests add no log line; at `DEBUG`, each adds exactly one | 22 |
 | L1 | After H1, B1, E1 and S4: one JSON log line each, with the fields in Appendix A. No line contains the body marker string, the `Authorization` value or the `X-API-Key` value | 22, 13 |
+| L2 | Exactly one log line per request, with the `status`, `outcome`, `bytes_in`, `bytes_out` and `slot_end` of §5, on every path: 400, 404, 405, 413 before and after admission, 408, 429, 503 `NODE_STARTING`, a disconnect while sending the body (E7), `upload_interrupted` (E12), `hold_exceeded` (S7), a stuck close (F4) and a shutdown (S11) | 22 |
+| L3 | Nothing secret reaches the log: the request has `Cookie: c=<marker>` and the query `?key=<marker>&token=<marker>`; the response has `Set-Cookie: s=<marker>`; and an internal error (E15) is raised while the body holds the marker → no log line contains the marker. The query string is never logged (`path` is the path only) | 22, 13 |
 | K-OAS1 | `contract/openapi.yaml` passes `openapi-spec-validator` (OpenAPI 3.1), and every `$ref` resolves (checked separately, because the validator accepts an unresolved one). Every Ollama path's `x-seriatim-gate` and `x-seriatim-scope` agree with `classify()` (Seriatim's own `/seriatim/*` and `/models/select` paths are not Ollama routes and have no `x-seriatim-gate`, but each must declare `x-seriatim-scope`: `none`, `infer` or `admin`, and the ones S1 serves must agree with `classify()`); `x-seriatim-unknown-endpoint` agrees with rule 5 | 5, G7 |
 | K-OAS2 | Every collected error body validates against `ErrorEnvelope`, in-stream records against `StreamErrorRecord`, and health bodies against `Health` | 25 |
 | K-OAS3 | `set(ErrorCode)` equals the contract's `ErrorCode.enum`, and `ERROR_TABLE` equals `x-seriatim-codes` (status, `retryable` and `replay_safe` for each code) | 25 |
@@ -820,6 +883,17 @@ also run on `windows-latest` and `macos-latest`.
 | S8 | `max_hold_s=1`; upstream never sends headers → 504 `LOCK_HOLD_EXCEEDED`; upstream sees the disconnect; the slot drains | 12 |
 | S9 | `max_hold_s=1` and the client disconnects at the same moment the deadline fires (both scheduled on the fake) → the log says `client_disconnect` or `hold_exceeded`, never both. Once the watcher has recorded the disconnect, the proxy makes no further `send` call (checked with a wrapped `send`). If the deadline won the race, at most one error write is attempted, its failure is caught, and nothing else is written. The slot drains exactly once | 10, 12 |
 | S10 | Framing refusals, each with an upstream reset: the response has `Content-Length`; `Content-Encoding: gzip` (passed through raw); `content-type: application/json`; NDJSON cut mid-line; SSE cut mid-event → in each case **no** record is sent, and the connection is aborted | 24 |
+| S11 | External cancellation (the server shutting down, simulated by cancelling the request's task) in each phase: the body read, the upstream write, the wait for headers, and streaming → the shielded `finally` runs: the per-request client is closed (the fake sees it), the slot is `DRAINING` if anything was sent and `FREE` otherwise, the log says `cancelled`, and the cancellation propagates (the task ends cancelled) | 10, 11 |
+| S12 | A second cancellation arrives while step (a) waits for a slow `aclose()` (it returns after 0.5 s, below `close_timeout_s`) → `aclose()` still completes, and the slot is not freed before it returns; the lease has exactly one end | 11 |
+| S13 | While step (a) waits for a slow `aclose()` (0.5 s), another gated request → 429; once `aclose()` returns, the slot follows §3.3 (b) | 11, 2 |
+| S14 | A slow reader: the client reads nothing while upstream streams 32 MiB, `max_hold_s=1` → the fake's writes block (upstream reads pause); after about 1 s the upstream connection is closed and the slot drains; log `hold_exceeded` | 12, 10 |
+| S15 | Upstream ends cleanly; the final `send` (`more_body=False`) is wrapped to hang → the slot is already `FREE` when it is called, and stays `FREE`. After `close_timeout_s` the write is abandoned, `client_write_failed` is logged at `DEBUG`, and the log line has `outcome: ok` and `slot_end: free`. The same when the final `send` raises | 10 |
+| S16 | A disconnect scheduled at the moment upstream completes (the fake's last chunk and the client's close together), 50 runs → in each run the lease has exactly one effective end (`finish` or `stuck` returns `True` once), and there is one log line | 10 |
+| S17 | A positive SSE record: `content-type: text/event-stream; charset=utf-8`; upstream sends two complete events, then resets → the client gets the two events, then exactly one `data: {"error":…,"error_code":"UPSTREAM_STREAM_BROKEN"}` event, then an abort | 24 |
+| S18 | Upstream sends the headers (NDJSON, chunked), then resets before any body → the client gets the headers, one record line, then an abort (an empty tail is a record boundary) | 24 |
+| S19 | Boundaries split across chunks, then a reset. NDJSON `{"a"` + `:1}` + `\n` → a record. SSE `data: x\n` + `\n` → a record. SSE `data: x\n\n` one byte per chunk → a record. NDJSON ending `{"a":1}` + `\n{"b"` → no record, only an abort | 24 |
+| S20 | Broken chunked framing from `raw_upstream`: a malformed chunk-size line; and a response that closes without the terminating `0\r\n\r\n` → never a clean end: aborted, the slot drains, log `upstream_error` | 24, 10 |
+| S21 | Bodyless responses are complete: a clean `HEAD /` (with `Content-Length` and no body), and a gated request that gets 204, or 304 → the client sees a complete response, and the gated slot is freed with no drain | 6, 10 |
 | F1 | **Fault at connect.** The `raw_upstream` fake closes at once after accepting → 502 `UPSTREAM_PROTOCOL_ERROR` with `replay_safe: false`; the slot drains (a connection was made, so bytes may have arrived) | 26, 10 |
 | F2 | **Fault during the write.** The `raw_upstream` fake stops reading a 32 MiB gated body, and the client disconnects during the write → the sidecar cancels the write, closes the socket (the fake sees EOF), and the slot drains; no 5xx is written to the gone client | 10 |
 | F3 | **Fault while waiting for headers.** The `raw_upstream` fake sends a malformed status line → 502 `UPSTREAM_PROTOCOL_ERROR`; the slot drains | 26 |
@@ -835,6 +909,10 @@ also run on `windows-latest` and `macos-latest`.
 | R3 | **Duplicate start.** A second sidecar with the same upstream port and lock directory, on another listen port → exits with code 3 within 5 s, and stderr names the lock file. The first sidecar keeps serving, and after `gc.collect()` is triggered in it (through a test-only signal handler) a third attempt still exits 3 | 12b |
 | R4 | The lock directory's parent is a regular file → exit 3 with `cannot lock` | 12b |
 | R5 | Invalid config (`SERIATIM_NODE_SLOTS=0`) → exit 2, and stderr names `SERIATIM_NODE_SLOTS` | 23 |
+| R6 | Four sidecars started at once with the same lock directory and upstream port, two with `OLLAMA_URL` on `127.0.0.1` and two on `127.0.0.2` → exactly one serves, and three exit 3 | 12b |
+| R7 | Permission failures (POSIX, not root; Windows is covered by R4): a lock directory with mode `0500`, and a lock file with mode `000` → exit 3 with `cannot lock` | 12b |
+| R8 | The lock file is never removed: three graceful stops (`Popen.terminate()`) and restarts → after each exit the file exists with the same inode (`os.stat().st_ino`) | 12b |
+| R9 | Two sidecars with the same lock directory and different upstream ports → both serve | 12b |
 
 ### 8.6 `tests/behaviour/test_sidecar.py` (black-box, PPE)
 
@@ -980,3 +1058,103 @@ A log line, one per request:
       `HEAD` any 404 means the route is absent (the blob is created first, so a 404 there
       means the route has gone). The script removes anything machine-specific (no IPs, no host names) and writes
     `tests/fixtures/ollama-0.40.16.json`.
+
+## Appendix C — The #15 scenarios: where each one is tested
+
+Issue #15 lists 57 scenarios that a codex and agy scenario pass found missing from revision 7.
+Each was checked against SPEC and ADR-001 first. Every one is now a test, under a new ID or
+in an existing one. One part of one scenario was dropped, with its reason below.
+
+| # | scenario (short) | test |
+|---|---|---|
+| 1 | External cancellation in each phase | S11 |
+| 2 | A second cancellation during cleanup | S12 |
+| 3 | A slow reader until the hold deadline | S14 |
+| 4 | The final write hangs or raises after a clean end | S15 |
+| 5 | A disconnect races a clean completion | S16 |
+| 6 | The close is pending while another request arrives | S13 |
+| 7 | Client construction fails after admission | E16 |
+| 8 | An internal error before and after the response starts | E15 |
+| 9 | Monotonic time; the strict overdue boundary | G11 |
+| 10 | `Retry-After` from the earliest drain; `busy_for_s == 0` | G12 |
+| 11 | Disconnect before a gated body is complete | E7 |
+| 12 | The body timeout is total, not per chunk | E8 |
+| 13 | The hold deadline during a gated upload | E9 |
+| 14 | Empty, at the limit, and one over | E10 |
+| 15 | 413 before 429 or 503 | B7 |
+| 16 | Ungated buffered routes enforce the limits | E11 |
+| 17 | Blob disconnect before and after the first chunk | E12 |
+| 18 | Chunked and empty blob uploads | E13 |
+| 19 | One owner of `receive` | E14 |
+| 20 | `Content-Length` and `Transfer-Encoding` smuggling | H28 |
+| 21 | A refused request, then another on the same socket | H29 |
+| 22 | `Expect: 100-continue` while busy or starting | B6 |
+| 23 | `Connection` tokens in both directions | H15 |
+| 24 | The full strip lists | H16 |
+| 25 | Repeated end-to-end headers survive | H17 |
+| 26 | `X-Request-Id` rules | H18 |
+| 27 | Seriatim's three headers on every response | H19 |
+| 28 | `X-Seriatim-Gate` for every error class | H19 |
+| 29 | Proxy environment variables ignored | H20 |
+| 30 | Redirects pass through, never followed | H21 |
+| 31 | `/seriatim/*` 404 and 405 over HTTP; look-alikes | H22, K6 (corrected, below) |
+| 32 | A missing `raw_path` | H23 |
+| 33 | Every forbidden control byte; allowed escapes | K4 |
+| 34 | Blob digest edge cases | K5 |
+| 35 | Bodies are opaque in S1 | H24 |
+| 36 | The health probe stalls | HL5 |
+| 37 | Several health faults at once | HL6 |
+| 38 | Held or draining slots are not a fault | HL7 |
+| 39 | Many concurrent health requests | HL8 |
+| 40 | Health logged at `DEBUG` only | HL9 |
+| 41 | Ungated upstream stalls and close failures | H26 |
+| 42 | The full `NODE_SATURATED` response | H27 |
+| 43 | A positive SSE record with a parameterised type | S17 |
+| 44 | A failure right after the headers | S18 |
+| 45 | Record boundaries split across chunks | S19 |
+| 46 | Broken chunked framing | S20 |
+| 47 | `HEAD` and bodyless responses are clean | S21 |
+| 48 | Clean upstream 5xx and non-JSON errors | H25 |
+| 49 | Concurrent startup; loopback aliases | R6 |
+| 50 | Permission failures exit 3 | R7 |
+| 51 | The lock file keeps its inode | R8 |
+| 52 | Different upstream ports are independent | R9 |
+| 53 | The remaining ranges and types; NaN and infinity | C9 |
+| 54 | An unreadable file; no `.env` | C10 |
+| 55 | Non-loopback IPv6 and names as `LISTEN_HOST` | C11 |
+| 56 | One accurate log line on every path | L2 |
+| 57 | No secrets in the log | L3 (narrowed, below) |
+
+**Corrected or narrowed, with the reason.**
+- **#31, the look-alike paths.** The scenario expects `/seriatimx` to get a Seriatim 404
+  without contacting Ollama. That contradicts REQ-5: only `/seriatim` and `/seriatim/…` are
+  Seriatim's (§2.2 rule 1), and every other unlisted path is forwarded as gated, admin and
+  unknown (rule 5). K6 therefore tests that the look-alikes are classified as **not**
+  Seriatim's. The rest of #31 is H22.
+- **#57, "no exception text".** §5 and E5 put the traceback of an unexpected error in the log
+  on purpose, so the error can be diagnosed, and REQ-22 forbids bodies and credentials, not
+  exception text. L3 therefore checks that no body, cookie or query credential reaches the
+  log, including through an internal error raised while handling a body. It doesn't forbid
+  the traceback itself.
+
+**Design changes.** Writing these tests found places where revision 7 would have failed them.
+Each is fixed in the section named:
+1. **A lease could leak** (#7). `new_gated_client()` ran before the `try`, so an exception
+   there skipped the `finally`. It now runs inside the `try` (§3.3, line 10a).
+2. **`X-Request-Id`** (#26). Several client headers are now replaced, not guessed between (§2.4
+   step 2). The client's own headers are removed before Seriatim's is set, and Ollama's is
+   removed from the response (§4).
+3. **`Connection` on the response** (#23). The removal of the headers it names is now stated
+   for responses too, and repeated headers are kept with every value (§4).
+4. **Bodyless responses** (#47). A response to `HEAD`, or a 1xx, 204 or 304, has no body by
+   HTTP's rules, so it counts as framed. Before, it would have been treated as broken and
+   drained (§3.3 step 5).
+5. **The record tail** (#45) is the last two bytes of the whole stream, not of the last
+   chunk (§3.3 step 5).
+6. **The buffered body timeout is total** (#12), as REQ-20 says (§3.3 step 1).
+7. **The health client's pool timeout** counts as `ollama_unreachable`, so many concurrent
+   probes can't produce a 500 (#39; §3.4).
+8. **The hold limit during the body read** (#13) frees the slot, because nothing was sent.
+   The §5 row said "drains" (§5).
+9. **Float settings must be finite**, and enum values are case-sensitive (#53; §2.1).
+10. **Names as `LISTEN_HOST`** are refused like non-loopback addresses (#55; §2.1 step 5).
