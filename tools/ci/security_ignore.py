@@ -24,10 +24,10 @@ that isn't a TOML date, or an expiry in the past fails the check. So does any ot
 Bandit reads the test ids up to the second `#`, so the reason never reaches it as a test
 name. The lint finds suppressions exactly as Bandit 1.9.4 does (its regexes are copied below),
 so a form Bandit accepts, such as `nosecB602`, or `nosec` inside a longer word, can't slip
-past. It then fails on anything but the form above, and on any test id Bandit doesn't know:
-Bandit drops unknown ids, and a suppression left with no known id silences every finding on
-its line. Only real comments count, read with `tokenize`; a string that contains the text
-doesn't.
+past. It then fails on anything but the form above: on a suppression with no test id
+(`# nosec # <reason>`), and on any id Bandit doesn't know. Bandit drops unknown ids, and a
+suppression left with no known id silences every finding on its line. Only real comments
+count, read with `tokenize`; a string that contains the text doesn't.
 
 **exec** checks the ignore file first, so an expired exception fails every scanner job too.
 Then it runs the command with the tool's exceptions added: Bandit `--skip`, pip-audit
@@ -62,8 +62,9 @@ FIELDS = {"tool", "id", "reason", "expires"}
 # and reads its test ids (only the last id of a comma run without spaces is captured).
 BANDIT_NOSEC = re.compile(r"#\s*nosec:?\s*(?P<tests>[^#]+)?#?")
 BANDIT_NOSEC_TESTS = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
-# The one form the lint accepts, from where Bandit's match starts.
-NOSEC_FORM = re.compile(r"#\s*nosec(?P<ids>(?:\s+B[0-9]{3}(?:\s*,\s*B[0-9]{3})*)?)\s*#\s*\S")
+# The one form the lint accepts, from where Bandit's match starts. At least one test id is
+# required: Bandit reads a suppression without one as covering every test on its line.
+NOSEC_FORM = re.compile(r"#\s*nosec(?P<ids>\s+B[0-9]{3}(?:\s*,\s*B[0-9]{3})*)\s*#\s*\S")
 NOSEC_FORM_HINT = "'# nosec B603 # <reason>'"
 # Every test id Bandit 1.9.4 knows (plugins, blacklist, builtin). A test compares this with
 # the installed Bandit, so a Bandit upgrade fails CI until this list is updated.
