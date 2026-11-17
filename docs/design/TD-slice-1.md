@@ -4,13 +4,15 @@
 to the mutation layout S0a built (PR #13); revision 6 adds the enforcement line below and
 the `td-test-ids` job to Appendix B (#16); revision 7 says what "exists" means for `HEAD` in
 the route probe (Appendix B, S0b; #29); revision 8 adds the 57 scenarios of #15 as tests
-(57 new IDs; Appendix C maps each one) and fixes the design gaps they found (Appendix C,
-"Design changes").
+(57 new IDs; Appendix C maps each one), fixes the design gaps they found (Appendix C,
+"Design changes"), and splits the code into the PR series of §9.
 
 Enforced: no
 
-(The `td-test-ids` check, SPEC REQ-63, reads this line. S1's first code PR sets it to `yes`,
-and from then on every ID in §8 needs a passing test marked `@pytest.mark.td("<ID>")`.)
+(The `td-test-ids` check, SPEC REQ-63, reads this line. S1's code ships as the series of
+small PRs in §9. The **last** one, S1-13, sets it to `yes`, and from then on every ID in §8
+needs a passing test marked `@pytest.mark.td("<ID>")`. Each earlier PR marks the tests of the
+IDs it delivers, as §9 lists them.)
 **Implements:** SPEC REQ-1 to REQ-7, REQ-10 to REQ-12b, REQ-15 (pre-auth form), REQ-18
 (S1 form), REQ-20 to REQ-26. **Architecture:** ADR-001 D1 to D4, D7, D8, D10 to D12.
 **Not in this slice:**
@@ -939,9 +941,40 @@ and the capture log. They import nothing from `seriatim_node`. They run in the r
   `app.py`), with a score of at least 75 % (SPEC REQ-61). The PR lists each survivor, with one
   line on why it is equivalent or which test was added.
 - **PPE.** The `ppe` job's P1 to P7 output, including the P6 latency.
-- **Size.** The PR-size check passes: 13 files.
+- **Size.** Each PR in the §9 series passes the PR-size check on its own. Together they
+  touch the 13 files of §1.
+- **Per PR.** Each PR in §9 runs these gates on the files it changes: coverage, mutation on
+  the modules it adds or changes, and the PPE once S1-13 adds the sidecar container.
 - **Review.** An independent review of the PR diff. Every real finding is fixed and listed,
   and every rejected one is given with its reason.
+
+## 9. Delivery: the S1 PR series
+
+The code is too large for one PR under the size limit, so it ships as 13 small PRs, in this
+order. Each has its own issue, a sub-issue of #34. Each leaves `main` releasable and green,
+and ships the tests for exactly the IDs listed. A PR may add a stub that a later PR
+completes, but never one that a test depends on. Modules grow across PRs: for example,
+`app.py` starts in S1-1 with the error table.
+
+| PR | scope | files (new or changed) | TD IDs | needs |
+|---|---|---|---|---|
+| S1-1 | Contract and the error table | `contract/openapi.yaml`; `app.py` (`ErrorCode`, `ERROR_TABLE`, `ErrorFactory`) | K-OAS1, K-OAS3 | — |
+| S1-2 | Configuration | `config.py`, `test_config.py` | C1–C7, C9–C11 | — |
+| S1-3 | Path safety and classification | `gate.py` (`check_raw_path`, `classify`, the tables), `test_gate.py` | K1–K6 | — |
+| S1-4 | The gate | `gate.py` (`Gate`, `Lease`), `test_gate.py` | G1–G12 | — |
+| S1-5 | Harness, dispatcher and health | `conftest.py`, `app.py` (`create_app`, the dispatcher, `X-Request-Id`, 505, `/seriatim/*`, health, `RequestLog`), `test_http.py` | H12, H22, H23, E2, HL1–HL9 | 1, 2, 3 |
+| S1-6 | Passthrough and headers | `proxy.py` (buffered relay, header rules, the ungated client), `test_http.py` | H1–H7, H9, H11, H15–H18, H20, H21, H24, H25 | 5 |
+| S1-7 | Admission and request limits | `proxy.py` (the gate, 429 and 503, body limits), `test_http.py` | B1–B7, E3, E4, E7–E11, H8, H19, H28, H29 | 4, 6 |
+| S1-8 | Streaming and errors after the headers | `proxy.py` (streaming, framing, records, upstream faults), `test_streaming.py`, `test_http.py` | S1–S10, S17–S21, H13, F1, F3, F5, E1, E5, E15 | 7 |
+| S1-9 | Cleanup, cancellation and the close proof | `proxy.py` (the shielded `finally`, `STUCK`, the ungated close), `test_streaming.py`, `test_http.py` | S11–S16, F2, F4, E16, H14, H26, H27 | 8 |
+| S1-10 | Blob uploads | `proxy.py` (`body_stream`), `test_http.py` | H10, E6, E12–E14 | 7 |
+| S1-11 | Process and singleton | `app.py` (`main`, `acquire_singleton`), `test_config.py`, `test_process.py` | C8, R1–R9 | 5 |
+| S1-12 | Request log | `app.py` (the log fields on every path), `test_http.py` | L1–L3, K-OAS2 | 9, 10 |
+| S1-13 | The PPE sidecar and enforcement | `ppe/compose.yaml` (`node-a`), `tests/behaviour/test_sidecar.py`; `Enforced: yes` | P1–P7 | 11, 12 |
+
+"needs" lists the PRs that must merge first. PRs with no dependency between them may be open
+at the same time when they touch different files. S1-1 to S1-4 are independent. S1-13 closes
+#34 and #15.
 
 ## Appendix A — Data shapes
 
