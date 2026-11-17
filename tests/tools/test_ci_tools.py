@@ -157,6 +157,16 @@ def test_staged_copies_tests_and_contract_then_removes_them(tmp_path):
             pass
 
 
+def test_staged_starts_with_no_mutants_from_an_earlier_run(tmp_path):
+    (tmp_path / "tests").mkdir()
+    pdir = tmp_path / "pkg"
+    stale = pdir / "mutants" / "seriatim_node" / "gate.py.meta"
+    stale.parent.mkdir(parents=True)
+    stale.write_text('{"exit_code_by_key": {"x": 0}}')
+    with mutation.staged(pdir, root=tmp_path):
+        assert not (pdir / "mutants").exists()
+
+
 def test_changed_files_needs_a_sha():
     with pytest.raises(mutation.GateError, match="40-character"):
         mutation.changed_files("main")
