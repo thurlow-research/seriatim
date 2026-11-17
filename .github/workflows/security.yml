@@ -1,0 +1,135 @@
+# Security scanners (SPEC REQ-63; ADR-001 §10 S0a). On every pull request, every push to main,
+# and weekly, to catch newly disclosed vulnerabilities in pinned dependencies. The job
+# `security` rolls up every other job, so the main ruleset needs only `security`.
+#
+# Failure policy: every scanner fails on findings at or above its threshold, and on errors
+# (a crash, a failed database download, missing or unreadable output). Exceptions live only
+# in .security-ignore.toml, each with a reason and an expiry date.
+# Event values reach steps only through if: and env:, never inside run:.
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1"  # Mondays 05:17 UTC
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.11.19"
+  UV_PYTHON: "3.12"
+
+jobs:
+  ignore-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - run: python3 -I tools/ci/security_ignore.py lint
+
+  bandit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv sync --frozen  # bandit is pinned and hash-verified through uv.lock
+      - name: Bandit, medium and high severity (-ll)
+        run: |
+          set -uo pipefail
+          python3 -I tools/ci/security_ignore.py exec bandit -- \
+            uv run --frozen bandit -r node tools deploy tests -ll \
+            -f json -o "$RUNNER_TEMP/bandit.json"
+          rc=$?
+          # 0: nothing found; 1: findings, listed below. Anything else is an error.
+          if [ "$rc" -gt 1 ]; then echo "::error::bandit exited $rc"; exit 1; fi
+          python3 -I tools/ci/security_ignore.py bandit-report "$RUNNER_TEMP/bandit.json"
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv sync --frozen  # pip-audit is pinned and hash-verified through uv.lock
+      - name: pip-audit on the locked third-party dependencies
+        run: |
+          set -euo pipefail
+          uv export --frozen --no-emit-workspace --format requirements-txt \
+            -o "$RUNNER_TEMP/requirements.txt"
+          python3 -I tools/ci/security_ignore.py exec pip-audit -- \
+            uv run --frozen pip-audit --strict --no-deps --disable-pip --progress-spinner off \
+            -r "$RUNNER_TEMP/requirements.txt"
+
+  trivy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TRIVY_VERSION: "0.76.1"
+      # Verified against the release's checksums file and its sigstore bundle (cosign:
+      # signed by aquasecurity/trivy's release workflow) when pinned.
+      TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Trivy (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tarball}"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" trivy
+      - name: Download the vulnerability database (a failed download fails the job)
+        run: |
+          "$RUNNER_TEMP/trivy" fs --cache-dir "$RUNNER_TEMP/trivy-cache" --download-db-only
+      - name: Full report, every severity, to the job summary
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/trivy" fs --cache-dir "$RUNNER_TEMP/trivy-cache" --skip-db-update \
+            --scanners vuln,misconfig,secret --exit-code 0 \
+            --format table --output "$RUNNER_TEMP/trivy-report.txt" .
+          cat "$RUNNER_TEMP/trivy-report.txt"
+          { echo '### Trivy: full report (every severity)'; echo '```'
+            cat "$RUNNER_TEMP/trivy-report.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Gate, HIGH and CRITICAL, on the same database
+        run: |
+          python3 -I tools/ci/security_ignore.py exec trivy -- \
+            "$RUNNER_TEMP/trivy" fs --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --skip-db-update --skip-check-update \
+            --scanners vuln,misconfig,secret --severity HIGH,CRITICAL --exit-code 1 .
+
+  security:
+    if: always()
+    needs: [ignore-lint, bandit, pip-audit, trivy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every security job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, sys
+          results = {job: v["result"] for job, v in json.loads(os.environ["NEEDS"]).items()}
+          for job, result in sorted(results.items()):
+              print(f"{job}: {result}")
+          if any(r != "success" for r in results.values()):
+              sys.exit("::error::a security job did not pass")
+          PY

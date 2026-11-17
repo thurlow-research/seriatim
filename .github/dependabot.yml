@@ -1,0 +1,18 @@
+# Dependabot (SPEC §7.9). Weekly, one grouped PR per ecosystem. Dependabot PRs are never
+# auto-merged: they go through the same checks and review as any other PR.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      uv:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

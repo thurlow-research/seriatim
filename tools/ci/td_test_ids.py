@@ -161,7 +161,9 @@ def load_base_tds(base: str, td_dir: Path) -> list[TD]:
 def junit_results(path: Path) -> tuple[dict[str, list[str]], dict[str, list[str]], int]:
     """Return ({id: passing tests}, {id: tests that didn't pass}, test-case count)."""
     try:
-        root = ET.parse(path).getroot()
+        # The file is this run's own JUnit output. Python's expat (2.4.1 and later) limits
+        # entity expansion, and the job holds a read-only token.
+        root = ET.parse(path).getroot()  # nosec B314 # own JUnit output, see above
     except (OSError, ET.ParseError) as e:
         raise CheckError(f"JUnit file {path}: {type(e).__name__}: {e}") from e
     if root.tag not in ("testsuites", "testsuite"):

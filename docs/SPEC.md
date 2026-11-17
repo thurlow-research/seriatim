@@ -1959,7 +1959,7 @@ The maintainer applies these settings; each slice's pull request says which rows
 
 | setting | value | from |
 |---|---|---|
-| Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks, each bound to **GitHub Actions** and named by job: `gitleaks` (workflow `secret-scan`; applied), then `ci` (S0a part 1; applied; it includes `td-test-ids` from part 1b), `private-terms` (S0a part 1b, added only once its secret `PRIVATE_TERMS` and variable `PRIVATE_TERMS_AGE_RECIPIENT` exist and a canary run has failed as expected), `security` (S0a part 2) and `ppe` (S0b), each added by the PR that introduces it | now, extended per slice |
+| Ruleset `main` | pull request with 1 approval and code-owner review; no force push, no deletion; required checks, each bound to **GitHub Actions** and named by job: `gitleaks` (workflow `secret-scan`; applied), then `ci` (S0a part 1; applied; it includes `td-test-ids` from part 1b), `private-terms` (S0a part 1b; applied after its canary run, #19), `security` (S0a part 2; the roll-up of `security.yml`) and `ppe` (S0b), each added by the PR that introduces it | now, extended per slice |
 | Default branch | `main`, and it stays `main`: `pull_request_target` workflows run from it, so changing it would change which `promotion-source` runs. `promotion-source` fails if the event reports another default branch | now |
 | Ruleset `deploy-branches` (targets `ppe`, `prod`; already active) | changes by pull request only, with the code owner's approval after the last push (CODEOWNERS has a catch-all `*` entry for the maintainer, so every promotion needs that approval); stale approvals dismissed; threads resolved; merge commits only; no force push, no deletion; an empty bypass list, so no App, `seriatim-worker` included, can bypass it | interim deploy |
 | Rulesets `deploy-checks-ppe` and `deploy-checks-prod` | require the check `promotion-source`, bound to the **GitHub Actions** app, so no other integration can report it. **"Require branches to be up to date before merging" is on for `ppe` only** (`deploy-checks-ppe`, strict), so a promotion built on an older `ppe` tip can't merge and is rebuilt instead. `deploy-checks-prod` is not strict: every merge adds a merge commit to `prod` that `main` never has, so a strict rule would leave every later `main` → `prod` pull request behind. Where the organisation supports it, also an organisation-required workflow pinned to `promotion-source.yml` on `main`, which no branch workflow can stand in for | interim deploy |
@@ -1973,7 +1973,7 @@ The maintainer applies these settings; each slice's pull request says which rows
 | Immutable releases | on, so a published release's assets and tag can't be changed | S0a; applied |
 | Environment `release` | the maintainer as required reviewer; deployment limited to `v*` tags; the only environment whose job holds publish permissions (REQ-68) | S0a; applied |
 | GHCR package | linked to this repository; write access only from this repository's Actions (the `release` job); no personal access token | S10 |
-| Dependabot | `uv` and `github-actions` ecosystems, grouped weekly; never auto-merged | S0a |
+| Dependabot | `.github/dependabot.yml`: the `uv` and `github-actions` ecosystems, each in one weekly grouped PR; never auto-merged (no auto-merge is enabled on Dependabot PRs; they pass the same checks and review as any PR) | S0a part 2 |
 | Auto-merge, delete branch on merge | on | now |
 
 ## 8. Test plan
@@ -2206,10 +2206,34 @@ command output, and never just says "tests pass".
       file, where each entry gives a reason and an expiry date. CI fails on an entry without
       both, and on an expired one. Inline suppressions such as `# nosec` need a reason on
       the same line, and a lint checks for it.
-    - **Pinned tools.** Each scanner is pinned to an exact version and verified by checksum.
+      - **The ignore file** is `.security-ignore.toml`: `[[ignore]]` tables with exactly
+        `tool` (`bandit`, `pip-audit` or `trivy`), `id` (the finding's id in that tool's
+        form), `reason` (non-empty) and `expires` (a TOML date). An entry fails from the day
+        after its expiry. Any other key, an unknown tool or a malformed id also fails.
+      - **The lint** (`tools/ci/security_ignore.py lint`, job `ignore-lint`) checks that
+        file, and every `# nosec` comment in the tracked Python files, read as comment
+        tokens. The required form is `# nosec B603 # <reason>`: Bandit reads test ids only up
+        to the second `#`, so the reason after it never reaches Bandit as a test name.
+      - **How exceptions reach the tools.** `security_ignore.py exec` checks the file again,
+        so an expired entry fails every scanner job, then adds each tool's own arguments:
+        Bandit `--skip`, pip-audit `--ignore-vuln`, Trivy `--ignorefile`.
+    - **Pinned tools.** Each scanner is pinned to an exact version and verified by checksum:
+      Bandit 1.9.4 and pip-audit 2.10.1 through hash-locked `uv.lock` entries (the root
+      `dev` group); Trivy 0.76.1 as a release tarball checked against a SHA-256 pinned in
+      the workflow. That checksum was recorded after verifying the release's checksums file
+      and its sigstore bundle (signed by aquasecurity/trivy's release workflow).
+    - **Where they run.** `.github/workflows/security.yml`, on every pull request, every push
+      to `main`, and weekly (Mondays). Its jobs are `ignore-lint`, `bandit`, `pip-audit` and
+      `trivy`, and its roll-up job **`security`** fails unless every one of them passed. The
+      ruleset requires `security`. gitleaks stays in `secret-scan.yml`, whose check
+      `gitleaks` is already required, and runs on the same weekly schedule.
     - **The scanners and their thresholds:**
-      - **gitleaks** (`secret-scan / gitleaks`): `--exit-code 1` on any finding.
-      - **Bandit** (Python SAST): fails on medium or high severity (`-ll`).
+      - **gitleaks** (workflow `secret-scan`, check `gitleaks`): `--exit-code 1` on any
+        finding.
+      - **Bandit** (Python SAST, over `node/`, `tools/`, `deploy/` and `tests/`): fails on
+        medium or high severity (`-ll`). Its JSON output is checked: any result fails, any
+        file Bandit couldn't scan fails, and so does missing or unreadable output or an exit
+        code above 1.
       - **pip-audit**, on the locked third-party dependencies (`uv export --frozen
         --no-emit-workspace --format requirements-txt`, then `pip-audit --strict --no-deps
         --disable-pip -r` on that file): `--strict`, so a
@@ -2220,6 +2244,11 @@ command output, and never just says "tests pass".
         - a full report at every severity, with `--exit-code 0`, written to the job summary;
         - the gate, with `--severity HIGH,CRITICAL --exit-code 1`. A failed database download fails the job; the scan is
         never run silently against a stale or empty database.
+
+        The database is downloaded once, in its own step (`--download-db-only`); both runs
+        then use it with `--skip-db-update`, and the gate also with `--skip-check-update`, so
+        both see the same database and checks. Any fatal Trivy error exits non-zero, so it
+        fails the job whatever `--exit-code` says.
   - **the private-terms check.**
     - **What it does.** It scans the pull request's changes against a list of private terms
       (host names and personal names) held in a CI secret.
