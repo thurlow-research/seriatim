@@ -213,6 +213,10 @@ class Lease:
             self._slot.drain_until = self._gate._clock() + self._gate.drain_s
         return True
 
+    def remaining_s(self) -> float:
+        """Seconds left before the hold limit (`max_hold_s`), on the gate's monotonic clock."""
+        return self.deadline - self._gate._clock()
+
     def stuck(self) -> bool:
         """Mark the slot STUCK: closing upstream was not proven, so it is never freed."""
         if self._ended:

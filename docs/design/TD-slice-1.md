@@ -284,6 +284,45 @@ def body_stream(receive) -> AsyncIterator[bytes]                           # ung
 async def watch_disconnect(receive, outcome: Outcome, scope: anyio.CancelScope) -> None
 ```
 
+**Details fixed by the code (S1-6).** S1-6 implements §3.3 (the three clients, the lifecycle,
+the error mapping before the headers and Seriatim's own response headers). It leaves these
+seams for the later slices:
+- **Header signatures.** `upstream_headers` also takes `request_id`, and `downstream_headers`
+  takes `node_id`. They set `X-Request-Id` (both ways) and `X-Seriatim-Node` (downstream).
+- **Strip lists.** Until S1-7, `upstream_headers` drops only `host`, `content-length`,
+  `transfer-encoding`, `connection`, `keep-alive` and `x-request-id`, then appends
+  `content-length` and `x-request-id`. `downstream_headers` drops the same hop-by-hop headers,
+  `x-request-id` and every `x-seriatim-*`, then appends `x-seriatim-gate`, `x-seriatim-node` and
+  `x-request-id`. `prune_httpx_defaults` arrives in S1-7, so httpx's default `accept`,
+  `accept-encoding`, `connection` and `user-agent` still reach Ollama.
+- **`read_body(receive)`** has no size limit and no timeout until S1-8. Ungated bodies are read
+  whole too (`body_stream` arrives with blob streaming in S1-11).
+- **The end of the stream.** `upstream_done` is set when `aiter_raw()` ends normally. S1-9
+  adds the framing rule of §3.3 step 5 and the in-stream error record. Until then an abort
+  after the headers returns without the final body message: the client sees a cut-short
+  response, and the slot drains. `Outcome.tail` keeps the last two bytes for S1-9.
+- **An abort closes the client connection.** uvicorn closes a connection whose response ended
+  without its final body message, so no second request can follow on it. H8b therefore checks
+  the cut-short body and the close on one raw socket, and sends its 429 and 200 requests on
+  new connections.
+- **The hold deadline** is read from the gate's own clock through a new
+  `Lease.remaining_s()` in `gate.py`. Ungated requests have no hold limit.
+- **Where the clients are built.** `new_gated_client` and `new_ungated_client` are in
+  `proxy.py`, on top of `app.new_client`, which applies the settings every client shares. The
+  lifespan imports `Proxy` lazily, because `proxy.py` imports `app.py`.
+- **`PoolTimeout`** maps to 503 `NODE_SATURATED` with `Retry-After: retry_after_s` now, as
+  §5 says. S1-10 adds its over-the-wire test; S1-6 unit-tests the mapping.
+- **The request log line** has `request_id`, `method`, `path`, `kind`, `scope`, `known`,
+  `outcome`, `status` and `slot_end` (`free`, `draining`, `stuck` or `none`). S1-13 adds the
+  rest. `outcome` is one of `ok`, `busy`, `starting`, `client_disconnect`, `hold_exceeded`
+  (CRITICAL), `upstream_unavailable`, `saturated`, `upstream_error`, `internal_error` (ERROR)
+  or `cancelled`. When a close isn't proven, the line also has `upstream_close_failed: true`,
+  at CRITICAL for a gated request (the slot is `STUCK`) and at ERROR for an ungated one.
+- **An external cancellation** (server shutdown) sends nothing more to the client, still runs
+  the shielded close proof, and drains the slot if the request was sent.
+- **`main()`** is still the S0a placeholder, so the sidecar can't be started from the command
+  line until S1-12.
+
 ### 2.4 `app.py`
 
 ```python
@@ -353,10 +392,9 @@ Gated requests have `read=None` and `write=None`. Their only bound is the hold l
 **Details fixed by the code (S1-5).**
 - **Order.** The HTTP-version check (§4, 505) runs right after step 2, before step 3, so a
   1.0 request is refused whatever its path.
-- **What `create_app` takes.** In S1-5 it takes `gate` only, which tests inject. `client`
-  arrives with the shared ungated client in S1-6.
-- **Routes for the proxy.** Until S1-6, step 7 answers 500 `INTERNAL`
-  (`X-Seriatim-Gate: ungated`), contacts nothing and takes no slot. No TD ID depends on it.
+- **What `create_app` takes.** Since S1-6 it takes both `client` and `gate`, as the signature
+  above shows. An injected `client` becomes the shared ungated client, and the lifespan leaves
+  closing it to the caller.
 - **The health probe.** `health_probe_timeout_s` bounds the whole probe, as well as each
   phase of the health client, so a slowly dripping body can't stretch it. Any
   `httpx.TransportError` counts as `ollama_unreachable`: for example, a connection closed
@@ -866,7 +904,7 @@ also run on `windows-latest` and `macos-latest`.
 | H5 | Upstream 404 `{"error":"model \"nope\" not found"}` → 404 with an identical body; the slot is free at once (clean end) | 6, 25 |
 | H6 | While a gated request is held: `GET /api/tags` → 200, `x-seriatim-gate: ungated`; `OPTIONS /api/tags` and `GET /api/chat` → 429 (gated, unknown) | 5 |
 | H7 | While a gated request is held: `POST /api/pull` replaying captured pull progress → 200, an identical stream | 5, 6 |
-| H8 | One raw keep-alive connection: two `/api/chat` requests, the second written to the socket immediately after the first response's last byte arrives, while a test hook holds the first request's `finally` at step (c) → the second is admitted (200), never 429. **H8b:** the same, but the first ends abnormally (upstream reset) → the next request within `drain_s` gets 429, and after `drain_s` (fake clock) it gets 200 | 2, 10 |
+| H8 | One raw keep-alive connection: two `/api/chat` requests, the second written to the socket immediately after the first response's last byte arrives, while a test hook holds the first request's `finally` at step (c) → the second is admitted (200), never 429. **H8b:** the same, but the first ends abnormally (upstream reset) → the next request within `drain_s` gets 429, and after `drain_s` (fake clock) it gets 200. The abort closes the connection (§2.3), so H8b asserts the cut-short response and the close on the raw socket, then sends the 429 and 200 requests on new connections | 2, 10 |
 | H9 | Upstream answers 429 with `Retry-After: 3` and its own `X-Seriatim-Gate: busy`, `Access-Control-Allow-Origin: *` and `X-Rerouted-From: x` → the client gets 429 with Ollama's body, `Retry-After: 3`, `x-seriatim-gate: acquired`, and no CORS or `X-Rerouted-From` header | 6, 36 |
 | H10 | A 100 MiB streamed `POST /api/blobs/sha256:<hex>` with `max_body_bytes=1 MiB` → forwarded intact (the SHA-256 of the received bytes matches). Not buffered: the in-process sidecar's `tracemalloc` peak during the upload stays under 16 MiB | 6, 20 |
 | H11 | Upstream answers request A with `Set-Cookie: s=1` → the client does not get the header, and a later request B (another client) reaches upstream with no `Cookie` header | 6, T3 |

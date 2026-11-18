@@ -15,12 +15,15 @@ down") and started later on the same socket.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import socket
 import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -33,14 +36,35 @@ LOOPBACK = "127.0.0.1"
 # TD §7 "Timing": an elapsed-time assertion may overrun its target by this much.
 TIMING_BOUND_S = 0.5 if os.environ.get("CI") == "true" else 0.1
 STALL_LIMIT_S = 30.0  # a stalled fake gives up after this, so teardown can never hang
+WAIT_S = 5.0  # TD §7: tests wait on events for at most this long, so a hang fails the test
+FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "ollama-0.40.16.json"
+
+
+def wait_for(predicate: Callable[[], object], timeout: float = WAIT_S) -> None:
+    """Poll until `predicate()` is true; fail (never pass) on a timeout."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting for a condition")
+        time.sleep(0.002)
 
 
 def reserve_socket() -> socket.socket:
-    """A TCP socket bound to an ephemeral loopback port, not yet listening: connections to it
-    are refused until a server is started on it."""
+    """A TCP socket bound to an ephemeral loopback port, not yet listening, so a server can be
+    started on it later. Until then nothing answers: Linux and Windows refuse a connection,
+    but macOS drops the SYN, so a connection hangs until its connect timeout. A test that
+    needs the refusal itself uses `closed_port`."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind((LOOPBACK, 0))
     return sock
+
+
+def closed_port() -> int:
+    """An ephemeral loopback port with no socket bound to it, so every OS refuses a connection
+    at once. The port was free a moment ago; nothing in the suite binds a fixed port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((LOOPBACK, 0))
+        return sock.getsockname()[1]
 
 
 class ThreadServer:
@@ -88,7 +112,9 @@ class ThreadServer:
 
 # --- fake_ollama ---------------------------------------------------------------------------
 
-Behaviour = Callable[[Callable[[dict], Awaitable[None]], "FakeOllama"], Awaitable[None]]
+# A behaviour answers one request: (send, fake, receive). `receive` returns `http.disconnect`
+# once the sidecar closes the connection, which is how a behaviour observes a disconnect.
+Behaviour = Callable[..., Awaitable[None]]
 
 
 @dataclass
@@ -109,7 +135,7 @@ async def _stall(fake: FakeOllama) -> None:
 def status(code: int, body: bytes = b"", headers: list[tuple[bytes, bytes]] = ()) -> Behaviour:
     """Answer with this status, body and headers."""
 
-    async def run(send, fake):
+    async def run(send, fake, receive=None):
         await send(
             {
                 "type": "http.response.start",
@@ -125,7 +151,7 @@ def status(code: int, body: bytes = b"", headers: list[tuple[bytes, bytes]] = ()
 def stall_headers() -> Behaviour:
     """Accept the request, then send nothing until the test releases the fake."""
 
-    async def run(send, fake):
+    async def run(send, fake, receive=None):
         await _stall(fake)
 
     return run
@@ -134,7 +160,7 @@ def stall_headers() -> Behaviour:
 def stall_body(first: bytes, length: int) -> Behaviour:
     """Send a 200 with `Content-Length: length` and the first bytes, then stall."""
 
-    async def run(send, fake):
+    async def run(send, fake, receive=None):
         await send(
             {
                 "type": "http.response.start",
@@ -154,7 +180,7 @@ def stall_body(first: bytes, length: int) -> Behaviour:
 def drip_body(length: int, every_s: float) -> Behaviour:
     """Send a 200 with `Content-Length: length`, then one byte every `every_s` seconds."""
 
-    async def run(send, fake):
+    async def run(send, fake, receive=None):
         await send(
             {
                 "type": "http.response.start",
@@ -170,6 +196,149 @@ def drip_body(length: int, every_s: float) -> Behaviour:
         await send({"type": "http.response.body", "body": b" "})
 
     return run
+
+
+def exchange(exchange_id: str) -> dict:
+    """One captured exchange from the S0b fixture file."""
+    doc = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    (found,) = [e for e in doc["exchanges"] if e["id"] == exchange_id]
+    return found
+
+
+def exchange_body(exchange_id: str) -> bytes:
+    return base64.b64decode(exchange(exchange_id)["response"]["body_b64"])
+
+
+def replay(exchange_id: str) -> Behaviour:
+    """Answer as Ollama did in the capture: its status, headers and body, sent with the
+    recorded chunk boundaries. Transfer-Encoding is left to uvicorn, which chunks a response
+    without a Content-Length."""
+    resp = exchange(exchange_id)["response"]
+    body = exchange_body(exchange_id)
+    headers = [
+        (k.lower().encode(), v.encode())
+        for k, v in resp["headers"]
+        if k.lower() != "transfer-encoding"
+    ]
+
+    async def run(send, fake, receive=None):
+        await send({"type": "http.response.start", "status": resp["status"], "headers": headers})
+        at = 0
+        for n in resp["chunks"]:
+            await send({"type": "http.response.body", "body": body[at : at + n], "more_body": True})
+            at += n
+        await send({"type": "http.response.body", "body": b""})
+
+    return run
+
+
+def sequence(*behaviours: Behaviour) -> Behaviour:
+    """The first request gets the first behaviour, the second the next, and so on; the last
+    one repeats."""
+    calls = [0]
+
+    async def run(send, fake, receive=None):
+        i = min(calls[0], len(behaviours) - 1)
+        calls[0] += 1
+        await behaviours[i](send, fake, receive)
+
+    return run
+
+
+def abort_body(first: bytes, length: int) -> Behaviour:
+    """Send a 200 with `Content-Length: length` and the first bytes, then return without
+    finishing: uvicorn closes the connection, so the response is cut short (an upstream reset
+    as the sidecar sees it)."""
+
+    async def run(send, fake, receive=None):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", str(length).encode())],
+            }
+        )
+        await send({"type": "http.response.body", "body": first, "more_body": True})
+
+    return run
+
+
+class Hold:
+    """A behaviour that holds each request until the test releases it, and records when the
+    sidecar closes the connection (TD §7 `hold` and `observe_disconnect`).
+
+    The response's headers and first chunk, if given, are sent before the hold; after a
+    release, `rest` follows and the response ends. Requests are numbered in arrival order.
+    """
+
+    def __init__(
+        self,
+        *,
+        headers: list[tuple[bytes, bytes]] | None = None,
+        first: bytes | None = None,
+        rest: bytes = b"",
+        status_code: int = 200,
+    ) -> None:
+        self.headers = headers
+        self.first = first
+        self.rest = rest
+        self.status_code = status_code
+        self._go: list[threading.Event] = []
+        self.disconnected_at: dict[int, float] = {}
+        self.finished: set[int] = set()
+
+    @property
+    def entered(self) -> int:
+        return len(self._go)
+
+    def release(self, i: int = 0) -> None:
+        self._go[i].set()
+
+    def release_all(self) -> None:
+        for go in self._go:
+            go.set()
+
+    def wait_entered(self, n: int = 1) -> None:
+        wait_for(lambda: self.entered >= n)
+
+    def wait_disconnected(self, i: int = 0) -> float:
+        wait_for(lambda: i in self.disconnected_at)
+        return self.disconnected_at[i]
+
+    async def __call__(self, send, fake, receive=None) -> None:
+        i = len(self._go)
+        go = threading.Event()
+        self._go.append(go)
+        started = self.headers is not None
+        if started:
+            start = {"type": "http.response.start", "status": self.status_code}
+            await send({**start, "headers": self.headers})
+            if self.first is not None:
+                await send({"type": "http.response.body", "body": self.first, "more_body": True})
+        assert receive is not None
+        gone = asyncio.ensure_future(receive())  # resolves when the sidecar disconnects
+        deadline = time.monotonic() + STALL_LIMIT_S
+        try:
+            while not go.is_set() and not fake.release.is_set():
+                if gone.done():
+                    self.disconnected_at[i] = time.monotonic()
+                    return
+                if time.monotonic() > deadline:
+                    return
+                await asyncio.sleep(0.002)
+        finally:
+            if not gone.done():
+                gone.cancel()
+        if not started:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": self.status_code,
+                    "headers": [(b"content-length", str(len(self.rest)).encode())],
+                }
+            )
+        await send({"type": "http.response.body", "body": self.rest})
+        self.finished.add(i)
 
 
 @dataclass
@@ -207,7 +376,7 @@ class FakeOllama:
             )
         )
         behaviour = self.routes.get((scope["method"], scope["path"]), status(404))
-        await behaviour(send, self)
+        await behaviour(send, self, receive)
 
     def start(self, sock: socket.socket | None = None) -> FakeOllama:
         self.server = ThreadServer(self, sock or reserve_socket(), lifespan="off").start()
@@ -292,6 +461,33 @@ class RawResponse:
 
     def header(self, name: str) -> list[str]:
         return [v for k, v in self.headers if k == name.lower()]
+
+
+def read_response(sock: socket.socket) -> RawResponse:
+    """Read exactly one response with a `Content-Length` from a keep-alive socket."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise AssertionError(f"the connection closed before a response: {buf!r}")
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    headers = [
+        (k.strip().lower(), v.strip()) for k, v in (line.split(":", 1) for line in lines[1:])
+    ]
+    length = int(next(v for k, v in headers if k == "content-length"))
+    while len(body) < length:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise AssertionError("the connection closed inside a response body")
+        body += chunk
+    assert len(body) == length, "nothing follows the response on the socket yet"
+    return RawResponse(int(lines[0].split()[1]), headers, body)
+
+
+def raw_connect(port: int, timeout: float = WAIT_S) -> socket.socket:
+    return socket.create_connection((LOOPBACK, port), timeout=timeout)
 
 
 def raw_exchange(port: int, data: bytes, timeout: float = 10) -> RawResponse:

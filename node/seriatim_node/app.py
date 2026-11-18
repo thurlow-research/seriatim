@@ -3,7 +3,8 @@
 S1-1 adds the error table: `ErrorCode`, `ERROR_TABLE` and `ErrorFactory`. `contract/openapi.yaml`
 is the source of truth, and K-OAS3 checks that this table equals its `x-seriatim-codes`.
 S1-5 adds `RequestLog`, `create_app` (the dispatcher and `/seriatim/health`) and the health
-client. The proxy (`proxy.py`) follows in S1-6, and the singleton lock and `main()` in S1-12.
+client. S1-6 hands every other route to the proxy (`proxy.py`). The singleton lock and `main()`
+follow in S1-12.
 """
 
 from __future__ import annotations
@@ -312,32 +313,19 @@ async def _send_response(
     await send({"type": "http.response.body", "body": body, "more_body": False})
 
 
-async def _not_yet_proxied(
-    app: _Dispatcher, scope: Scope, receive: Receive, send: Send, request_id: str, where: dict
-) -> None:
-    """Placeholder for the proxy until S1-6: nothing is sent upstream and no slot is taken."""
-    await app.reply(
-        send,
-        ErrorCode.INTERNAL,
-        "passthrough is not available in this build",
-        request_id=request_id,
-        method=scope["method"],
-        log_level="ERROR",
-        outcome="internal_error",
-        **where,
-    )
-
-
 class _Dispatcher:
     """The ASGI callable `create_app` returns. It sees every request before Starlette."""
 
-    def __init__(self, settings: Settings, gate: Gate | None) -> None:
+    def __init__(
+        self, settings: Settings, gate: Gate | None, client: httpx.AsyncClient | None
+    ) -> None:
         self.settings = settings
         self.gate = gate
+        self.client = client  # the shared ungated client; the lifespan creates it if None
         self.health_client: httpx.AsyncClient | None = None
         self.errors = ErrorFactory(settings.id)
         self.log = RequestLog(settings.log_level, settings.id)
-        self.proxy = _not_yet_proxied
+        self.proxy: Any = None  # set by the lifespan, which runs before any request
         # The dispatcher has already refused every other method (405), so the route lists none.
         self._router = Starlette(
             routes=[StarletteRoute("/seriatim/health", self._health)],
@@ -347,13 +335,21 @@ class _Dispatcher:
     @contextlib.asynccontextmanager
     async def _lifespan(self, _app: Starlette) -> AsyncIterator[None]:
         s = self.settings
+        # proxy.py imports this module, so it is imported here rather than at the top.
+        from seriatim_node.proxy import Proxy, new_ungated_client
+
         if self.gate is None:  # a new Gate starts in its startup quarantine (REQ-12a)
             self.gate = Gate(s.slots, s.retry_after_s, s.drain_s, s.max_hold_s)
+        owned = self.client is None
+        client = self.client = new_ungated_client(s) if owned else self.client
         self.health_client = new_health_client(s)
+        self.proxy = Proxy(s, self.gate, client, self.log, self.errors)
         try:
             yield
         finally:
             await self.health_client.aclose()
+            if owned:
+                await client.aclose()
 
     async def reply(
         self,
@@ -424,7 +420,8 @@ class _Dispatcher:
             "known": route.known,
         }
         if route.kind is not Kind.SERIATIM:
-            await self.proxy(self, scope, receive, send, rid, where)
+            assert self.proxy is not None  # set by the lifespan
+            await self.proxy(scope, receive, send, route, rid)
         elif route.seriatim_status == 404:
             await self.reply(
                 send, ErrorCode.NOT_FOUND, "no such path", request_id=rid, method=method, **where
@@ -509,10 +506,12 @@ class _Dispatcher:
         )
 
 
-def create_app(settings: Settings, *, gate: Gate | None = None) -> ASGIApp:
-    """The sidecar's ASGI app (TD §2.4). Tests inject `gate`; otherwise the lifespan creates
-    one, which starts in its startup quarantine."""
-    return _Dispatcher(settings, gate)
+def create_app(
+    settings: Settings, *, client: httpx.AsyncClient | None = None, gate: Gate | None = None
+) -> ASGIApp:
+    """The sidecar's ASGI app (TD §2.4). Tests may inject the shared ungated `client` and the
+    `gate`; otherwise the lifespan creates them (a new gate starts in its startup quarantine)."""
+    return _Dispatcher(settings, gate, client)
 
 
 def main() -> int:
