@@ -2,13 +2,16 @@
 
 S1-1: the error table against the contract (K-OAS3). S1-3: the contract against `classify()`
 (K-OAS1). S1-5: the dispatcher and health over real sockets (H12, H22, H23, E2, HL1-HL7,
-HL9), with the harness in `harness.py`.
+HL9), with the harness in `harness.py`. S1-6: the proxy core over real sockets (H1, H2,
+H4-H8, H25, B1-B5, E1).
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -19,19 +22,31 @@ import pytest
 import yaml
 from harness import (
     TIMING_BOUND_S,
+    WAIT_S,
     FakeOllama,
+    Hold,
+    ThreadServer,
+    abort_body,
     all_free,
     drip_body,
+    exchange,
+    exchange_body,
     make_settings,
+    raw_connect,
     raw_exchange,
+    read_response,
     ready_gate,
+    replay,
     reserve_socket,
+    sequence,
     stall_body,
     stall_headers,
     status,
+    wait_for,
 )
 from openapi_spec_validator import OpenAPIV31SpecValidator, validate
 
+import seriatim_node.proxy as proxy_module
 from seriatim_node.app import (
     ERROR_TABLE,
     ErrorCode,
@@ -45,6 +60,7 @@ from seriatim_node.app import (
     request_id_from,
 )
 from seriatim_node.gate import BLOB_RE, Kind, Route, Scope, classify
+from seriatim_node.proxy import Proxy
 
 # Resolved from this file, so the same path works when mutmut copies tests/ and contract/
 # into node/ (tools/ci/mutation.py).
@@ -515,9 +531,6 @@ REFUSALS = [
      [(b"allow", b"GET")], "INFO", "rejected", {"path": "/seriatim/health",
                                                 "kind": "seriatim", "scope": "none",
                                                 "known": False}),
-    ("GET", b"/api/tags", "1.1", ErrorCode.INTERNAL, "passthrough is not available in this build",
-     [], "ERROR", "internal_error", {"path": "/api/tags", "kind": "ungated", "scope": "infer",
-                                     "known": True}),
 ]  # fmt: skip
 
 
@@ -554,19 +567,6 @@ def test_dispatcher_refusals_exactly(
         "node": "node-a",
     }
     assert list(line)[-4:] == ["outcome", "status", "slot_end", "node"]
-    assert all_free(gate)
-
-
-def test_passthrough_is_refused_until_s1_6(fake_ollama, sidecar, envelope_validator):
-    """Until the proxy lands (S1-6), a non-Seriatim route gets 500 and reaches nothing."""
-    gate, _ = ready_gate()
-    car = sidecar(fake_ollama.url, gate=gate)
-    for method, path in [("GET", "/api/tags"), ("POST", "/api/chat")]:
-        resp = httpx.request(method, car.url + path, content=b"{}")
-        assert resp.status_code == 500
-        _error_doc(resp.content, ErrorCode.INTERNAL, envelope_validator)
-        assert resp.headers["x-seriatim-gate"] == "ungated"
-    assert fake_ollama.requests == []
     assert all_free(gate)
 
 
@@ -924,3 +924,797 @@ def test_hl9_a_degraded_health_line(sidecar, capsys):
         assert line == _health_line("d1", "degraded", 503)
     finally:
         closed.close()
+
+
+# --- S1-6: the proxy core (TD §3.3, §4, §5) --------------------------------------------------
+
+CHAT = b'{"model":"m","messages":[]}'
+
+
+def _slot_states(gate) -> list[str]:
+    return sorted(s.state.value for s in gate.slots())
+
+
+def _in_background(fn, *args, **kwargs) -> concurrent.futures.Future:
+    """Run a blocking client call in a thread, so the test can act while it is held."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn, *args, **kwargs)
+    pool.shutdown(wait=False)
+    return future
+
+
+def _chat(car, body: bytes = CHAT) -> httpx.Response:
+    return httpx.post(car.url + "/api/chat", content=body, timeout=WAIT_S)
+
+
+@pytest.mark.td("H1")
+def test_h1_non_streaming_chat_replayed(fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", replay("chat.nostream"))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    captured = exchange("chat.nostream")
+    resp = _chat(car, captured["request"]["body"].encode())
+    assert resp.status_code == captured["response"]["status"] == 200
+    assert resp.headers["content-type"] == "application/json; charset=utf-8"
+    assert resp.content == exchange_body("chat.nostream")
+    assert resp.headers.get_list("x-seriatim-gate") == ["acquired"]
+    assert resp.headers.get_list("x-seriatim-node") == ["node-a"]
+    (rid,) = resp.headers.get_list("x-request-id")
+    assert HEX32.fullmatch(rid)
+    (req,) = fake_ollama.requests
+    assert dict(req.headers)[b"x-request-id"] == rid.encode()
+    wait_for(lambda: all_free(gate))
+
+
+@pytest.mark.td("H2")
+def test_h2_unusual_json_reaches_upstream_byte_identical(fake_ollama, sidecar):
+    body = (
+        b'{"options":{"num_ctx": 30000 ,"top_k":40,"seed":7},  "model":"q\\u00e9",'
+        b'"n":1.0e0,"x_future":[1],"messages":[]}\n'
+    )
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    assert _chat(car, body).status_code == 200
+    (req,) = fake_ollama.requests
+    assert req.body == body
+    assert [v for k, v in req.headers if k == b"content-length"] == [str(len(body)).encode()]
+
+
+@pytest.mark.td("H4")
+@pytest.mark.parametrize(
+    ("line", "route", "raw_path", "query"),
+    [
+        (b"GET /api/tags?x=1&y=%20", ("GET", "/api/tags"), b"/api/tags", b"x=1&y=%20"),
+        (b"POST /api/show%20x", ("POST", "/api/show x"), b"/api/show%20x", b""),
+    ],
+)
+def test_h4_raw_path_and_query_are_byte_identical(
+    line, route, raw_path, query, fake_ollama, sidecar
+):
+    fake_ollama.script(*route, status(200, b"{}"))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    request = line + b" HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+    assert raw_exchange(car.port, request).status == 200
+    (req,) = fake_ollama.requests
+    assert (req.raw_path, req.query) == (raw_path, query)
+
+
+@pytest.mark.td("H5")
+def test_h5_upstream_404_passes_through_and_frees_the_slot(fake_ollama, sidecar):
+    body = b'{"error":"model \\"nope\\" not found"}'
+    fake_ollama.script(
+        "POST", "/api/chat", status(404, body, [(b"content-type", b"application/json")])
+    )
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _chat(car)
+    assert (resp.status_code, resp.content) == (404, body)
+    assert resp.headers.get_list("x-seriatim-gate") == ["acquired"]
+    wait_for(lambda: all_free(gate))  # a clean end: freed at once, and the clock never moved
+
+
+@pytest.mark.td("H25")
+@pytest.mark.parametrize(
+    ("code", "ctype", "body"),
+    [
+        (500, b"application/json", b'{"error":"x"}'),
+        (503, b"text/plain", b"oops"),
+        (502, b"text/html", b"<html>bad gateway</html>"),
+    ],
+)
+def test_h25_clean_upstream_errors_pass_through(code, ctype, body, fake_ollama, sidecar):
+    first = status(code, body, [(b"content-type", ctype)])
+    fake_ollama.script("POST", "/api/chat", sequence(first, status(200, b"{}")))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _chat(car)
+    assert (resp.status_code, resp.headers["content-type"], resp.content) == (
+        code,
+        ctype.decode(),
+        body,
+    )
+    wait_for(lambda: all_free(gate))
+    assert _chat(car).status_code == 200  # freed with no drain: the fake clock never moved
+
+
+@pytest.mark.td("H6")
+def test_h6_ungated_routes_pass_while_gated_is_held(fake_ollama, sidecar):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    fake_ollama.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    tags = httpx.get(car.url + "/api/tags", timeout=WAIT_S)
+    assert (tags.status_code, tags.content) == (200, b'{"models":[]}')
+    assert tags.headers.get_list("x-seriatim-gate") == ["ungated"]
+    for method, path in [("OPTIONS", "/api/tags"), ("GET", "/api/chat")]:  # gated, unknown
+        resp = httpx.request(method, car.url + path, timeout=WAIT_S)
+        assert resp.status_code == 429
+        assert resp.headers["x-seriatim-gate"] == "busy"
+    hold.release()
+    assert held.result(WAIT_S).status_code == 200
+    assert [r.method for r in fake_ollama.requests] == ["POST", "GET"]
+
+
+@pytest.mark.td("H7")
+def test_h7_pull_progress_streams_while_gated_is_held(fake_ollama, sidecar):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    fake_ollama.script("POST", "/api/pull", replay("pull.progress"))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    pull = httpx.post(car.url + "/api/pull", content=b'{"model":"m"}', timeout=WAIT_S)
+    assert pull.status_code == 200
+    assert pull.headers["content-type"] == "application/x-ndjson"
+    assert pull.content == exchange_body("pull.progress")
+    assert pull.headers.get_list("x-seriatim-gate") == ["ungated"]
+    hold.release()
+    assert held.result(WAIT_S).status_code == 200
+
+
+def _raw_chat(body: bytes = CHAT) -> bytes:
+    length = str(len(body)).encode()
+    return b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Length: " + length + b"\r\n\r\n" + body
+
+
+@pytest.mark.td("H8")
+def test_h8_keep_alive_next_request_is_admitted(fake_ollama, sidecar, monkeypatch):
+    """The lease ends in step (b), before step (c) sends the final body message, so the next
+    request on the same connection is never refused because of its own previous one."""
+    entered, go = threading.Event(), threading.Event()
+    original = Proxy._finish_response
+    free_at_step_c = []
+
+    async def held_at_step_c(self, *args, **kwargs):
+        free_at_step_c.append(all_free(self.gate))
+        if len(free_at_step_c) == 1:
+            entered.set()
+            while not go.is_set():
+                await anyio.sleep(0.002)
+        await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Proxy, "_finish_response", held_at_step_c)
+    fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_raw_chat())
+        first = read_response(sock)  # every body byte arrives before step (c)
+        assert (first.status, first.body) == (200, b'{"done":true}')
+        assert entered.wait(WAIT_S)
+        sock.sendall(_raw_chat())  # at once, while step (c) is held
+        assert all_free(gate)
+        go.set()
+        second = read_response(sock)
+    assert (second.status, second.body) == (200, b'{"done":true}')
+    assert free_at_step_c == [True, True]
+    assert len(fake_ollama.requests) == 2
+
+
+@pytest.mark.td("H8")
+def test_h8b_an_abnormal_end_drains(fake_ollama, sidecar):
+    cut_short = abort_body(b'{"do', 100)
+    fake_ollama.script("POST", "/api/chat", sequence(cut_short, status(200, b'{"done":true}')))
+    gate, clock = ready_gate(drain_s=10)
+    car = sidecar(fake_ollama.url, gate=gate)
+    with pytest.raises(httpx.RemoteProtocolError):  # the client sees the response cut short
+        _chat(car)
+    wait_for(lambda: _slot_states(gate) == ["draining"])
+    assert _chat(car).status_code == 429
+    clock.advance(10)
+    assert _chat(car).status_code == 200
+
+
+@pytest.mark.td("B1")
+def test_b1_second_request_gets_429_at_once(fake_ollama, sidecar, envelope_validator):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    started = time.perf_counter()
+    resp = _chat(car)
+    elapsed = time.perf_counter() - started
+    assert resp.status_code == 429
+    assert elapsed < TIMING_BOUND_S
+    assert resp.headers["retry-after"] == "15"
+    assert resp.headers.get_list("x-seriatim-gate") == ["busy"]
+    doc = _error_doc(resp.content, ErrorCode.GPU_BUSY, envelope_validator)
+    assert (doc["retryable"], doc["replay_safe"], doc["retry_after"]) == (True, True, 15)
+    assert doc["busy_for_s"] >= 0
+    assert len(fake_ollama.requests) == 1
+    hold.release()
+    assert held.result(WAIT_S).status_code == 200
+
+
+@pytest.mark.td("B2")
+def test_b2_a_clean_end_admits_the_next_at_once(fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    assert _chat(car).status_code == 200
+    wait_for(lambda: all_free(gate))
+    assert _chat(car).status_code == 200
+    assert len(fake_ollama.requests) == 2
+
+
+@pytest.mark.td("B3")
+def test_b3_429_without_reading_the_body(fake_ollama, sidecar):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    with raw_connect(car.port) as sock:
+        sock.sendall(b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Length: 10485760\r\n\r\n")
+        resp = read_response(sock)  # no body byte was ever sent
+    assert resp.status == 429
+    assert resp.header("x-seriatim-gate") == ["busy"]
+    assert len(fake_ollama.requests) == 1
+    hold.release()
+    assert held.result(WAIT_S).status_code == 200
+
+
+@pytest.mark.td("B4")
+def test_b4_two_slots(fake_ollama, sidecar):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    gate, _ = ready_gate(slots=2)
+    car = sidecar(fake_ollama.url, gate=gate)
+    first, second = _in_background(_chat, car), _in_background(_chat, car)
+    hold.wait_entered(2)
+    assert _chat(car).status_code == 429
+    hold.release(0)
+    wait_for(lambda: _slot_states(gate) == ["free", "held"])
+    fourth = _in_background(_chat, car)
+    hold.wait_entered(3)
+    hold.release_all()
+    assert [f.result(WAIT_S).status_code for f in (first, second, fourth)] == [200, 200, 200]
+
+
+@pytest.mark.td("B5")
+def test_b5_startup_quarantine(fake_ollama, sidecar, envelope_validator, health_validator):
+    fake_ollama.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    fake_ollama.script("GET", "/api/version", VERSION_OK)
+    car = sidecar(fake_ollama.url, drain_s=600)  # the lifespan's Gate starts in quarantine
+    with raw_connect(car.port) as sock:
+        sock.sendall(b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Length: 10485760\r\n\r\n")
+        resp = read_response(sock)  # the body is never read
+    assert resp.status == 503
+    doc = _error_doc(resp.body, ErrorCode.NODE_STARTING, envelope_validator)
+    (retry_after,) = resp.header("retry-after")
+    assert 0 < int(retry_after) <= 600 and doc["retry_after"] == int(retry_after)
+    assert resp.header("x-seriatim-gate") == ["refused"]
+    assert httpx.get(car.url + "/api/tags", timeout=WAIT_S).status_code == 200
+    health = _health(car, health_validator)
+    assert health.status_code == 503 and _reasons(health) == ["starting"]
+    assert [r.raw_path for r in fake_ollama.requests] == [b"/api/tags", b"/api/version"]
+
+
+@pytest.mark.td("E1")
+def test_e1_closed_port_is_502_and_frees_the_slot(sidecar, envelope_validator):
+    down = reserve_socket()
+    try:
+        gate, _ = ready_gate()
+        car = sidecar(f"http://127.0.0.1:{down.getsockname()[1]}", gate=gate)
+        for _ in range(2):  # the second is 502 too, never 429: nothing was sent
+            resp = _chat(car)
+            assert resp.status_code == 502
+            doc = _error_doc(resp.content, ErrorCode.UPSTREAM_UNAVAILABLE, envelope_validator)
+            assert doc["replay_safe"] is True
+            assert resp.headers.get_list("x-seriatim-gate") == ["acquired"]
+            wait_for(lambda: all_free(gate))
+    finally:
+        down.close()
+
+
+# --- S1-6: the lifecycle's branches, in process ----------------------------------------------
+# The proxy is called directly, with httpx's MockTransport upstream, so each branch of §3.3 and
+# §5 is checked exactly. The over-the-wire tests for these paths come with their own IDs in
+# S1-8 to S1-10; these pin the S1-6 structure they build on.
+
+
+class _Stream(httpx.AsyncByteStream):
+    """A response body: `chunks`, then optionally a stall or an error; `aclose` may fail."""
+
+    def __init__(self, chunks=(), *, then=None, close=None):
+        self.chunks, self.then, self.close = list(chunks), then, close
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+        if self.then == "stall":
+            await anyio.sleep(30)
+        elif self.then is not None:
+            raise self.then
+
+    async def aclose(self):
+        if self.close == "raise":
+            raise OSError("close failed")
+        if self.close == "hang":
+            await anyio.sleep(30)
+
+
+class _Client(httpx.AsyncClient):
+    """A client whose own `aclose` can fail or hang (the gated close proof)."""
+
+    def __init__(self, handler, close=None):
+        super().__init__(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:1")
+        self.close = close
+
+    async def aclose(self):
+        await super().aclose()
+        if self.close == "raise":
+            raise OSError("close failed")
+        if self.close == "hang":
+            await anyio.sleep(30)
+
+
+def _run_proxy(
+    handler,
+    *,
+    method="POST",
+    path=b"/api/chat",
+    gate=None,
+    gated_close=None,
+    shared=None,
+    monkeypatch,
+    cancel_after=None,
+    **settings,
+):
+    """Call the proxy directly; return (messages sent, gate, the gated client used)."""
+    settings = make_settings("http://127.0.0.1:1", close_timeout_s=0.2, **settings)
+    gate = gate or ready_gate()[0]
+    gated: list[_Client] = []
+
+    def new_gated(_settings):
+        gated.append(_Client(handler, gated_close))
+        return gated[-1]
+
+    monkeypatch.setattr(proxy_module, "new_gated_client", new_gated)
+    proxy = Proxy(
+        settings,
+        gate,
+        shared or _Client(handler),
+        RequestLog(settings.log_level, settings.id),
+        ErrorFactory(settings.id),
+    )
+    scope = {
+        "type": "http",
+        "method": method,
+        "raw_path": path,
+        "query_string": b"",
+        "headers": [(b"host", b"x"), (b"content-length", b"2")],
+    }
+    sent: list[dict] = []
+    body = [{"type": "http.request", "body": b"{}", "more_body": False}]
+
+    async def receive():
+        if body:
+            return body.pop()
+        await anyio.sleep(30)  # the watcher waits; no disconnect comes
+
+    async def send(message):
+        sent.append(message)
+
+    async def main():
+        with anyio.move_on_after(cancel_after if cancel_after is not None else 30):
+            await proxy(scope, receive, send, classify(method, path), "rid")
+
+    anyio.run(main)
+    return sent, gate, gated
+
+
+def _ok(request):
+    # A stream body: MockTransport treats `content=` as already read, so aiter_raw would fail.
+    return httpx.Response(200, stream=_Stream([b'{"done":true}']))
+
+
+def _one_line(capsys) -> dict:
+    (line,) = _log_lines(capsys.readouterr().out)
+    return line
+
+
+def test_proxy_clean_gated_exchange(monkeypatch, capsys):
+    sent, gate, _ = _run_proxy(_ok, monkeypatch=monkeypatch)
+    assert [(m["type"], m.get("more_body")) for m in sent] == [
+        ("http.response.start", None),
+        ("http.response.body", True),
+        ("http.response.body", False),
+    ]
+    assert sent[1]["body"] == b'{"done":true}' and sent[2]["body"] == b""
+    assert all_free(gate)
+    line = _one_line(capsys)
+    assert (line["level"], line["outcome"], line["status"], line["slot_end"]) == (
+        "INFO",
+        "ok",
+        200,
+        "free",
+    )
+    assert (line["path"], line["kind"], line["scope"], line["known"]) == (
+        "/api/chat",
+        "gated",
+        "infer",
+        True,
+    )
+    assert "upstream_close_failed" not in line
+
+
+@pytest.mark.parametrize("close", ["raise", "hang"])
+def test_proxy_unproven_close_marks_the_slot_stuck(close, monkeypatch, capsys):
+    sent, gate, _ = _run_proxy(_ok, gated_close=close, monkeypatch=monkeypatch)
+    assert _slot_states(gate) == ["stuck"]
+    assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+    line = _one_line(capsys)
+    assert (line["level"], line["slot_end"], line["upstream_close_failed"]) == (
+        "CRITICAL",
+        "stuck",
+        True,
+    )
+
+
+def test_proxy_gated_client_creation_fails(monkeypatch, capsys, envelope_validator):
+    def boom(_settings):
+        raise RuntimeError("no client")
+
+    settings = make_settings("http://127.0.0.1:1")
+    gate, _ = ready_gate()
+    proxy = Proxy(
+        settings, gate, _Client(_ok), RequestLog("INFO", "node-a"), ErrorFactory("node-a")
+    )
+    monkeypatch.setattr(proxy_module, "new_gated_client", boom)
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"method": "POST", "raw_path": b"/api/chat", "query_string": b"", "headers": []}
+    anyio.run(proxy, scope, receive, send, classify("POST", b"/api/chat"), "rid")
+    assert sent[0]["status"] == 500
+    assert [v for k, v in sent[0]["headers"] if k == b"x-seriatim-gate"] == [b"acquired"]
+    _error_doc(sent[1]["body"], ErrorCode.INTERNAL, envelope_validator)
+    assert all_free(gate)  # nothing was sent: freed with no drain
+    line = _one_line(capsys)
+    assert (line["level"], line["outcome"], line["slot_end"]) == ("ERROR", "internal_error", "free")
+
+
+async def _never_answers(request):
+    await anyio.sleep(30)
+
+
+def test_proxy_hold_limit_before_the_headers(monkeypatch, capsys, envelope_validator):
+    gate, _ = ready_gate(max_hold_s=0.2)  # the fake clock stands still: 0.2 s of real time
+    sent, _, _ = _run_proxy(_never_answers, gate=gate, monkeypatch=monkeypatch)
+    assert sent[0]["status"] == 504
+    _error_doc(sent[1]["body"], ErrorCode.LOCK_HOLD_EXCEEDED, envelope_validator)
+    assert _slot_states(gate) == ["draining"]  # it was sent upstream
+    line = _one_line(capsys)
+    assert (line["level"], line["outcome"], line["slot_end"]) == (
+        "CRITICAL",
+        "hold_exceeded",
+        "draining",
+    )
+
+
+def test_proxy_hold_limit_mid_stream_aborts(monkeypatch, capsys):
+    gate, _ = ready_gate(max_hold_s=0.2)
+    sent, _, _ = _run_proxy(
+        lambda r: httpx.Response(200, stream=_Stream([b"a\n"], then="stall")),
+        gate=gate,
+        monkeypatch=monkeypatch,
+    )
+    assert [m.get("more_body") for m in sent] == [None, True]  # no final message: an abort
+    assert _slot_states(gate) == ["draining"]
+    assert _one_line(capsys)["outcome"] == "hold_exceeded"
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "outcome", "slot"),
+    [
+        (httpx.ConnectError("refused"), ErrorCode.UPSTREAM_UNAVAILABLE, "upstream_unavailable",
+         "free"),
+        (httpx.ConnectTimeout("slow"), ErrorCode.UPSTREAM_UNAVAILABLE, "upstream_unavailable",
+         "free"),
+        (httpx.ReadError("reset"), ErrorCode.UPSTREAM_PROTOCOL_ERROR, "upstream_error",
+         "draining"),
+        (ValueError("bug"), ErrorCode.INTERNAL, "internal_error", "draining"),
+    ],
+)  # fmt: skip
+def test_proxy_errors_before_the_headers(
+    error, code, outcome, slot, monkeypatch, capsys, envelope_validator
+):
+    def fail(request):
+        raise error
+
+    sent, gate, _ = _run_proxy(fail, monkeypatch=monkeypatch)
+    assert sent[0]["status"] == ERROR_TABLE[code].status
+    _error_doc(sent[1]["body"], code, envelope_validator)
+    assert _slot_states(gate) == [slot]
+    line = _one_line(capsys)
+    assert (line["outcome"], line["slot_end"], line["status"]) == (
+        outcome,
+        slot,
+        ERROR_TABLE[code].status,
+    )
+    assert line["level"] == ("ERROR" if code is ErrorCode.INTERNAL else "INFO")
+
+
+def test_proxy_ungated_pool_timeout_is_saturated(monkeypatch, capsys, envelope_validator):
+    def full(request):
+        raise httpx.PoolTimeout("full")
+
+    sent, gate, gated = _run_proxy(full, method="GET", path=b"/api/tags", monkeypatch=monkeypatch)
+    assert sent[0]["status"] == 503 and gated == []
+    headers = dict(sent[0]["headers"])
+    assert (headers[b"retry-after"], headers[b"x-seriatim-gate"]) == (b"15", b"ungated")
+    doc = _error_doc(sent[1]["body"], ErrorCode.NODE_SATURATED, envelope_validator)
+    assert doc["retry_after"] == 15
+    line = _one_line(capsys)
+    assert (line["outcome"], line["slot_end"], line["kind"]) == ("saturated", "none", "ungated")
+    assert all_free(gate)
+
+
+def test_proxy_error_mid_stream_aborts(monkeypatch, capsys):
+    sent, gate, _ = _run_proxy(
+        lambda r: httpx.Response(200, stream=_Stream([b"a\n"], then=httpx.ReadError("reset"))),
+        monkeypatch=monkeypatch,
+    )
+    assert [m.get("more_body") for m in sent] == [None, True]
+    assert _slot_states(gate) == ["draining"]
+    line = _one_line(capsys)
+    assert (line["outcome"], line["status"]) == ("upstream_error", 200)
+
+
+def _broken_then(close):
+    """An ungated response that breaks mid-stream, so step (a)'s close is the only one: when
+    the stream ends normally, httpx's aiter_raw closes it itself (S1-10 covers that, H26)."""
+    return lambda r: httpx.Response(
+        200, stream=_Stream([b"{"], then=httpx.ReadError("reset"), close=close)
+    )
+
+
+def test_proxy_ungated_close_failure_is_logged(monkeypatch, capsys):
+    sent, gate, _ = _run_proxy(
+        _broken_then("raise"), method="GET", path=b"/api/tags", monkeypatch=monkeypatch
+    )
+    assert [m.get("more_body") for m in sent] == [None, True]  # an abort
+    line = _one_line(capsys)
+    assert (line["level"], line["upstream_close_failed"], line["slot_end"]) == (
+        "ERROR",
+        True,
+        "none",
+    )
+    assert line["outcome"] == "upstream_error"
+    assert all_free(gate)
+
+
+def test_proxy_ungated_close_that_hangs_is_bounded(monkeypatch, capsys):
+    started = time.perf_counter()
+    _run_proxy(_broken_then("hang"), method="GET", path=b"/api/tags", monkeypatch=monkeypatch)
+    assert time.perf_counter() - started < 0.2 + TIMING_BOUND_S  # close_timeout_s, then on
+    line = _one_line(capsys)
+    assert (line["level"], line["upstream_close_failed"]) == ("ERROR", True)
+
+
+def test_proxy_external_cancellation_sends_nothing_and_drains(monkeypatch, capsys):
+    sent, gate, gated = _run_proxy(_never_answers, monkeypatch=monkeypatch, cancel_after=0.2)
+    assert sent == []
+    assert _slot_states(gate) == ["draining"]
+    assert gated[0].is_closed  # the shielded finally still proved the close
+    line = _one_line(capsys)
+    assert (line["outcome"], line["status"], line["slot_end"]) == ("cancelled", None, "draining")
+
+
+def _direct(proxy, receive, send):
+    scope = {"method": "POST", "raw_path": b"/api/chat", "query_string": b"", "headers": []}
+    anyio.run(proxy, scope, receive, send, classify("POST", b"/api/chat"), "rid")
+
+
+def _plain_proxy(gate, handler=_ok):
+    settings = make_settings("http://127.0.0.1:1")
+    return Proxy(
+        settings, gate, _Client(handler), RequestLog("INFO", "node-a"), ErrorFactory("node-a")
+    )
+
+
+def test_proxy_a_failed_final_write_never_changes_the_slot(monkeypatch, capsys):
+    monkeypatch.setattr(proxy_module, "new_gated_client", lambda s: _Client(_ok))
+    gate, _ = ready_gate()
+    sent: list[dict] = []
+
+    async def receive():
+        if not sent:
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+        await anyio.sleep(30)
+
+    async def send(message):
+        if message.get("more_body") is False:
+            raise OSError("the client is gone")
+        sent.append(message)
+
+    _direct(_plain_proxy(gate), receive, send)
+    assert all_free(gate)
+    line = _one_line(capsys)
+    assert (line["outcome"], line["slot_end"]) == ("ok", "free")
+
+
+def test_proxy_client_gone_during_the_body(monkeypatch, capsys):
+    monkeypatch.setattr(proxy_module, "new_gated_client", lambda s: _Client(_ok))
+    gate, _ = ready_gate()
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    _direct(_plain_proxy(gate), receive, send)
+    assert sent == []  # nobody to answer
+    assert all_free(gate)  # nothing was sent upstream: freed with no drain
+    line = _one_line(capsys)
+    assert (line["outcome"], line["status"], line["slot_end"]) == (
+        "client_disconnect",
+        None,
+        "free",
+    )
+
+
+def test_watch_disconnect_ignores_other_messages():
+    messages = [{"type": "http.request", "body": b""}, {"type": "http.disconnect"}]
+
+    async def main():
+        outcome = proxy_module.Outcome()
+
+        async def receive():
+            return messages.pop(0)
+
+        with anyio.CancelScope() as scope:
+            await proxy_module.watch_disconnect(receive, outcome, scope)
+        return outcome, scope
+
+    outcome, scope = anyio.run(main)
+    assert outcome.disconnected and scope.cancel_called and messages == []
+
+
+def test_read_body_joins_chunks_and_sees_a_disconnect():
+    async def read(messages):
+        async def receive():
+            return messages.pop(0)
+
+        return await proxy_module.read_body(receive)
+
+    parts = [
+        {"type": "http.request", "body": b"ab", "more_body": True},
+        {"type": "http.request", "more_body": True},
+        {"type": "http.request", "body": b"c"},
+    ]
+    assert anyio.run(read, parts) == b"abc"
+    gone = [{"type": "http.request", "body": b"a", "more_body": True}, {"type": "http.disconnect"}]
+    with pytest.raises(proxy_module.ClientGone):
+        anyio.run(read, gone)
+
+
+def test_upstream_headers_exactly():
+    client = [
+        (b"Host", b"evil"),
+        (b"Content-Length", b"99"),
+        (b"Transfer-Encoding", b"chunked"),
+        (b"Connection", b"keep-alive"),
+        (b"Keep-Alive", b"timeout=5"),
+        (b"X-Request-Id", b"theirs"),
+        (b"X-Custom", b"a"),
+        (b"x-custom", b"b"),
+    ]
+    assert proxy_module.upstream_headers(client, body_len=3, request_id="rid") == [
+        (b"X-Custom", b"a"),
+        (b"x-custom", b"b"),
+        (b"content-length", b"3"),
+        (b"x-request-id", b"rid"),
+    ]
+
+
+def test_downstream_headers_exactly():
+    upstream = httpx.Headers(
+        [
+            (b"Content-Type", b"application/json"),
+            (b"Content-Length", b"2"),
+            (b"Transfer-Encoding", b"chunked"),
+            (b"Connection", b"close"),
+            (b"Keep-Alive", b"timeout=5"),
+            (b"X-Request-Id", b"upstream"),
+            (b"X-Seriatim-Gate", b"busy"),
+            (b"Link", b"<a>"),
+            (b"Link", b"<b>"),
+        ]
+    )
+    headers = proxy_module.downstream_headers(
+        upstream, gate_value="acquired", node_id="node-a", request_id="rid"
+    )
+    assert headers == [
+        (b"Content-Type", b"application/json"),
+        (b"Content-Length", b"2"),
+        (b"Link", b"<a>"),
+        (b"Link", b"<b>"),
+        (b"x-seriatim-gate", b"acquired"),
+        (b"x-seriatim-node", b"node-a"),
+        (b"x-request-id", b"rid"),
+    ]
+
+
+def _pool(client: httpx.AsyncClient):
+    return client._transport._pool
+
+
+@pytest.mark.parametrize(
+    ("factory", "connections", "keepalive", "read"),
+    [("new_gated_client", 1, 0, None), ("new_ungated_client", 16, 8, 300.0)],
+)
+def test_proxy_client_settings(factory, connections, keepalive, read):
+    settings = make_settings("http://127.0.0.1:11435")
+    client = getattr(proxy_module, factory)(settings)
+    try:
+        pool = _pool(client)
+        assert (pool._max_connections, pool._max_keepalive_connections) == (connections, keepalive)
+        timeout = client.timeout
+        assert (timeout.connect, timeout.pool) == (5.0, 5.0)
+        assert (timeout.read, timeout.write) == (read, read)
+        assert str(client.base_url) == "http://127.0.0.1:11435/"
+        assert client.follow_redirects is False and client._trust_env is False
+        assert isinstance(client.cookies.jar, NoCookies)
+    finally:
+        anyio.run(client.aclose)
+
+
+def test_create_app_uses_an_injected_shared_client():
+    """Ungated routes go through an injected shared client, which the lifespan leaves open."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.raw_path)
+        return httpx.Response(200, stream=_Stream([b"{}"]))
+
+    shared = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:1"
+    )
+    gate, _ = ready_gate()
+    app = create_app(make_settings("http://127.0.0.1:1"), client=shared, gate=gate)
+    server = ThreadServer(app, reserve_socket(), lifespan="on").start()
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{server.port}/api/tags", timeout=WAIT_S)
+    finally:
+        server.stop()
+    assert (resp.status_code, seen) == (200, [b"/api/tags"])
+    assert not shared.is_closed
+    anyio.run(shared.aclose)
