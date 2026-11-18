@@ -335,8 +335,9 @@ seams for the later slices:
   uses a client whose jar does hold a cookie.
 - **`Connection` tokens** are read from every `Connection` header, split on commas, trimmed
   and lower-cased (`connection_tokens`). The same rule applies to requests and responses.
-- **`proxy-*`.** The code removes the two names §4 lists, `proxy-authenticate` and
-  `proxy-authorization`. ADR-001 §5.3 writes `Proxy-*`. No other `Proxy-` header is removed.
+- **`proxy-*` and `date`** (#82, from the maintainer's answers on #57). Requests lose every
+  `proxy-*` header by prefix, as ADR-001 §5.3 writes; responses lose Ollama's `date`, so
+  uvicorn's is the only one. H16's tests check both.
 - **Case.** h11 delivers header names in lower case, so the mixed-case names of H16 can't
   reach the proxy over the wire. The unit tests of `upstream_headers` and `downstream_headers`
   check case-insensitive matching with every name on both lists.
@@ -711,6 +712,8 @@ The body never includes the Ollama version or any address. Probes are logged at 
 - the hop-by-hop headers: `connection`, every header named in `Connection`, `keep-alive`,
   `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding` and
   `upgrade`;
+- every `proxy-*` header, by prefix (ADR-001 §5.3), so `proxy-connection` and any other
+  `Proxy-` header never reach Ollama;
 - `host`, `authorization`, `cookie`, `x-api-key`, every `x-seriatim-*`, `content-length` and
   `accept-encoding`;
 - the forwarding headers `forwarded`, `x-forwarded-*` and `x-real-ip`.
@@ -734,7 +737,12 @@ loopback only.
 - the compatibility headers `x-resolved-model`, `x-model-digest`, `x-execution-device`,
   `x-rerouted-from`, `x-reroute-reason` and `x-context-clamped`;
 - `set-cookie`, `server` and `x-request-id`, so a conflicting id from Ollama never reaches the
-  client (H18).
+  client (H18);
+- `date`, so the response carries exactly one `Date`, uvicorn's (`date_header=True`, §2.4;
+  RFC 9110 §6.6.1).
+
+The prefix rule for `proxy-*` is for requests only: a response's `proxy-authenticate` goes
+as a hop-by-hop header, and no other `Proxy-` response header is removed.
 
 Every other header is kept, and a repeated header keeps all its values, in order (H17).
 Kept unchanged: `content-type`, `content-length` and `content-encoding`. Then added:
