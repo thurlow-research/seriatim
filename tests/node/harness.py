@@ -50,11 +50,21 @@ def wait_for(predicate: Callable[[], object], timeout: float = WAIT_S) -> None:
 
 
 def reserve_socket() -> socket.socket:
-    """A TCP socket bound to an ephemeral loopback port, not yet listening: connections to it
-    are refused until a server is started on it."""
+    """A TCP socket bound to an ephemeral loopback port, not yet listening, so a server can be
+    started on it later. Until then nothing answers: Linux and Windows refuse a connection,
+    but macOS drops the SYN, so a connection hangs until its connect timeout. A test that
+    needs the refusal itself uses `closed_port`."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind((LOOPBACK, 0))
     return sock
+
+
+def closed_port() -> int:
+    """An ephemeral loopback port with no socket bound to it, so every OS refuses a connection
+    at once. The port was free a moment ago; nothing in the suite binds a fixed port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((LOOPBACK, 0))
+        return sock.getsockname()[1]
 
 
 class ThreadServer:

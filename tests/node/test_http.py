@@ -28,6 +28,7 @@ from harness import (
     ThreadServer,
     abort_body,
     all_free,
+    closed_port,
     drip_body,
     exchange,
     exchange_body,
@@ -724,7 +725,7 @@ def test_hl1_healthy(fake_ollama, sidecar, health_validator):
 
 @pytest.mark.td("HL2")
 def test_hl2_upstream_down(sidecar, health_validator):
-    closed = reserve_socket()  # bound, never listening: connections are refused
+    closed = reserve_socket()  # bound, never listening: nothing answers
     try:
         gate, _ = ready_gate()
         car = sidecar(f"http://127.0.0.1:{closed.getsockname()[1]}", gate=gate)
@@ -1113,6 +1114,7 @@ def test_h8_keep_alive_next_request_is_admitted(fake_ollama, sidecar, monkeypatc
         go.set()
         second = read_response(sock)
     assert (second.status, second.body) == (200, b'{"done":true}')
+    wait_for(lambda: len(free_at_step_c) == 2)  # step (c) runs after the body bytes are sent
     assert free_at_step_c == [True, True]
     assert len(fake_ollama.requests) == 2
 
@@ -1221,19 +1223,15 @@ def test_b5_startup_quarantine(fake_ollama, sidecar, envelope_validator, health_
 
 @pytest.mark.td("E1")
 def test_e1_closed_port_is_502_and_frees_the_slot(sidecar, envelope_validator):
-    down = reserve_socket()
-    try:
-        gate, _ = ready_gate()
-        car = sidecar(f"http://127.0.0.1:{down.getsockname()[1]}", gate=gate)
-        for _ in range(2):  # the second is 502 too, never 429: nothing was sent
-            resp = _chat(car)
-            assert resp.status_code == 502
-            doc = _error_doc(resp.content, ErrorCode.UPSTREAM_UNAVAILABLE, envelope_validator)
-            assert doc["replay_safe"] is True
-            assert resp.headers.get_list("x-seriatim-gate") == ["acquired"]
-            wait_for(lambda: all_free(gate))
-    finally:
-        down.close()
+    gate, _ = ready_gate()
+    car = sidecar(f"http://127.0.0.1:{closed_port()}", gate=gate)  # refused, on every OS
+    for _ in range(2):  # the second is 502 too, never 429: nothing was sent
+        resp = _chat(car)
+        assert resp.status_code == 502
+        doc = _error_doc(resp.content, ErrorCode.UPSTREAM_UNAVAILABLE, envelope_validator)
+        assert doc["replay_safe"] is True
+        assert resp.headers.get_list("x-seriatim-gate") == ["acquired"]
+        wait_for(lambda: all_free(gate))
 
 
 # --- S1-6: the lifecycle's branches, in process ----------------------------------------------
