@@ -315,7 +315,9 @@ def test_acquire_on_a_file_parent_cannot_lock(tmp_path, singleton):
     parent.write_text("x", encoding="utf-8")
     with pytest.raises(SingletonError) as e:
         acquire_singleton(_settings(parent / "run"))
-    assert str(e.value).startswith(f"cannot lock {parent / 'run' / 'upstream-11435.lock'}: ")
+    message = str(e.value)
+    assert message.startswith(f"cannot lock {parent / 'run' / 'upstream-11435.lock'}: ")
+    assert "Errno" not in message  # the OS's reason only (strerror), not the whole OSError
     assert app._SINGLETON_FD is None
 
 

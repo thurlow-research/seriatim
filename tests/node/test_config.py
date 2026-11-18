@@ -432,6 +432,19 @@ def test_main_runs_uvicorn_with_one_h11_worker(node_env, monkeypatch, tmp_path):
     monkeypatch.setenv(P + "LOCK_DIR", str(tmp_path))
     monkeypatch.setenv(P + "LISTEN_PORT", "12345")
     monkeypatch.setenv(P + "ID", "node-c")
+    real_create_app = app.create_app
+    seen: list[tuple] = []
+
+    def create_app(settings):
+        dispatcher = real_create_app(settings)
+
+        async def recording(scope, receive, send):
+            seen.append((scope, receive, send))
+            await dispatcher(scope, receive, send)
+
+        return recording
+
+    monkeypatch.setattr(app, "create_app", create_app)
     assert app.main() == 0
     ((args, kwargs),) = node_env
     assert kwargs == {
@@ -449,6 +462,8 @@ def test_main_runs_uvicorn_with_one_h11_worker(node_env, monkeypatch, tmp_path):
     assert inspect.iscoroutinefunction(asgi)
     assert list(inspect.signature(asgi).parameters) == ["scope", "receive", "send"]
     start, _ = anyio.run(_get, asgi, b"/seriatim/nope")
+    ((scope, receive, send),) = seen  # handed on unchanged
+    assert scope["raw_path"] == b"/seriatim/nope" and callable(receive) and callable(send)
     assert start["status"] == 404
     assert (b"x-seriatim-node", b"node-c") in start["headers"]
     assert app._SINGLETON_FD is not None  # taken before uvicorn starts
