@@ -244,7 +244,32 @@ S = "services"
             lambda c: c["volumes"].update(
                 v={"driver_opts": {"type": "none", "o": "bind", "device": "/etc"}}
             ),
-            "volume v: binds /etc, outside ppe/",
+            "volume v: bind device /etc is outside ppe/",
+        ),
+        # The rest are allowlists too: volume drivers and options, network drivers, mounts.
+        (
+            lambda c: c["volumes"].update(v={"driver": "some-plugin"}),
+            "volume v: driver some-plugin; only local is allowed",
+        ),
+        (
+            lambda c: c["volumes"].update(
+                v={"driver_opts": {"type": "nfs", "o": "addr=192.0.2.1", "device": ":/x"}}
+            ),
+            "volume v: driver_opts {'type': 'nfs'",
+        ),
+        (
+            lambda c: c["networks"].update(m={"driver": "macvlan"}),
+            "network m: driver macvlan; only bridge is allowed",
+        ),
+        (
+            lambda c: c["networks"]["default"].update(driver_opts={"parent": "eth0"}),
+            "network default: driver_opts are refused",
+        ),
+        (
+            lambda c: c[S]["dbg-a"].update(
+                volumes=[{"type": "npipe", "source": "x", "target": "/p"}]
+            ),
+            "dbg-a: mount type npipe is not on the allowlist",
         ),
         (lambda c: c.update(configs={"k": {"file": "/etc/passwd"}}), "config k: file /etc/passwd"),
         (lambda c: c.update(secrets={"k": {"file": "/root/.ssh/id"}}), "secret k: file /root"),
@@ -308,7 +333,7 @@ def test_resolve_binds_writes_real_paths(good, ppe, tmp_path):
             ]
         ),
     )
-    config["volumes"]["v"] = {"driver_opts": {"o": "bind", "device": str(link)}}
+    config["volumes"]["v"] = {"driver_opts": {"type": "none", "o": "bind", "device": str(link)}}
     config["configs"] = {"k": {"file": str(link / "f")}, "e": {"environment": "E"}}
     resolved = g.resolve_binds(config)
     assert resolved[S]["dbg-a"]["volumes"][0]["source"] == os.path.realpath(real)
@@ -317,6 +342,28 @@ def test_resolve_binds_writes_real_paths(good, ppe, tmp_path):
     assert resolved["configs"]["k"]["file"] == os.path.realpath(real / "f")
     assert config[S]["dbg-a"]["volumes"][0]["source"] == str(link)  # a copy, not in place
     assert refused(resolved, ppe) == []
+
+
+def test_a_resolved_path_with_a_dollar_is_refused(good, ppe):
+    """Compose interpolates the effective file again at `up`: ${X:-..} would become `..`."""
+    target = ppe / "data" / "${X:-..}"
+    link = ppe / "data" / "link"
+    try:
+        target.mkdir()
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("this platform can't name a directory ${X:-..}, or make a symlink")
+    config = change(
+        good,
+        lambda c: c[S]["dbg-a"].update(
+            volumes=[{"type": "bind", "source": str(link), "target": "/x"}]
+        ),
+    )
+    config["volumes"]["v"] = {"driver_opts": {"type": "none", "o": "bind", "device": str(link)}}
+    config["secrets"] = {"k": {"file": str(link)}}
+    problems = refused(g.resolve_binds(config), ppe)
+    for what in ("dbg-a: bind mount", "volume v: bind device", "secret k: file"):
+        assert any(p.startswith(what) and "contains '$'" in p for p in problems), problems
 
 
 def test_a_mount_of_ppe_itself_is_inside(good, ppe):
@@ -485,6 +532,45 @@ def test_up_refuses_before_starting_anything(isolated, good, monkeypatch, capsys
     assert docker.compose_verbs() == ["config"]
     assert "refusing to start" in capsys.readouterr().err
     assert list(isolated.parent.glob("seriatim-ppe-*")) == []  # nothing written
+
+
+@pytest.mark.parametrize("which", ["data", "data/ollama", "data/capture"])
+def test_up_refuses_a_symlinked_data_directory_before_touching_it(
+    isolated, good, monkeypatch, capsys, tmp_path, which
+):
+    """Nothing is created or chmod-ed through a data directory that is a symlink."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    elsewhere.chmod(0o755)
+    before = elsewhere.stat().st_mode
+    link = isolated / which
+    if which == "data":
+        shutil.rmtree(link)
+    try:
+        link.symlink_to(elsewhere, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks need privileges on this platform")
+    docker = FakeDocker(good)
+    monkeypatch.setattr(g, "run", docker)
+    assert g.main(["up", "--ci"]) == 1
+    assert "is a symlink" in capsys.readouterr().err
+    assert docker.compose_verbs() == []
+    assert elsewhere.stat().st_mode == before
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_check_data_dirs_refuses_a_path_outside_ppe(ppe, tmp_path):
+    g.check_data_dirs(ppe, (ppe / "data",))
+    with pytest.raises(g.GuardError, match="resolves outside ppe/"):
+        g.check_data_dirs(ppe, (tmp_path / "other",))
+
+
+def test_capture_is_opened_up_only_after_the_check(isolated, good, monkeypatch):
+    bad = change(good, lambda c: c[S]["dbg-a"].update(privileged=True))
+    monkeypatch.setattr(g, "run", FakeDocker(bad))
+    assert g.main(["up", "--ci"]) == 1
+    if os.name != "nt":
+        assert (isolated / "data" / "capture").stat().st_mode & 0o777 != 0o777
 
 
 def test_up_refuses_a_remote_endpoint_before_rendering(isolated, good, monkeypatch, capsys):

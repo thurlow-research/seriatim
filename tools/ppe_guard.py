@@ -18,7 +18,9 @@ refuses to start if any of these holds:
   `devices`, `security_opt`, `cgroup_parent`, `sysctls`, `volumes_from`, `privileged` and the
   rest are refused), or a `deploy` key not on the deploy allowlists;
 - `network_mode` is set to anything but `service:<another service of this project>`;
-- a network or a named volume is external, or a network has the `host` driver;
+- a network or a named volume is external; a network driver is not the default `bridge`,
+  or a network has `driver_opts`; a volume driver is not `local`, or its `driver_opts` are
+  anything but a bind of a device inside ppe/; a mount type is not bind, volume or tmpfs;
 - the per-service limits, each times the service's `scale` or `deploy.replicas`, sum to more
   than 4 CPUs or 6 GiB (a service with no CPU or memory limit is unbounded, so it is refused
   too);
@@ -26,7 +28,10 @@ refuses to start if any of these holds:
 - added capabilities beyond NET_RAW/NET_ADMIN on a capture container (`cap-*`, which must also
   drop all others), or any added capability on another service;
 - a Docker socket mount, or a bind mount (including a bind-backed named volume, a config or a
-  secret file) whose real path is outside ppe/;
+  secret file) whose real path is outside ppe/, or contains `$` (Compose interpolates the
+  checked file again at `up`);
+- ppe/data, ppe/data/ollama or ppe/data/capture is a symlink or resolves outside ppe/
+  (checked before anything is created; capture/ is opened up only after the guard passes);
 - a Docker endpoint (`DOCKER_HOST`, or the current Docker context) that is not a local unix
   socket.
 `up` writes the configuration it checked, with the resolved bind sources, to a file of mode
@@ -88,6 +93,7 @@ SERVICE_KEYS = frozenset(
 DEPLOY_KEYS = frozenset({"placement", "replicas", "resources"})
 RESOURCE_KEYS = frozenset({"limits"})  # not reservations, which can claim devices (GPUs)
 LIMIT_KEYS = frozenset({"cpus", "memory"})
+MOUNT_TYPES = frozenset({"bind", "volume", "tmpfs"})  # not npipe, image or cluster
 
 
 class GuardError(Exception):
@@ -187,32 +193,58 @@ def refusals(config: dict, ppe_dir: Path | None = None) -> list[str]:
         for vol in svc.get("volumes") or []:
             vol = vol if isinstance(vol, dict) else {"type": "bind", "source": str(vol)}
             source, target = str(vol.get("source") or ""), str(vol.get("target") or "")
+            kind = vol.get("type")
+            if kind not in MOUNT_TYPES:
+                out.append(f"{name}: mount type {kind} is not on the allowlist")
             if "docker.sock" in source or "docker.sock" in target:
                 out.append(f"{name}: mounts the Docker socket ({source or target})")
-            elif vol.get("type") == "bind" and not _inside(source, root):
-                out.append(f"{name}: bind mount {source} is outside ppe/")
+            elif kind == "bind":
+                out += _host_path(f"{name}: bind mount", source, root)
     if cpus > MAX_CPUS:
         out.append(f"the CPU limits sum to {cpus:g}, above {MAX_CPUS:g}")
     if memory > MAX_MEMORY:
         out.append(f"the memory limits sum to {memory / 1024**3:.3g} GiB, above 6 GiB")
     for name, net in sorted((config.get("networks") or {}).items()):
-        if (net or {}).get("external"):
+        net = net or {}
+        if net.get("external"):
             out.append(f"network {name}: external networks are refused")
-        if (net or {}).get("driver") == "host":
+        if net.get("driver") == "host":
             out.append(f"network {name}: the host driver is host networking")
+        elif net.get("driver") not in (None, "bridge"):
+            out.append(f"network {name}: driver {net['driver']}; only bridge is allowed")
+        if net.get("driver_opts"):
+            out.append(f"network {name}: driver_opts are refused")
     for name, vol in sorted((config.get("volumes") or {}).items()):
-        if (vol or {}).get("external"):
+        vol = vol or {}
+        if vol.get("external"):
             out.append(f"volume {name}: external volumes are refused")
-        opts = (vol or {}).get("driver_opts") or {}
-        device = opts.get("device")
-        if device and "bind" in str(opts.get("o", "")) and not _inside(str(device), root):
-            out.append(f"volume {name}: binds {device}, outside ppe/")
+        if vol.get("driver") not in (None, "local"):
+            out.append(f"volume {name}: driver {vol['driver']}; only local is allowed")
+        opts = vol.get("driver_opts") or {}
+        if not opts:
+            continue
+        device = str(opts.get("device") or "")
+        bind = "bind" in str(opts.get("o", "")).split(",")
+        known = set(opts) <= {"type", "o", "device"} and opts.get("type") == "none"
+        if not (known and bind and device):
+            out.append(f"volume {name}: driver_opts {opts}; only a bind inside ppe/ is allowed")
+        else:
+            out += _host_path(f"volume {name}: bind device", device, root)
     for kind in ("configs", "secrets"):
         for name, item in sorted((config.get(kind) or {}).items()):
             f = (item or {}).get("file")
-            if f and not _inside(str(f), root):
-                out.append(f"{kind[:-1]} {name}: file {f} is outside ppe/")
+            if f:
+                out += _host_path(f"{kind[:-1]} {name}: file", str(f), root)
     return out
+
+
+def _host_path(what: str, path: str, root: Path) -> list[str]:
+    """Refuse a host path outside ppe/, or one Compose would interpolate again at `up`."""
+    if not _inside(path, root):
+        return [f"{what} {path} is outside ppe/"]
+    if "$" in path:
+        return [f"{what} {path} contains '$', which Compose would interpolate at up"]
+    return []
 
 
 def resolve_binds(config: dict) -> dict:
@@ -235,6 +267,16 @@ def resolve_binds(config: dict) -> dict:
             if (item or {}).get("file"):
                 item["file"] = os.path.realpath(str(item["file"]))
     return config
+
+
+def check_data_dirs(ppe_dir: Path, dirs: tuple[Path, ...]) -> None:
+    """Refuse before any mkdir or chmod if a data directory is a symlink or leaves ppe/."""
+    root = Path(os.path.realpath(ppe_dir))
+    for d in dirs:
+        if d.is_symlink():
+            raise GuardError(f"{d} is a symlink; the PPE's data directories must be real")
+        if not _inside(str(d), root):
+            raise GuardError(f"{d} resolves outside ppe/")
 
 
 def write_checked(config: dict) -> tuple[Path, str]:
@@ -317,15 +359,16 @@ def wait_for_ollama(timeout: float = READY_TIMEOUT) -> str:
 def up(ci: bool) -> None:
     check_where(ci, dict(os.environ), socket.gethostname(), ALLOWED_HOST)
     endpoint_ok()
+    capture = DATA_DIR / "capture"
+    check_data_dirs(PPE_DIR, (DATA_DIR, DATA_DIR / "ollama", capture))
     # Created before rendering, so the bind sources resolve to directories that exist.
     (DATA_DIR / "ollama").mkdir(parents=True, exist_ok=True)
-    capture = DATA_DIR / "capture"
     capture.mkdir(parents=True, exist_ok=True)
-    capture.chmod(0o777)  # tcpdump runs as root with no capability but NET_RAW/NET_ADMIN
     config = resolve_binds(json.loads(compose("config", "--format", "json", capture=True)))
     problems = refusals(config)
     if problems:
         raise GuardError("refusing to start:\n  - " + "\n  - ".join(problems))
+    capture.chmod(0o777)  # tcpdump runs as root with no capability but NET_RAW/NET_ADMIN
     effective, digest = write_checked(config)
     try:
         print("ppe: the effective configuration passed the guard", flush=True)

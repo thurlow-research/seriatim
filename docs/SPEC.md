@@ -2159,12 +2159,22 @@ command output, and never just says "tests pass".
     reservations;
   - a `network_mode` other than `service:<another service of this project>`, such as
     `host` or `container:<name>`;
-  - an external network or an external named volume, or a network with the `host` driver;
+  - an external network or an external named volume;
+  - a network driver other than the default `bridge` (so `host`, `macvlan` and `ipvlan`
+    are refused), or any network `driver_opts`;
+  - a volume driver other than `local`, or volume `driver_opts` other than a bind
+    (`type: none`, `o: bind`) of a device inside `ppe/`;
+  - a service mount type other than `bind`, `volume` and `tmpfs`;
   - a sum of per-service limits above **4 CPUs or 6 GiB**, where each service counts once
     for every container its `scale` or `deploy.replicas` starts;
   - a published port that is not on `127.0.0.1`;
   - capabilities beyond `NET_RAW`/`NET_ADMIN` on the capture containers, a Docker socket
     mount, or a bind mount outside `ppe/`;
+  - a resolved host path (bind source, bind device, config or secret file) that contains
+    `$`, because Compose interpolates the checked file again when `up` loads it;
+  - a `ppe/data`, `ppe/data/ollama` or `ppe/data/capture` that is a symlink or resolves
+    outside `ppe/`. This is checked before anything is created, and `ppe/data/capture` is
+    made writable for the capture container only after the guard passes;
   - a Docker context or `DOCKER_HOST` that is not the local socket.
 
   **No gap between the check and the start.** The guard resolves every bind source to its
@@ -2172,6 +2182,12 @@ command output, and never just says "tests pass".
   paths, to a file of mode 0600 in a fresh private temporary directory, checks the file's
   hash again just before `compose up`, and starts the PPE from that file. Docker gets the
   path the guard checked, so a symlink swapped in afterwards can't redirect a mount.
+
+  **Known limit.** A real path names a directory but doesn't pin it. If an ancestor
+  directory of a bind source is replaced by a symlink after the check and before Docker
+  mounts it, the mount still follows the symlink. Closing this fully needs descriptor-based
+  pinning or a re-check after `up`. Until then, the PPE's data directories must not be
+  writable by anyone the guard is meant to stop.
 - **Models.** These are real micro-models with real, different `parameter_size` metadata:
   - `qwen2.5:0.5b` (0.5B) on every node;
   - `all-minilm:22m`, a small embedding model, on every node, for the embedding cases of
