@@ -1,20 +1,36 @@
 """The sidecar's application module (TD-slice-1 §2.4).
 
 S1-1 adds the error table: `ErrorCode`, `ERROR_TABLE` and `ErrorFactory`. `contract/openapi.yaml`
-is the source of truth, and K-OAS3 checks that this table equals its `x-seriatim-codes`. The
-dispatcher, health, `RequestLog` and the singleton lock follow in S1-5, and `main()` in S1-12.
+is the source of truth, and K-OAS3 checks that this table equals its `x-seriatim-codes`.
+S1-5 adds `RequestLog`, `create_app` (the dispatcher and `/seriatim/health`) and the health
+client. The proxy (`proxy.py`) follows in S1-6, and the singleton lock and `main()` in S1-12.
 """
 
 from __future__ import annotations
 
+import contextlib
+import http.cookiejar
 import json
+import re
 import sys
-from collections.abc import Mapping
+import time
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
+from typing import Any
+
+import anyio
+import httpx
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.routing import Route as StarletteRoute
 
 from seriatim_node.__main__ import NOT_YET
+from seriatim_node.config import Settings
+from seriatim_node.gate import SERIATIM_ROUTES, Gate, Kind, PathError, check_raw_path, classify
 
 
 class ErrorCode(StrEnum):
@@ -195,6 +211,308 @@ class ErrorFactory:
             (b"x-request-id", request_id.encode()),
         ]
         return spec.status, headers, body
+
+
+# --- The request log (SPEC REQ-22) -----------------------------------------------------------
+
+_LEVELS: Mapping[str, int] = MappingProxyType(
+    {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+)
+
+
+class RequestLog:
+    """One JSON line per request to stdout (REQ-22; TD Appendix A).
+
+    A line is written only when its `level` is at or above the configured one, so health
+    requests, logged at `DEBUG`, add nothing at the default `INFO` (HL9).
+    """
+
+    def __init__(self, level: str, node_id: str, wall: Callable[[], float] = time.time) -> None:
+        self._threshold = _LEVELS[level]
+        self._node = node_id
+        self._wall = wall
+
+    def emit(self, *, level: str = "INFO", **fields: object) -> None:
+        if _LEVELS[level] < self._threshold:
+            return
+        ms = int(self._wall() * 1000)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms // 1000))
+        line = {
+            "ts": f"{stamp}.{ms % 1000:03d}Z",
+            "level": level,
+            "event": "request",
+            **fields,
+            "node": self._node,
+        }
+        # Resolved at each call, so a redirected or captured stdout is honoured.
+        sys.stdout.write(json.dumps(line, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+
+# --- HTTP clients (TD §2.4) ------------------------------------------------------------------
+
+
+class NoCookies(http.cookiejar.CookieJar):
+    """A cookie jar that stores nothing, so a `Set-Cookie` from Ollama is never replayed."""
+
+    def __init__(self) -> None:
+        super().__init__(policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+
+
+def new_client(
+    settings: Settings, *, limits: httpx.Limits, timeout: httpx.Timeout
+) -> httpx.AsyncClient:
+    """An upstream client with the settings every client shares (TD §2.4)."""
+    return httpx.AsyncClient(
+        base_url=str(settings.ollama_url),
+        http1=True,
+        http2=False,
+        trust_env=False,
+        follow_redirects=False,
+        headers={},
+        cookies=NoCookies(),
+        limits=limits,
+        timeout=timeout,
+    )
+
+
+def new_health_client(settings: Settings) -> httpx.AsyncClient:
+    """The health client: one connection, every phase bounded by the probe timeout."""
+    return new_client(
+        settings,
+        limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+        timeout=httpx.Timeout(settings.health_probe_timeout_s),
+    )
+
+
+# --- The dispatcher and health (TD §2.4, §3.4) -----------------------------------------------
+
+Scope = MutableMapping[str, Any]
+Receive = Callable[[], Awaitable[MutableMapping[str, Any]]]
+Send = Callable[[MutableMapping[str, Any]], Awaitable[None]]
+ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
+
+_REQUEST_ID_RE = re.compile(rb"[A-Za-z0-9._-]{1,128}")  # used with fullmatch
+_RID_KEY = "seriatim.request_id"  # where the dispatcher leaves the request id in the scope
+
+
+def request_id_from(headers: list[tuple[bytes, bytes]]) -> str:
+    """Keep the client's `X-Request-Id` only if there is exactly one and it is valid; else a
+    fresh `uuid4().hex` (TD §2.4 step 2)."""
+    values = [v for k, v in headers if k.lower() == b"x-request-id"]
+    if len(values) == 1 and _REQUEST_ID_RE.fullmatch(values[0]):
+        return values[0].decode()
+    return uuid.uuid4().hex
+
+
+async def _send_response(
+    send: Send, status: int, headers: list[tuple[bytes, bytes]], body: bytes
+) -> None:
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+async def _not_yet_proxied(
+    app: _Dispatcher, scope: Scope, receive: Receive, send: Send, request_id: str, where: dict
+) -> None:
+    """Placeholder for the proxy until S1-6: nothing is sent upstream and no slot is taken."""
+    await app.reply(
+        send,
+        ErrorCode.INTERNAL,
+        "passthrough is not available in this build",
+        request_id=request_id,
+        method=scope["method"],
+        log_level="ERROR",
+        outcome="internal_error",
+        **where,
+    )
+
+
+class _Dispatcher:
+    """The ASGI callable `create_app` returns. It sees every request before Starlette."""
+
+    def __init__(self, settings: Settings, gate: Gate | None) -> None:
+        self.settings = settings
+        self.gate = gate
+        self.health_client: httpx.AsyncClient | None = None
+        self.errors = ErrorFactory(settings.id)
+        self.log = RequestLog(settings.log_level, settings.id)
+        self.proxy = _not_yet_proxied
+        # The dispatcher has already refused every other method (405), so the route lists none.
+        self._router = Starlette(
+            routes=[StarletteRoute("/seriatim/health", self._health)],
+            lifespan=self._lifespan,
+        )
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(self, _app: Starlette) -> AsyncIterator[None]:
+        s = self.settings
+        if self.gate is None:  # a new Gate starts in its startup quarantine (REQ-12a)
+            self.gate = Gate(s.slots, s.retry_after_s, s.drain_s, s.max_hold_s)
+        self.health_client = new_health_client(s)
+        try:
+            yield
+        finally:
+            await self.health_client.aclose()
+
+    async def reply(
+        self,
+        send: Send,
+        code: ErrorCode,
+        message: str,
+        *,
+        request_id: str,
+        method: str,
+        log_level: str = "INFO",
+        outcome: str = "rejected",
+        extra_headers: list[tuple[bytes, bytes]] | None = None,
+        **log_fields: object,
+    ) -> None:
+        """Send an ungated error response and log it (`slot_end` is `none`: no slot)."""
+        status, headers, body = self.errors.response(
+            code, message, gate_value="ungated", request_id=request_id
+        )
+        await _send_response(send, status, headers + (extra_headers or []), body)
+        self.log.emit(
+            level=log_level,
+            request_id=request_id,
+            method=method,
+            **log_fields,
+            outcome=outcome,
+            status=status,
+            slot_end="none",
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":  # lifespan (and anything else) goes to Starlette
+            await self._router(scope, receive, send)
+            return
+        rid = request_id_from(scope["headers"])
+        method = scope["method"]
+        if scope["http_version"] != "1.1":
+            await self.reply(
+                send,
+                ErrorCode.HTTP_VERSION_UNSUPPORTED,
+                "only HTTP/1.1 is supported",
+                request_id=rid,
+                method=method,
+                extra_headers=[(b"connection", b"close")],
+            )
+            return
+        raw_path = scope.get("raw_path")
+        if raw_path is None:  # uvicorn with h11 always sets it: fail closed
+            await self.reply(
+                send,
+                ErrorCode.INTERNAL,
+                "internal error",
+                request_id=rid,
+                method=method,
+                log_level="ERROR",
+                outcome="internal_error",
+            )
+            return
+        try:
+            check_raw_path(raw_path)
+        except PathError as e:
+            await self.reply(send, ErrorCode.BAD_PATH, str(e), request_id=rid, method=method)
+            return
+        route = classify(method, raw_path)
+        where = {
+            "path": raw_path.decode("latin-1"),
+            "kind": route.kind.value,
+            "scope": route.scope.value,
+            "known": route.known,
+        }
+        if route.kind is not Kind.SERIATIM:
+            await self.proxy(self, scope, receive, send, rid, where)
+        elif route.seriatim_status == 404:
+            await self.reply(
+                send, ErrorCode.NOT_FOUND, "no such path", request_id=rid, method=method, **where
+            )
+        elif route.seriatim_status == 405:
+            allow = ", ".join(sorted(SERIATIM_ROUTES[raw_path])).encode()
+            await self.reply(
+                send,
+                ErrorCode.METHOD_NOT_ALLOWED,
+                "method not allowed",
+                request_id=rid,
+                method=method,
+                extra_headers=[(b"allow", allow)],
+                **where,
+            )
+        else:
+            scope[_RID_KEY] = rid
+            await self._router(scope, receive, send)
+
+    async def _probe(self) -> str | None:
+        """None if Ollama answers well; otherwise the health reason (TD §3.4)."""
+        client = self.health_client
+        assert client is not None  # set by the lifespan, which runs before any request
+        try:
+            with anyio.fail_after(self.settings.health_probe_timeout_s):  # total, not per read
+                resp = await client.get("/api/version")
+        except (httpx.TransportError, TimeoutError):  # every httpx timeout is a TransportError
+            return "ollama_unreachable"
+        if resp.status_code != 200:
+            return "ollama_bad_response"
+        try:
+            doc = json.loads(resp.content)
+        except ValueError:  # includes a body that isn't UTF-8
+            return "ollama_bad_response"
+        if not isinstance(doc, dict):
+            return "ollama_bad_response"
+        version = doc.get("version")
+        if not isinstance(version, str) or not version:
+            return "ollama_bad_response"
+        return None
+
+    async def _health(self, request: Request) -> Response:
+        gate = self.gate
+        assert gate is not None  # set at construction or by the lifespan
+        rid = request.scope[_RID_KEY]
+        reasons = []
+        probe = await self._probe()
+        if probe is not None:
+            reasons.append(probe)
+        if gate.overdue():
+            reasons.append("slot_overdue")
+        if gate.any_stuck():
+            reasons.append("slot_stuck")
+        if gate.starting():
+            reasons.append("starting")
+        doc: dict[str, object] = {"status": "ok"}
+        status = 200
+        if reasons:
+            doc = {"status": "degraded", "reasons": reasons}
+            status = 503
+        self.log.emit(
+            level="DEBUG",  # a load balancer polls this (REQ-22; HL9)
+            request_id=rid,
+            method="GET",
+            path="/seriatim/health",
+            kind="seriatim",
+            scope="none",
+            known=True,
+            outcome="ok" if status == 200 else "degraded",
+            status=status,
+            slot_end="none",
+        )
+        return Response(
+            json.dumps(doc, separators=(",", ":")).encode(),
+            status_code=status,
+            media_type="application/json",
+            headers={
+                "x-seriatim-gate": "ungated",
+                "x-seriatim-node": self.settings.id,
+                "x-request-id": rid,
+            },
+        )
+
+
+def create_app(settings: Settings, *, gate: Gate | None = None) -> ASGIApp:
+    """The sidecar's ASGI app (TD §2.4). Tests inject `gate`; otherwise the lifespan creates
+    one, which starts in its startup quarantine."""
+    return _Dispatcher(settings, gate)
 
 
 def main() -> int:

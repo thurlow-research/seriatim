@@ -43,7 +43,7 @@ TD is merged before its code (ADR-001 §10).
 | 3 | `node/seriatim_node/gate.py` | `check_raw_path()`, `classify()`, `Gate`, `Lease` |
 | 4 | `node/seriatim_node/proxy.py` | `Proxy`: passthrough with streaming, disconnects, the hold limit, framing-safe errors and the shielded release |
 | 5 | `node/seriatim_node/app.py` | the dispatcher, `ErrorCode` and the error table, `/seriatim/health`, `RequestLog`, the singleton lock, `main()` |
-| 6 | `tests/node/conftest.py` | the real-socket harness: the sidecar and a fake Ollama on ephemeral ports, a fixture replayer and a raw-socket fake |
+| 6 | `tests/node/conftest.py` and `tests/node/harness.py` | the real-socket harness: the sidecar and a fake Ollama on ephemeral ports, a fixture replayer and a raw-socket fake (helpers in `harness.py`, fixtures in `conftest.py`) |
 | 7 | `tests/node/test_config.py` | C1 to C11 |
 | 8 | `tests/node/test_gate.py` | K1 to K6, G1 to G12 |
 | 9 | `tests/node/test_http.py` | H1 to H29, B1 to B7, E1 to E16, HL1 to HL9, L1 to L3, K-OAS1 to K-OAS3 |
@@ -349,6 +349,33 @@ Two of those settings deserve a note:
   built request.
 
 Gated requests have `read=None` and `write=None`. Their only bound is the hold limit.
+
+**Details fixed by the code (S1-5).**
+- **Order.** The HTTP-version check (§4, 505) runs right after step 2, before step 3, so a
+  1.0 request is refused whatever its path.
+- **What `create_app` takes.** In S1-5 it takes `gate` only, which tests inject. `client`
+  arrives with the shared ungated client in S1-6.
+- **Routes for the proxy.** Until S1-6, step 7 answers 500 `INTERNAL`
+  (`X-Seriatim-Gate: ungated`), contacts nothing and takes no slot. No TD ID depends on it.
+- **The health probe.** `health_probe_timeout_s` bounds the whole probe, as well as each
+  phase of the health client, so a slowly dripping body can't stretch it. Any
+  `httpx.TransportError` counts as `ollama_unreachable`: for example, a connection closed
+  before a response, because Ollama has not answered. A body that isn't UTF-8 is
+  `ollama_bad_response`.
+- **`RequestLog.emit(level=…, **fields)`.** `level` defaults to `INFO`, and a line is written
+  only at or above `log_level`. The line is `ts` (UTC, milliseconds, from an injectable wall
+  clock), `level`, `event`, the fields as given, then `node`. Health logs `outcome: ok` or `degraded`. The 505, `BAD_PATH` and missing
+  `raw_path` lines have no `path`, `kind`, `scope` or `known`, because the path wasn't
+  checked or classified. So an unsafe path is never logged.
+- **The harness.** The helpers are in `tests/node/harness.py`, and `conftest.py` exposes them
+  as the `fake_ollama` and `sidecar` fixtures. Servers run in a thread, on a socket the
+  harness binds first. That lets a test hold a port closed ("Ollama is down") and later
+  start the fake on it (HL6).
+- **HL6 uses a stub gate for the four-fault order.** A real `Gate` can't hold an overdue
+  lease while it is `starting`: `try_acquire` returns `Starting` until the quarantine ends,
+  and time only moves forward. So the full four-reason order is tested against a stub that
+  reports each fault as a flag. A second HL6 case uses the real `Gate` and `Lease` for the
+  three faults that can coexist, and a third checks `starting` on a new real gate.
 
 **`main()`** runs these steps:
 1. `load_settings()`. On `ConfigError`, print the message to stderr and exit 2.
@@ -889,7 +916,7 @@ also run on `windows-latest` and `macos-latest`.
 | HL3 | Upstream `/api/version` returns each of: 500; 200 `not json`; 200 `[]`; 200 `{}`; 200 `{"version":""}`; 200 `{"version":7}` → each gives 503 with `["ollama_bad_response"]` | 18 |
 | HL4 | An injected overdue lease → `slot_overdue`; an injected stuck slot → `slot_stuck`. The body never contains the version string | 18 |
 | HL5 | The probe connects, then stalls: once before the headers and once in the middle of the body → 503 `["ollama_unreachable"]` within `health_probe_timeout_s` plus the bound | 18 |
-| HL6 | Several faults at once: upstream down, an overdue lease, a stuck slot and the startup quarantine → `reasons` is exactly `["ollama_unreachable", "slot_overdue", "slot_stuck", "starting"]`. Clearing each fault in turn removes only its reason, and the rest stay in order | 18 |
+| HL6 | Several faults at once: upstream down, an overdue lease, a stuck slot and the startup quarantine → `reasons` is exactly `["ollama_unreachable", "slot_overdue", "slot_stuck", "starting"]`. Clearing each fault in turn removes only its reason, and the rest stay in order. A real gate can't be overdue while starting, so this order uses a stub gate. With the real `Gate` (2 slots: one lease overdue, one `stuck()`) and upstream down → `["ollama_unreachable", "slot_overdue", "slot_stuck"]`. Starting Ollama removes only `ollama_unreachable`, and finishing the overdue lease removes only `slot_overdue`. `slot_stuck` stays, because a `STUCK` slot is never freed before a restart. A new real gate reports `["starting"]` | 18 |
 | HL7 | Normal use is not a fault: slots 2, one `HELD` within its limit and one `DRAINING` → 200 `{"status":"ok"}` | 18 |
 | HL8 | Two cases. **Stalled:** 200 concurrent health requests while the fake stalls `/api/version` past `health_probe_timeout_s` → **every** response is 503 `["ollama_unreachable"]` within `health_probe_timeout_s` plus the bound; none is 200 and none is 500. **Not stalled:** 200 concurrent health requests on a fake that answers → every response is 200. In both cases, a gated `/api/chat` sent meanwhile gets 200 | 18 |
 | HL9 | Health requests are logged at `DEBUG` only: at `LOG_LEVEL=INFO`, 10 health requests add no log line; at `DEBUG`, each adds exactly one | 22 |
@@ -1023,7 +1050,9 @@ closes #34 and #15.
 **Why each ID sits where it does**, for the ones the review asked about:
 - **K-OAS1 and K3** compare the contract with `gate.py`'s tables, so both are in S1-3,
   which needs S1-1.
-- **H23, HL4, HL6 and HL7** use `Gate` and `Lease`, so S1-5 needs S1-4.
+- **H23, HL4, HL6 and HL7** use `Gate` and `Lease`, so S1-5 needs S1-4. (HL6's four-fault
+  order uses a stub gate, because a real gate can't be overdue while starting; its other
+  cases use the real one.)
 - **HL8** sends a gated request during the health load, so it waits for S1-6 (in S1-13).
 - **H25 and the other "freed at once" assertions** need admission and the `finally`, which
   are both in S1-6.
