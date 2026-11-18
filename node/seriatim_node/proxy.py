@@ -3,8 +3,8 @@
 S1-6 adds the request lifecycle of §3.3 complete: admission, the body read, the disconnect
 watcher, the relay, the hold limit, and the shielded `finally` that proves upstream closure
 before it ends the lease, then talks to the client. Later PRs add to it without changing that
-structure:
-- S1-7: the full header strip lists and `prune_httpx_defaults`;
+structure. S1-7 adds the full header strip lists of §4 and `prune_httpx_defaults`. Still to
+come:
 - S1-8: the request limits in `read_body` and the size check before admission;
 - S1-9: the in-stream error records and the framing rule for a clean end;
 - S1-10: the cancellation and close edge cases;
@@ -33,14 +33,29 @@ Headers = list[tuple[bytes, bytes]]
 # replay-safe.
 _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
-# S1-6 removes only what framing and Seriatim's own headers need. S1-7 completes both lists
-# (§4): the rest of the hop-by-hop headers, the credentials, the forwarding headers, the
-# compatibility headers, CORS, `set-cookie` and `server`.
-_UPSTREAM_DROP = frozenset(
-    {b"host", b"content-length", b"transfer-encoding", b"connection", b"keep-alive",
-     b"x-request-id"}
+# The strip lists of TD §4 (ADR-001 §5.3). Names are compared in lower case, and every header
+# named in a message's own `Connection` header goes too.
+_HOP_BY_HOP = frozenset(
+    {b"connection", b"keep-alive", b"proxy-authenticate", b"proxy-authorization", b"te",
+     b"trailer", b"transfer-encoding", b"upgrade"}
 )  # fmt: skip
-_DOWNSTREAM_DROP = frozenset({b"transfer-encoding", b"connection", b"keep-alive", b"x-request-id"})
+# Request side: also `host`, the credentials, the forwarding headers, the framing the sidecar
+# sets itself, `accept-encoding` (so Ollama never compresses) and the client's request id.
+_UPSTREAM_DROP = _HOP_BY_HOP | {
+    b"host", b"authorization", b"cookie", b"x-api-key", b"content-length", b"accept-encoding",
+    b"forwarded", b"x-real-ip", b"x-request-id",
+}  # fmt: skip
+_UPSTREAM_DROP_PREFIXES = (b"x-seriatim-", b"x-forwarded-")
+# Response side: also the compatibility headers Ollama must not forge, `set-cookie`, `server`
+# and Ollama's own request id (H18).
+_DOWNSTREAM_DROP = _HOP_BY_HOP | {
+    b"x-resolved-model", b"x-model-digest", b"x-execution-device", b"x-rerouted-from",
+    b"x-reroute-reason", b"x-context-clamped", b"set-cookie", b"server", b"x-request-id",
+}  # fmt: skip
+_DOWNSTREAM_DROP_PREFIXES = (b"access-control-", b"x-seriatim-")
+# The headers httpx fills in on every request it builds. They reach Ollama only if the client
+# sent them (`accept-encoding` and `connection` never do: both are on the strip list).
+HTTPX_DEFAULTS = (b"accept", b"accept-encoding", b"connection", b"user-agent")
 
 
 # --- clients (TD §2.4, "HTTP clients") ------------------------------------------------------
@@ -79,28 +94,55 @@ def new_ungated_client(settings: Settings) -> httpx.AsyncClient:
 # --- headers (TD §4) ------------------------------------------------------------------------
 
 
-def upstream_headers(client_headers: Headers, *, body_len: int, request_id: str) -> Headers:
-    """The client's headers for Ollama: framing set from the buffered body, and the sidecar's
-    sanitised request id in place of any the client sent."""
-    kept = [(k, v) for k, v in client_headers if k.lower() not in _UPSTREAM_DROP]
+def connection_tokens(headers: Headers) -> frozenset[bytes]:
+    """The header names listed in every `Connection` header, in lower case (H15)."""
+    return frozenset(
+        token.strip().lower()
+        for k, v in headers
+        if k.lower() == b"connection"
+        for token in v.split(b",")
+    )
+
+
+def _strip(headers: Headers, drop: frozenset[bytes], prefixes: tuple[bytes, ...]) -> Headers:
+    """`headers` without the dropped names and prefixes and every header named in
+    `Connection`. Order is kept, and a repeated header keeps all its values (H17)."""
+    named = connection_tokens(headers)
     return [
-        *kept,
+        (k, v)
+        for k, v in headers
+        if (name := k.lower()) not in drop and name not in named and not name.startswith(prefixes)
+    ]
+
+
+def upstream_headers(client_headers: Headers, *, body_len: int, request_id: str) -> Headers:
+    """The client's headers for Ollama (TD §4): the strip list removed, then the framing set
+    from the buffered body, and the sidecar's sanitised request id in place of the client's."""
+    return [
+        *_strip(client_headers, _UPSTREAM_DROP, _UPSTREAM_DROP_PREFIXES),
         (b"content-length", str(body_len).encode()),
         (b"x-request-id", request_id.encode()),
     ]
 
 
+def prune_httpx_defaults(req: httpx.Request, client_headers: Headers) -> None:
+    """Delete the defaults httpx added in `build_request`, unless `client_headers` (the headers
+    forwarded to Ollama) has them. `host` and the body framing come from httpx too, and stay.
+    A `cookie` header is always removed: the cookie jar stores nothing (`NoCookies`), and this
+    is the second guard (§2.4)."""
+    sent = {k.lower() for k, _ in client_headers}
+    for name in HTTPX_DEFAULTS:
+        if name not in sent:
+            req.headers.pop(name.decode(), None)
+    req.headers.pop("cookie", None)
+
+
 def downstream_headers(
     resp_headers: httpx.Headers, *, gate_value: str, node_id: str, request_id: str
 ) -> Headers:
-    """Ollama's headers for the client, then Seriatim's own: each exactly once."""
-    kept = [
-        (k, v)
-        for k, v in resp_headers.raw
-        if k.lower() not in _DOWNSTREAM_DROP and not k.lower().startswith(b"x-seriatim-")
-    ]
+    """Ollama's headers for the client (TD §4), then Seriatim's own: each exactly once."""
     return [
-        *kept,
+        *_strip(resp_headers.raw, _DOWNSTREAM_DROP, _DOWNSTREAM_DROP_PREFIXES),
         (b"x-seriatim-gate", gate_value.encode()),
         (b"x-seriatim-node", node_id.encode()),
         (b"x-request-id", request_id.encode()),
@@ -308,12 +350,9 @@ class Proxy:
             url = client.base_url.copy_with(
                 raw_path=scope["raw_path"] + (b"?" + query if query else b"")
             )
-            req = client.build_request(
-                scope["method"],
-                url,
-                headers=upstream_headers(scope["headers"], body_len=len(body), request_id=rid),
-                content=body,
-            )
+            headers = upstream_headers(scope["headers"], body_len=len(body), request_id=rid)
+            req = client.build_request(scope["method"], url, headers=headers, content=body)
+            prune_httpx_defaults(req, headers)
             outcome.sent_upstream = True
             try:
                 resp = await client.send(req, stream=True)
