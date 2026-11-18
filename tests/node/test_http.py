@@ -1636,12 +1636,13 @@ REQUEST_STRIPPED = [
     *HOP_BY_HOP, b"Host", b"AUTHORIZATION", b"Cookie", b"x-API-key", b"Content-Length",
     b"Accept-Encoding", b"Forwarded", b"X-Forwarded-For", b"X-Forwarded-Host",
     b"X-Forwarded-Proto", b"X-Real-IP", b"X-Request-Id", b"X-SERIATIM-GATE", b"X-Seriatim-Node",
+    b"Proxy-Connection", b"PROXY-FOO",
 ]  # fmt: skip
 RESPONSE_STRIPPED = [
     *HOP_BY_HOP, b"Access-Control-Allow-Origin", b"ACCESS-CONTROL-EXPOSE-HEADERS",
     b"X-Seriatim-Gate", b"X-Seriatim-Node", b"X-Resolved-Model", b"X-Model-Digest",
     b"X-Execution-Device", b"X-Rerouted-From", b"X-Reroute-Reason", b"X-Context-Clamped",
-    b"Set-Cookie", b"Server", b"X-Request-Id",
+    b"Set-Cookie", b"Server", b"X-Request-Id", b"Date",
 ]  # fmt: skip
 
 
@@ -1655,6 +1656,7 @@ def test_upstream_headers_exactly():
         (b"Accept", b"*/*"),
         (b"User-Agent", b"ua"),
         (b"X-Forwarded", b"not a forwarding header"),
+        (b"Proxyish", b"not a proxy-* header"),
     ]
     assert proxy_module.upstream_headers(client, body_len=3, request_id="rid") == [
         (b"X-Custom", b"a"),
@@ -1662,6 +1664,7 @@ def test_upstream_headers_exactly():
         (b"Accept", b"*/*"),
         (b"User-Agent", b"ua"),
         (b"X-Forwarded", b"not a forwarding header"),
+        (b"Proxyish", b"not a proxy-* header"),
         (b"content-length", b"3"),
         (b"x-request-id", b"rid"),
     ]
@@ -1959,6 +1962,8 @@ def test_h16_the_request_strip_list(fake_ollama, sidecar):
     car = sidecar(fake_ollama.url, gate=gate)
     stripped = [
         b"Proxy-Authorization: Basic x",
+        b"Proxy-Connection: keep-alive",
+        b"Proxy-Foo: x",
         b"TE: trailers",
         b"Trailer: X-T",
         b"Upgrade: example/1",
@@ -1990,8 +1995,10 @@ def test_h16_the_response_strip_list(fake_ollama, sidecar):
         (b"x-reroute-reason", b"busy"),
         (b"x-context-clamped", b"true"),
     ]
+    stale_date = b"Thu, 01 Jan 1970 00:00:00 GMT"  # Ollama's; uvicorn sends its own
     seriatims = [(b"x-seriatim-node", b"forged"), (b"x-seriatim-gate", b"busy")]
-    upstream = [*forged, *seriatims, (b"x-request-id", b"upstream"), (b"x-keep", b"1")]
+    upstream = [*forged, (b"date", stale_date), *seriatims, (b"x-request-id", b"upstream")]
+    upstream.append((b"x-keep", b"1"))
     fake_ollama.script("POST", "/api/chat", status(200, b"{}", upstream))
     gate, _ = ready_gate()
     car = sidecar(fake_ollama.url, gate=gate)
@@ -2004,6 +2011,8 @@ def test_h16_the_response_strip_list(fake_ollama, sidecar):
     (rid,) = resp.headers.get_list("x-request-id")
     assert HEX32.fullmatch(rid)
     assert resp.headers.get_list("x-keep") == ["1"]
+    (date,) = resp.headers.get_list("date")  # exactly one, RFC 9110 §6.6.1
+    assert date != stale_date.decode()
 
 
 @pytest.mark.td("H17")

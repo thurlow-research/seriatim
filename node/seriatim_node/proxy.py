@@ -39,18 +39,20 @@ _HOP_BY_HOP = frozenset(
     {b"connection", b"keep-alive", b"proxy-authenticate", b"proxy-authorization", b"te",
      b"trailer", b"transfer-encoding", b"upgrade"}
 )  # fmt: skip
-# Request side: also `host`, the credentials, the forwarding headers, the framing the sidecar
-# sets itself, `accept-encoding` (so Ollama never compresses) and the client's request id.
+# Request side: also `host`, the credentials, the forwarding headers, every `proxy-*` (ADR-001
+# §5.3), the framing the sidecar sets itself, `accept-encoding` (so Ollama never compresses)
+# and the client's request id.
 _UPSTREAM_DROP = _HOP_BY_HOP | {
     b"host", b"authorization", b"cookie", b"x-api-key", b"content-length", b"accept-encoding",
     b"forwarded", b"x-real-ip", b"x-request-id",
 }  # fmt: skip
-_UPSTREAM_DROP_PREFIXES = (b"x-seriatim-", b"x-forwarded-")
-# Response side: also the compatibility headers Ollama must not forge, `set-cookie`, `server`
-# and Ollama's own request id (H18).
+_UPSTREAM_DROP_PREFIXES = (b"x-seriatim-", b"x-forwarded-", b"proxy-")
+# Response side: also the compatibility headers Ollama must not forge, `set-cookie`, `server`,
+# Ollama's own request id (H18) and Ollama's `date`, so uvicorn's is the only one.
 _DOWNSTREAM_DROP = _HOP_BY_HOP | {
     b"x-resolved-model", b"x-model-digest", b"x-execution-device", b"x-rerouted-from",
     b"x-reroute-reason", b"x-context-clamped", b"set-cookie", b"server", b"x-request-id",
+    b"date",
 }  # fmt: skip
 _DOWNSTREAM_DROP_PREFIXES = (b"access-control-", b"x-seriatim-")
 # The headers httpx fills in on every request it builds. They reach Ollama only if the client
