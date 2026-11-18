@@ -3,13 +3,14 @@
 S1-1: the error table against the contract (K-OAS3). S1-3: the contract against `classify()`
 (K-OAS1). S1-5: the dispatcher and health over real sockets (H12, H22, H23, E2, HL1-HL7,
 HL9), with the harness in `harness.py`. S1-6: the proxy core over real sockets (H1, H2,
-H4-H8, H25, B1-B5, E1).
+H4-H8, H25, B1-B5, E1). S1-7: the header rules (H3, H9, H11, H15-H18, H20, H21, H24).
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import json
+import random
 import re
 import threading
 import time
@@ -578,6 +579,7 @@ def test_dispatcher_refusals_exactly(
         [(b"x-request-id", b"ok"), (b"X-Request-Id", b"ok")],
     ],
 )
+@pytest.mark.td("H18")
 def test_request_id_is_replaced(headers):
     assert HEX32.fullmatch(request_id_from(headers))
 
@@ -1625,37 +1627,57 @@ def test_read_body_joins_chunks_and_sees_a_disconnect():
         anyio.run(read, gone)
 
 
+# Every name on the §4 strip lists, in mixed case. The hop-by-hop headers are on both.
+HOP_BY_HOP = [
+    b"Connection", b"Keep-Alive", b"Proxy-Authenticate", b"Proxy-Authorization", b"TE",
+    b"Trailer", b"Transfer-Encoding", b"Upgrade",
+]  # fmt: skip
+REQUEST_STRIPPED = [
+    *HOP_BY_HOP, b"Host", b"AUTHORIZATION", b"Cookie", b"x-API-key", b"Content-Length",
+    b"Accept-Encoding", b"Forwarded", b"X-Forwarded-For", b"X-Forwarded-Host",
+    b"X-Forwarded-Proto", b"X-Real-IP", b"X-Request-Id", b"X-SERIATIM-GATE", b"X-Seriatim-Node",
+]  # fmt: skip
+RESPONSE_STRIPPED = [
+    *HOP_BY_HOP, b"Access-Control-Allow-Origin", b"ACCESS-CONTROL-EXPOSE-HEADERS",
+    b"X-Seriatim-Gate", b"X-Seriatim-Node", b"X-Resolved-Model", b"X-Model-Digest",
+    b"X-Execution-Device", b"X-Rerouted-From", b"X-Reroute-Reason", b"X-Context-Clamped",
+    b"Set-Cookie", b"Server", b"X-Request-Id",
+]  # fmt: skip
+
+
+@pytest.mark.td("H16")
 def test_upstream_headers_exactly():
     client = [
-        (b"Host", b"evil"),
-        (b"Content-Length", b"99"),
-        (b"Transfer-Encoding", b"chunked"),
-        (b"Connection", b"keep-alive"),
-        (b"Keep-Alive", b"timeout=5"),
-        (b"X-Request-Id", b"theirs"),
+        *[(name, b"v") for name in REQUEST_STRIPPED],
+        (b"Authorization", b"Bearer second"),
         (b"X-Custom", b"a"),
         (b"x-custom", b"b"),
+        (b"Accept", b"*/*"),
+        (b"User-Agent", b"ua"),
+        (b"X-Forwarded", b"not a forwarding header"),
     ]
     assert proxy_module.upstream_headers(client, body_len=3, request_id="rid") == [
         (b"X-Custom", b"a"),
         (b"x-custom", b"b"),
+        (b"Accept", b"*/*"),
+        (b"User-Agent", b"ua"),
+        (b"X-Forwarded", b"not a forwarding header"),
         (b"content-length", b"3"),
         (b"x-request-id", b"rid"),
     ]
 
 
+@pytest.mark.td("H16")
 def test_downstream_headers_exactly():
     upstream = httpx.Headers(
         [
             (b"Content-Type", b"application/json"),
             (b"Content-Length", b"2"),
-            (b"Transfer-Encoding", b"chunked"),
-            (b"Connection", b"close"),
-            (b"Keep-Alive", b"timeout=5"),
-            (b"X-Request-Id", b"upstream"),
-            (b"X-Seriatim-Gate", b"busy"),
+            (b"Content-Encoding", b"identity"),
+            *[(name, b"v") for name in RESPONSE_STRIPPED],
             (b"Link", b"<a>"),
             (b"Link", b"<b>"),
+            (b"Cookie", b"kept: a response header nobody sends"),
         ]
     )
     headers = proxy_module.downstream_headers(
@@ -1664,12 +1686,66 @@ def test_downstream_headers_exactly():
     assert headers == [
         (b"Content-Type", b"application/json"),
         (b"Content-Length", b"2"),
+        (b"Content-Encoding", b"identity"),
         (b"Link", b"<a>"),
         (b"Link", b"<b>"),
+        (b"Cookie", b"kept: a response header nobody sends"),
         (b"x-seriatim-gate", b"acquired"),
         (b"x-seriatim-node", b"node-a"),
         (b"x-request-id", b"rid"),
     ]
+
+
+@pytest.mark.td("H15")
+def test_connection_tokens_are_trimmed_and_lower_case():
+    headers = [
+        (b"Connection", b"Keep-Alive, X-A ,x-b"),
+        (b"connection", b"X-C"),
+        (b"X-Connection", b"X-Z"),
+    ]
+    assert proxy_module.connection_tokens(headers) == {b"keep-alive", b"x-a", b"x-b", b"x-c"}
+    named = [*headers, (b"X-A", b"1"), (b"x-B", b"2"), (b"X-C", b"3"), (b"X-Z", b"4")]
+    assert proxy_module.upstream_headers(named, body_len=0, request_id="r")[:2] == [
+        (b"X-Connection", b"X-Z"),
+        (b"X-Z", b"4"),
+    ]
+    response = httpx.Headers([(b"Connection", b"X-D, x-e"), (b"X-D", b"1"), (b"X-E", b"2")])
+    assert proxy_module.downstream_headers(
+        response, gate_value="ungated", node_id="n", request_id="r"
+    ) == [(b"x-seriatim-gate", b"ungated"), (b"x-seriatim-node", b"n"), (b"x-request-id", b"r")]
+
+
+def test_httpx_defaults_are_the_ones_pruned():
+    """An httpx upgrade that adds a default header fails here, not in production."""
+    with httpx.Client() as client:
+        assert [k.lower() for k, _ in client.headers.raw] == list(proxy_module.HTTPX_DEFAULTS)
+
+
+@pytest.mark.td("H3")
+@pytest.mark.parametrize(
+    ("forwarded", "expected"),
+    [
+        ([], []),
+        (
+            [(b"Accept", b"text/x"), (b"user-agent", b"mine")],
+            [(b"accept", b"text/x"), (b"user-agent", b"mine")],
+        ),
+    ],
+)
+def test_prune_httpx_defaults(forwarded, expected):
+    forwarded = [*forwarded, (b"content-length", b"2"), (b"x-request-id", b"r")]
+    # A jar that does store a cookie, so httpx adds a `cookie` header for prune to remove.
+    with httpx.Client(base_url="http://127.0.0.1:1", cookies={"s": "1"}) as client:
+        req = client.build_request("POST", "/api/chat", headers=forwarded, content=b"{}")
+    proxy_module.prune_httpx_defaults(req, forwarded)
+    assert sorted((k.lower(), v) for k, v in req.headers.raw) == sorted(
+        [
+            (b"host", b"127.0.0.1:1"),
+            *expected,
+            (b"content-length", b"2"),
+            (b"x-request-id", b"r"),
+        ]
+    )
 
 
 def _pool(client: httpx.AsyncClient):
@@ -1717,3 +1793,329 @@ def test_create_app_uses_an_injected_shared_client():
     assert (resp.status_code, seen) == (200, [b"/api/tags"])
     assert not shared.is_closed
     anyio.run(shared.aclose)
+
+
+# --- S1-7: the header rules over real sockets (TD §4) ---------------------------------------
+
+
+def _raw_post(car, header_lines: list[bytes], body: bytes = CHAT, path: bytes = b"/api/chat"):
+    """POST with exactly these header lines (no client defaults), on a keep-alive socket."""
+    head = b"".join(line + b"\r\n" for line in header_lines)
+    request = b"POST %s HTTP/1.1\r\n%sContent-Length: %d\r\n\r\n%s" % (path, head, len(body), body)
+    with raw_connect(car.port) as sock:
+        sock.sendall(request)
+        return read_response(sock)
+
+
+def _names(headers) -> list[bytes]:
+    return [k.lower() for k, _ in headers]
+
+
+def _wait_log_lines(capsys, n: int) -> list[dict]:
+    """The request log is written after the response, from the server thread: wait for it."""
+    lines: list[dict] = []
+
+    def enough() -> bool:
+        lines.extend(_log_lines(capsys.readouterr().out))
+        return len(lines) >= n
+
+    wait_for(enough)
+    return lines
+
+
+@pytest.mark.td("H3")
+def test_h3_request_headers_are_stripped(fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _raw_post(
+        car,
+        [
+            b"Host: evil",
+            b"Authorization: Bearer secret",
+            b"X-API-Key: secret",
+            b"Cookie: c=1",
+            b"Connection: x-foo",
+            b"X-Foo: named",
+            b"Keep-Alive: timeout=5",
+            b"X-Seriatim-Node: forged",
+            b"Accept-Encoding: gzip",
+            b"X-Custom: kept",
+        ],
+    )
+    assert resp.status == 200
+    (req,) = fake_ollama.requests
+    # Nothing else: no removed header, and no httpx default (`user-agent`, `accept`,
+    # `accept-encoding`, `connection`), since the client sent none.
+    assert sorted(_names(req.headers)) == [b"content-length", b"host", b"x-custom", b"x-request-id"]
+    headers = dict(req.headers)
+    assert headers[b"host"] == f"127.0.0.1:{fake_ollama.server.port}".encode()
+    assert headers[b"x-custom"] == b"kept"
+
+
+@pytest.mark.td("H3")
+def test_h3_the_clients_own_accept_and_user_agent_are_forwarded(fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    lines = [b"Host: x", b"Accept: application/x-ndjson", b"User-Agent: client/1"]
+    assert _raw_post(car, lines).status == 200
+    (req,) = fake_ollama.requests
+    headers = dict(req.headers)
+    assert (headers[b"accept"], headers[b"user-agent"]) == (b"application/x-ndjson", b"client/1")
+    assert b"accept-encoding" not in headers and b"connection" not in headers
+
+
+@pytest.mark.td("H9")
+def test_h9_an_ollama_429_passes_through_without_forged_headers(fake_ollama, sidecar):
+    body = b'{"error":"server busy"}'
+    fake_ollama.script(
+        "POST",
+        "/api/chat",
+        status(
+            429,
+            body,
+            [
+                (b"content-type", b"application/json"),
+                (b"retry-after", b"3"),
+                (b"x-seriatim-gate", b"busy"),
+                (b"access-control-allow-origin", b"*"),
+                (b"x-rerouted-from", b"x"),
+            ],
+        ),
+    )
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _chat(car)
+    assert (resp.status_code, resp.content) == (429, body)
+    assert resp.headers.get_list("retry-after") == ["3"]
+    assert resp.headers.get_list("x-seriatim-gate") == ["acquired"]  # never `busy`: no spill-over
+    assert "access-control-allow-origin" not in resp.headers
+    assert "x-rerouted-from" not in resp.headers
+    wait_for(lambda: all_free(gate))  # Ollama's 429 is a clean end
+
+
+@pytest.mark.td("H11")
+@pytest.mark.parametrize(("method", "path"), [("POST", "/api/chat"), ("GET", "/api/tags")])
+def test_h11_set_cookie_is_never_relayed_or_replayed(method, path, fake_ollama, sidecar):
+    fake_ollama.script(
+        method,
+        path,
+        sequence(status(200, b"{}", [(b"set-cookie", b"s=1")]), status(200, b"{}")),
+    )
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    content = CHAT if method == "POST" else None
+    with httpx.Client(timeout=WAIT_S) as a:
+        resp = a.request(method, car.url + path, content=content)
+        assert resp.status_code == 200
+        assert "set-cookie" not in resp.headers
+        assert not a.cookies
+    wait_for(lambda: all_free(gate))
+    with httpx.Client(timeout=WAIT_S) as b:  # another client
+        assert b.request(method, car.url + path, content=content).status_code == 200
+    first, second = fake_ollama.requests
+    assert b"cookie" not in _names(first.headers)
+    assert b"cookie" not in _names(second.headers)
+
+
+@pytest.mark.td("H15")
+def test_h15_headers_named_in_connection_are_removed_both_ways(fake_ollama, sidecar):
+    fake_ollama.script(
+        "POST",
+        "/api/chat",
+        status(
+            200,
+            b"{}",
+            [(b"connection", b"X-D, x-e"), (b"x-d", b"1"), (b"x-e", b"2"), (b"x-keep", b"3")],
+        ),
+    )
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _raw_post(
+        car,
+        [
+            b"Host: x",
+            b"Connection: Keep-Alive, X-A ,x-b",
+            b"Connection: X-C",
+            b"X-A: 1",
+            b"X-B: 2",
+            b"X-C: 3",
+            b"X-Keep: 4",
+        ],
+    )
+    assert resp.status == 200
+    (req,) = fake_ollama.requests
+    assert sorted(_names(req.headers)) == [b"content-length", b"host", b"x-keep", b"x-request-id"]
+    names = {k for k, _ in resp.headers}
+    assert not {"x-d", "x-e"} & names
+    assert resp.header("x-keep") == ["3"]
+
+
+@pytest.mark.td("H16")
+def test_h16_the_request_strip_list(fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    stripped = [
+        b"Proxy-Authorization: Basic x",
+        b"TE: trailers",
+        b"Trailer: X-T",
+        b"Upgrade: example/1",
+        b"X-Real-IP: 192.0.2.7",
+        b"X-Forwarded-Host: example.com",
+        b"X-Forwarded-Proto: https",
+        b"X-Forwarded-For: 192.0.2.7",
+        b"Forwarded: for=192.0.2.7",
+        b"Authorization: Bearer one",
+        b"Authorization: Bearer two",
+        b"AUTHORIZATION: Bearer three",
+        b"x-API-key: k",
+        b"X-SERIATIM-GATE: busy",
+    ]
+    assert _raw_post(car, [b"Host: x", *stripped, b"X-Keep: 1"]).status == 200
+    (req,) = fake_ollama.requests
+    assert sorted(_names(req.headers)) == [b"content-length", b"host", b"x-keep", b"x-request-id"]
+
+
+@pytest.mark.td("H16")
+def test_h16_the_response_strip_list(fake_ollama, sidecar):
+    forged = [
+        (b"proxy-authenticate", b"Basic"),
+        (b"server", b"ollama"),
+        (b"x-resolved-model", b"m"),
+        (b"x-model-digest", b"sha256:00"),
+        (b"x-execution-device", b"cpu"),
+        (b"x-rerouted-from", b"node-b"),
+        (b"x-reroute-reason", b"busy"),
+        (b"x-context-clamped", b"true"),
+    ]
+    seriatims = [(b"x-seriatim-node", b"forged"), (b"x-seriatim-gate", b"busy")]
+    upstream = [*forged, *seriatims, (b"x-request-id", b"upstream"), (b"x-keep", b"1")]
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}", upstream))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _chat(car)
+    assert resp.status_code == 200
+    for name, _ in forged:
+        assert name.decode() not in resp.headers
+    assert resp.headers.get_list("x-seriatim-node") == ["node-a"]
+    assert resp.headers.get_list("x-seriatim-gate") == ["acquired"]
+    (rid,) = resp.headers.get_list("x-request-id")
+    assert HEX32.fullmatch(rid)
+    assert resp.headers.get_list("x-keep") == ["1"]
+
+
+@pytest.mark.td("H17")
+def test_h17_repeated_headers_keep_every_value_in_order(fake_ollama, sidecar):
+    links = [(b"link", b"<a>; rel=x"), (b"link", b"<b>; rel=y")]
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}", links))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _raw_post(car, [b"Host: x", b"X-Custom: a", b"X-Custom: b"])
+    assert resp.status == 200
+    assert resp.header("link") == ["<a>; rel=x", "<b>; rel=y"]
+    (req,) = fake_ollama.requests
+    assert [v for k, v in req.headers if k == b"x-custom"] == [b"a", b"b"]
+
+
+@pytest.mark.td("H18")
+@pytest.mark.parametrize(
+    ("lines", "kept"),
+    [
+        ([b"X-Request-Id: abc-1.2_3"], "abc-1.2_3"),
+        ([b"X-Request-Id: "], None),
+        ([b"X-Request-Id: " + b"a" * 129], None),
+        ([b"X-Request-Id: a b"], None),
+        ([b"X-Request-Id: a/b"], None),
+        ([b"X-Request-Id: abc", b"X-Request-Id: abc"], None),
+    ],
+    ids=["valid", "empty", "129-chars", "space", "slash", "two-headers"],
+)
+def test_h18_request_id_is_echoed_forwarded_and_logged(lines, kept, fake_ollama, sidecar, capsys):
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}", [(b"x-request-id", b"upstream")]))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _raw_post(car, [b"Host: x", *lines])
+    assert resp.status == 200
+    (rid,) = resp.header("x-request-id")  # only the sidecar's: never Ollama's `upstream`
+    if kept is not None:
+        assert rid == kept
+    else:
+        assert HEX32.fullmatch(rid)
+    (req,) = fake_ollama.requests
+    assert [v for k, v in req.headers if k == b"x-request-id"] == [rid.encode()]
+    (line,) = _wait_log_lines(capsys, 1)
+    assert line["request_id"] == rid
+
+
+@pytest.fixture
+def recording_proxy():
+    """A fake that records every request, standing in for an HTTP proxy."""
+    proxy = FakeOllama().start()
+    yield proxy
+    proxy.stop()
+
+
+@pytest.mark.td("H20")
+def test_h20_proxy_environment_variables_are_ignored(
+    fake_ollama, sidecar, recording_proxy, monkeypatch
+):
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, recording_proxy.url)
+        monkeypatch.setenv(name.lower(), recording_proxy.url)
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    # The fake proxy works: a client that trusts the environment goes through it.
+    httpx.get("http://192.0.2.1/x", timeout=WAIT_S)
+    assert len(recording_proxy.requests) == 1
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
+    fake_ollama.script("GET", "/api/tags", status(200, b"{}"))
+    fake_ollama.script("GET", "/api/version", VERSION_OK)
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)  # its clients are built with the variables set
+    with httpx.Client(timeout=WAIT_S, trust_env=False) as client:
+        assert client.post(car.url + "/api/chat", content=CHAT).status_code == 200
+        assert client.get(car.url + "/api/tags").status_code == 200
+        assert client.get(car.url + "/seriatim/health").status_code == 200
+    paths = sorted(r.raw_path for r in fake_ollama.requests)
+    assert paths == [b"/api/chat", b"/api/tags", b"/api/version"]
+    assert len(recording_proxy.requests) == 1
+
+
+@pytest.mark.td("H21")
+@pytest.mark.parametrize(("method", "path"), [("POST", "/api/chat"), ("GET", "/api/tags")])
+def test_h21_a_redirect_is_passed_through_not_followed(method, path, fake_ollama, sidecar):
+    location = b"http://192.0.2.1/x"
+    fake_ollama.script(method, path, status(302, b"", [(b"location", location)]))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    content = CHAT if method == "POST" else None
+    resp = httpx.request(
+        method, car.url + path, content=content, timeout=WAIT_S, follow_redirects=False
+    )
+    assert resp.status_code == 302
+    assert resp.headers.get_list("location") == [location.decode()]
+    assert len(fake_ollama.requests) == 1
+
+
+@pytest.mark.td("H24")
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"a":',
+        b'{"model":"a","model":"b"}',
+        b"\xff\xfe",
+        random.Random(57).randbytes(1024),
+    ],
+    ids=["truncated", "duplicate-keys", "invalid-utf8", "random-1k"],
+)
+def test_h24_the_body_is_opaque_bytes(body, fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _chat(car, body)
+    assert (resp.status_code, resp.content) == (200, b'{"done":true}')  # no error of its own
+    (req,) = fake_ollama.requests
+    assert req.body == body
+    assert [v for k, v in req.headers if k == b"content-length"] == [str(len(body)).encode()]

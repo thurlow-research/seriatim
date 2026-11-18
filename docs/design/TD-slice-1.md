@@ -289,12 +289,10 @@ the error mapping before the headers and Seriatim's own response headers). It le
 seams for the later slices:
 - **Header signatures.** `upstream_headers` also takes `request_id`, and `downstream_headers`
   takes `node_id`. They set `X-Request-Id` (both ways) and `X-Seriatim-Node` (downstream).
-- **Strip lists.** Until S1-7, `upstream_headers` drops only `host`, `content-length`,
-  `transfer-encoding`, `connection`, `keep-alive` and `x-request-id`, then appends
-  `content-length` and `x-request-id`. `downstream_headers` drops the same hop-by-hop headers,
-  `x-request-id` and every `x-seriatim-*`, then appends `x-seriatim-gate`, `x-seriatim-node` and
-  `x-request-id`. `prune_httpx_defaults` arrives in S1-7, so httpx's default `accept`,
-  `accept-encoding`, `connection` and `user-agent` still reach Ollama.
+- **Strip lists.** S1-6 shipped interim lists. S1-7 replaces them with the full lists of §4
+  and adds `prune_httpx_defaults` (see "Details fixed by the code (S1-7)" below).
+  `upstream_headers` still appends `content-length` and `x-request-id` after the strip, and
+  `downstream_headers` still appends `x-seriatim-gate`, `x-seriatim-node` and `x-request-id`.
 - **`read_body(receive)`** has no size limit and no timeout until S1-8. Ungated bodies are read
   whole too (`body_stream` arrives with blob streaming in S1-11).
 - **The end of the stream.** `upstream_done` is set when `aiter_raw()` ends normally. S1-9
@@ -322,6 +320,34 @@ seams for the later slices:
   the shielded close proof, and drains the slot if the request was sent.
 - **`main()`** is still the S0a placeholder, so the sidecar can't be started from the command
   line until S1-12.
+
+**Details fixed by the code (S1-7).** S1-7 implements the header rules of §4.
+- **What `prune_httpx_defaults` compares against.** Its `client_headers` argument is the list
+  `upstream_headers` returned, not the client's raw headers. So `accept-encoding` and
+  `connection`, which are on the strip list, never come back as httpx defaults, even when the
+  client sent them. A client's own `accept` and `user-agent` are forwarded with the client's
+  values.
+- **Which defaults are pruned.** `HTTPX_DEFAULTS` holds `accept`, `accept-encoding`,
+  `connection` and `user-agent`. ADR-001 §5.3 names three of these; `connection` is the
+  fourth, because httpx adds it too. A unit test checks that the list equals httpx's own
+  defaults, so an httpx upgrade that adds one fails the suite. `host` and the body framing
+  are httpx's and stay. A `cookie` header is always removed (§2.4, §3.3 step 3); its unit test
+  uses a client whose jar does hold a cookie.
+- **`Connection` tokens** are read from every `Connection` header, split on commas, trimmed
+  and lower-cased (`connection_tokens`). The same rule applies to requests and responses.
+- **`proxy-*`.** The code removes the two names §4 lists, `proxy-authenticate` and
+  `proxy-authorization`. ADR-001 §5.3 writes `Proxy-*`. No other `Proxy-` header is removed.
+- **Case.** h11 delivers header names in lower case, so the mixed-case names of H16 can't
+  reach the proxy over the wire. The unit tests of `upstream_headers` and `downstream_headers`
+  check case-insensitive matching with every name on both lists.
+- **Already true in S1-6.** H17, H18, H20, H21 and H24 pass against the S1-6 code: it kept
+  repeated headers, replaced `x-request-id` both ways, and built its clients with
+  `trust_env=False` and `follow_redirects=False`. S1-7 adds their tests. H18's `a\r\nb` case
+  is the unit test of `request_id_from`, because a value with CR or LF can't be sent.
+- **H20** sets the variables in upper and lower case. It first checks that a client that does
+  trust the environment goes through the fake proxy, so the test can't pass vacuously.
+- **H21's "nothing was sent to the `Location`".** The `Location` is a documentation address
+  that nothing answers, so following it would end in a 502 or a timeout, not the 302.
 
 ### 2.4 `app.py`
 
