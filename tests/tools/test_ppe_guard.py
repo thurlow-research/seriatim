@@ -309,7 +309,7 @@ def test_resolve_binds_writes_real_paths(good, ppe, tmp_path):
         ),
     )
     config["volumes"]["v"] = {"driver_opts": {"o": "bind", "device": str(link)}}
-    config["configs"] = {"k": {"file": str(link / "f")}}
+    config["configs"] = {"k": {"file": str(link / "f")}, "e": {"environment": "E"}}
     resolved = g.resolve_binds(config)
     assert resolved[S]["dbg-a"]["volumes"][0]["source"] == os.path.realpath(real)
     assert resolved[S]["dbg-a"]["volumes"][1]["source"] == "cache"
