@@ -398,6 +398,19 @@ class _Dispatcher:
                 extra_headers=[(b"connection", b"close")],
             )
             return
+        names = {k for k, _ in scope["headers"]}
+        if b"transfer-encoding" in names and b"content-length" in names:
+            # h11 accepts this framing and uses Transfer-Encoding alone (RFC 9112 §6.3), so the
+            # sidecar refuses it and closes the connection itself, as §6.1 requires (H28).
+            await self.reply(
+                send,
+                ErrorCode.BAD_REQUEST_BODY,
+                "Transfer-Encoding and Content-Length together",
+                request_id=rid,
+                method=method,
+                extra_headers=[(b"connection", b"close")],
+            )
+            return
         raw_path = scope.get("raw_path")
         if raw_path is None:  # uvicorn with h11 always sets it: fail closed
             await self.reply(

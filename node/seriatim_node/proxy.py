@@ -3,9 +3,9 @@
 S1-6 adds the request lifecycle of §3.3 complete: admission, the body read, the disconnect
 watcher, the relay, the hold limit, and the shielded `finally` that proves upstream closure
 before it ends the lease, then talks to the client. Later PRs add to it without changing that
-structure. S1-7 adds the full header strip lists of §4 and `prune_httpx_defaults`. Still to
-come:
-- S1-8: the request limits in `read_body` and the size check before admission;
+structure. S1-7 adds the full header strip lists of §4 and `prune_httpx_defaults`. S1-8
+adds the request limits: the size limit and the total timeout in `read_body`, and the
+`Content-Length` check before admission. Still to come:
 - S1-9: the in-stream error records and the framing rule for a clean end;
 - S1-10: the cancellation and close edge cases;
 - S1-11: streamed blob uploads (`body_stream`).
@@ -158,16 +158,43 @@ class ClientGone(Exception):
     """The client disconnected while sending the request body."""
 
 
-async def read_body(receive: Receive) -> bytes:
-    """The whole request body, as received. S1-8 adds the size limit and the total timeout."""
-    chunks = []
-    while True:
-        msg = await receive()
-        if msg["type"] == "http.disconnect":
-            raise ClientGone
-        chunks.append(msg.get("body", b""))
-        if not msg.get("more_body", False):
-            return b"".join(chunks)
+class BodyTooLarge(Exception):
+    """The request body grew past `max_body_bytes` while it was being read (413)."""
+
+
+class BodyTimeout(Exception):
+    """The request body had not fully arrived within `body_timeout_s` (408)."""
+
+
+def declared_length(headers: Headers) -> int | None:
+    """The request's `Content-Length`, or None when it has none (a chunked body). h11 has
+    already refused a malformed or conflicting value (H28), so the first one is the value."""
+    for k, v in headers:
+        if k == b"content-length":
+            return int(v)
+    return None
+
+
+async def read_body(receive: Receive, *, limit: int, timeout_s: float) -> bytes:
+    """The whole request body, as received (REQ-20). Raises `BodyTooLarge` as soon as more
+    than `limit` bytes have arrived, `BodyTimeout` if the body is not complete `timeout_s`
+    after the first `receive()` (a total bound, not reset by each chunk: E8), and `ClientGone`
+    on a disconnect."""
+    chunks: list[bytes] = []
+    size = 0
+    with anyio.move_on_after(timeout_s):
+        while True:
+            msg = await receive()
+            if msg["type"] == "http.disconnect":
+                raise ClientGone
+            chunk = msg.get("body", b"")
+            size += len(chunk)
+            if size > limit:
+                raise BodyTooLarge
+            chunks.append(chunk)
+            if not msg.get("more_body", False):
+                return b"".join(chunks)
+    raise BodyTimeout  # the loop leaves only by return, raise or the deadline
 
 
 @dataclass
@@ -242,6 +269,17 @@ class Proxy:
         lease: Lease | None = None
         req_client: httpx.AsyncClient | None = None
         slot_end = "none"
+        length = declared_length(scope["headers"])
+        if length is not None and length > self.settings.max_body_bytes:  # before admission (B7)
+            status = await self._reply(
+                send,
+                ErrorCode.BODY_TOO_LARGE,
+                "the request body is too large",
+                gate_value="ungated",
+                rid=rid,
+            )
+            self.log.emit(**where, outcome="rejected", status=status, slot_end="none")
+            return
         if route.kind is Kind.GATED:
             r = self.gate.try_acquire(where["path"], rid)
             if isinstance(r, Busy):  # the body is never read (B3)
@@ -345,7 +383,11 @@ class Proxy:
         """Read the body, send it upstream and relay the response. Records every failure in
         `outcome` instead of raising, so the task group only ever sees cancellations."""
         try:
-            body = await read_body(receive)
+            body = await read_body(
+                receive,
+                limit=self.settings.max_body_bytes,
+                timeout_s=self.settings.body_timeout_s,
+            )
             tg.start_soon(watch_disconnect, receive, outcome, tg.cancel_scope)
             client = req_client if req_client is not None else self.client
             query = scope["query_string"]
@@ -413,6 +455,10 @@ def _error_reply(outcome: Outcome) -> tuple[ErrorCode, str, dict[str, Any]] | No
     err = outcome.error
     if outcome.hold_exceeded:
         return ErrorCode.LOCK_HOLD_EXCEEDED, "the request exceeded the hold limit", {}
+    if isinstance(err, BodyTooLarge):
+        return ErrorCode.BODY_TOO_LARGE, "the request body is too large", {}
+    if isinstance(err, BodyTimeout):
+        return ErrorCode.REQUEST_BODY_TIMEOUT, "the request body did not arrive in time", {}
     if isinstance(err, (httpx.ConnectError, httpx.ConnectTimeout)):
         return ErrorCode.UPSTREAM_UNAVAILABLE, "Ollama is not reachable", {}
     if isinstance(err, httpx.PoolTimeout):
@@ -431,6 +477,8 @@ def _log_outcome(outcome: Outcome) -> tuple[str, str]:
         return "client_disconnect", "INFO"
     if outcome.hold_exceeded:
         return "hold_exceeded", "CRITICAL"
+    if isinstance(err, (BodyTooLarge, BodyTimeout)):
+        return "rejected", "INFO"
     if isinstance(err, (httpx.ConnectError, httpx.ConnectTimeout)):
         return "upstream_unavailable", "INFO"
     if isinstance(err, httpx.PoolTimeout):
