@@ -1121,12 +1121,19 @@ def test_h8_keep_alive_next_request_is_admitted(fake_ollama, sidecar, monkeypatc
 
 @pytest.mark.td("H8")
 def test_h8b_an_abnormal_end_drains(fake_ollama, sidecar):
+    """The abort closes the keep-alive connection (TD §2.3), so the next requests use new ones."""
     cut_short = abort_body(b'{"do', 100)
     fake_ollama.script("POST", "/api/chat", sequence(cut_short, status(200, b'{"done":true}')))
     gate, clock = ready_gate(drain_s=10)
     car = sidecar(fake_ollama.url, gate=gate)
-    with pytest.raises(httpx.RemoteProtocolError):  # the client sees the response cut short
-        _chat(car)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_raw_chat())
+        received = b""
+        while chunk := sock.recv(65536):  # ends only when the sidecar closes the connection
+            received += chunk
+    head, _, body = received.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 200 ") and b"content-length: 100" in head.lower()
+    assert body == b'{"do'  # cut short: 4 of the 100 bytes, then the connection closes
     wait_for(lambda: _slot_states(gate) == ["draining"])
     assert _chat(car).status_code == 429
     clock.advance(10)

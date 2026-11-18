@@ -301,6 +301,10 @@ seams for the later slices:
   adds the framing rule of §3.3 step 5 and the in-stream error record. Until then an abort
   after the headers returns without the final body message: the client sees a cut-short
   response, and the slot drains. `Outcome.tail` keeps the last two bytes for S1-9.
+- **An abort closes the client connection.** uvicorn closes a connection whose response ended
+  without its final body message, so no second request can follow on it. H8b therefore checks
+  the cut-short body and the close on one raw socket, and sends its 429 and 200 requests on
+  new connections.
 - **The hold deadline** is read from the gate's own clock through a new
   `Lease.remaining_s()` in `gate.py`. Ungated requests have no hold limit.
 - **Where the clients are built.** `new_gated_client` and `new_ungated_client` are in
@@ -900,7 +904,7 @@ also run on `windows-latest` and `macos-latest`.
 | H5 | Upstream 404 `{"error":"model \"nope\" not found"}` → 404 with an identical body; the slot is free at once (clean end) | 6, 25 |
 | H6 | While a gated request is held: `GET /api/tags` → 200, `x-seriatim-gate: ungated`; `OPTIONS /api/tags` and `GET /api/chat` → 429 (gated, unknown) | 5 |
 | H7 | While a gated request is held: `POST /api/pull` replaying captured pull progress → 200, an identical stream | 5, 6 |
-| H8 | One raw keep-alive connection: two `/api/chat` requests, the second written to the socket immediately after the first response's last byte arrives, while a test hook holds the first request's `finally` at step (c) → the second is admitted (200), never 429. **H8b:** the same, but the first ends abnormally (upstream reset) → the next request within `drain_s` gets 429, and after `drain_s` (fake clock) it gets 200 | 2, 10 |
+| H8 | One raw keep-alive connection: two `/api/chat` requests, the second written to the socket immediately after the first response's last byte arrives, while a test hook holds the first request's `finally` at step (c) → the second is admitted (200), never 429. **H8b:** the same, but the first ends abnormally (upstream reset) → the next request within `drain_s` gets 429, and after `drain_s` (fake clock) it gets 200. The abort closes the connection (§2.3), so H8b asserts the cut-short response and the close on the raw socket, then sends the 429 and 200 requests on new connections | 2, 10 |
 | H9 | Upstream answers 429 with `Retry-After: 3` and its own `X-Seriatim-Gate: busy`, `Access-Control-Allow-Origin: *` and `X-Rerouted-From: x` → the client gets 429 with Ollama's body, `Retry-After: 3`, `x-seriatim-gate: acquired`, and no CORS or `X-Rerouted-From` header | 6, 36 |
 | H10 | A 100 MiB streamed `POST /api/blobs/sha256:<hex>` with `max_body_bytes=1 MiB` → forwarded intact (the SHA-256 of the received bytes matches). Not buffered: the in-process sidecar's `tracemalloc` peak during the upload stays under 16 MiB | 6, 20 |
 | H11 | Upstream answers request A with `Set-Cookie: s=1` → the client does not get the header, and a later request B (another client) reaches upstream with no `Cookie` header | 6, T3 |
