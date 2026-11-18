@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
-from harness import FakeOllama, Sidecar, start_sidecar
+from harness import FakeOllama, Sidecar, SidecarProcess, start_process, start_sidecar
 
 
 @pytest.fixture
@@ -29,3 +30,20 @@ def sidecar() -> Iterator[Callable[..., Sidecar]]:
     yield start
     for car in started:
         car.server.stop()
+
+
+@pytest.fixture
+def sidecar_process(tmp_path: Path) -> Iterator[Callable[..., SidecarProcess]]:
+    """`sidecar_process(ollama_url, lock_dir=None, **kwargs)` spawns `python -m seriatim_node`
+    (TD §7). The lock directory defaults to one under `tmp_path`; every process is killed at
+    teardown, with `Popen.kill()`, so it works the same on every OS."""
+    started: list[SidecarProcess] = []
+
+    def start(ollama_url: str, lock_dir: Path | None = None, **kwargs: object) -> SidecarProcess:
+        proc = start_process(ollama_url, lock_dir or tmp_path / "lock", tmp_path / "logs", **kwargs)
+        started.append(proc)
+        return proc
+
+    yield start
+    for proc in started:
+        proc.kill()

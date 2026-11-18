@@ -1,15 +1,17 @@
-"""TD-slice-1 §8.1: configuration (C1 to C7, C9 to C11; C8 arrives with `main()` in S1-12)."""
+"""TD-slice-1 §8.1: configuration (C1 to C11; C8 is `main()`)."""
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import sys
 from pathlib import Path
 
+import anyio
 import pytest
 
-from seriatim_node import config
+from seriatim_node import app, config
 from seriatim_node.config import ConfigError, Settings, default_lock_dir, load_settings
 
 P = "SERIATIM_NODE_"
@@ -377,3 +379,103 @@ def test_settings_reads_no_source_but_its_arguments(monkeypatch):
     monkeypatch.setenv(P + "SLOTS", "7")
     assert Settings().slots == 1
     assert config.FIELDS == frozenset(Settings.model_fields)
+
+
+@pytest.fixture
+def node_env(monkeypatch):
+    """A real `os.environ` without any `SERIATIM_NODE_*`, for `main()`; uvicorn never runs
+    (the fake records its call), and a lock that `main()` takes is closed afterwards."""
+    for key in list(os.environ):
+        if key.startswith(P):
+            monkeypatch.delenv(key)
+    monkeypatch.setattr(app, "_SINGLETON_FD", None)
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(app.uvicorn, "run", lambda *a, **kw: calls.append((a, kw)))
+    yield calls
+    if app._SINGLETON_FD is not None:
+        os.close(app._SINGLETON_FD)
+
+
+async def _get(asgi, path: bytes) -> list[dict]:
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(msg):
+        sent.append(msg)
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "raw_path": path,
+        "path": path.decode(),
+        "query_string": b"",
+        "headers": [],
+    }
+    await asgi(scope, receive, send)
+    return sent
+
+
+@pytest.mark.td("C8")
+def test_main_invalid_config_exits_2(node_env, monkeypatch, capsys):
+    monkeypatch.setenv(P + "SLOTS", "0")
+    assert app.main() == 2
+    assert "SERIATIM_NODE_SLOTS" in capsys.readouterr().err
+    assert node_env == [] and app._SINGLETON_FD is None
+
+
+@pytest.mark.td("C8")
+def test_main_runs_uvicorn_with_one_h11_worker(node_env, monkeypatch, tmp_path):
+    monkeypatch.setenv(P + "ALLOW_UNAUTHENTICATED", "true")
+    monkeypatch.setenv(P + "LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv(P + "LISTEN_PORT", "12345")
+    monkeypatch.setenv(P + "ID", "node-c")
+    real_create_app = app.create_app
+    seen: list[tuple] = []
+
+    def create_app(settings):
+        dispatcher = real_create_app(settings)
+
+        async def recording(scope, receive, send):
+            seen.append((scope, receive, send))
+            await dispatcher(scope, receive, send)
+
+        return recording
+
+    monkeypatch.setattr(app, "create_app", create_app)
+    assert app.main() == 0
+    ((args, kwargs),) = node_env
+    assert kwargs == {
+        "host": "127.0.0.1",
+        "port": 12345,
+        "http": "h11",
+        "workers": 1,
+        "lifespan": "on",
+        "log_config": None,
+        "server_header": False,
+        "date_header": True,
+    }
+    (asgi,) = args
+    # A plain 3-argument ASGI function, so uvicorn can never take it for a factory.
+    assert inspect.iscoroutinefunction(asgi)
+    assert list(inspect.signature(asgi).parameters) == ["scope", "receive", "send"]
+    start, _ = anyio.run(_get, asgi, b"/seriatim/nope")
+    ((scope, receive, send),) = seen  # handed on unchanged
+    assert scope["raw_path"] == b"/seriatim/nope" and callable(receive) and callable(send)
+    assert start["status"] == 404
+    assert (b"x-seriatim-node", b"node-c") in start["headers"]
+    assert app._SINGLETON_FD is not None  # taken before uvicorn starts
+    assert (tmp_path / "upstream-11435.lock").is_file()
+
+
+def test_main_exits_3_when_it_cannot_lock(node_env, monkeypatch, tmp_path, capsys):
+    parent = tmp_path / "f"
+    parent.write_text("x", encoding="utf-8")
+    monkeypatch.setenv(P + "ALLOW_UNAUTHENTICATED", "true")
+    monkeypatch.setenv(P + "LOCK_DIR", str(parent / "run"))
+    assert app.main() == 3
+    err = capsys.readouterr().err
+    assert err.startswith("seriatim-node: cannot lock ") and str(parent) in err
+    assert node_env == []

@@ -5,6 +5,7 @@
   body.
 - `start_sidecar`: runs `create_app(settings)` under a real uvicorn server (h11) on
   127.0.0.1, with `ollama_url` pointing at the fake (or at a port nothing listens on).
+- `start_process`: runs `python -m seriatim_node` as a subprocess (`test_process.py`).
 
 Servers run in their own thread and event loop, so tests stay synchronous and work the same
 on Linux, macOS and Windows. Every socket is bound by the harness to an ephemeral port before
@@ -19,12 +20,14 @@ import base64
 import json
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import uvicorn
 
@@ -503,3 +506,126 @@ def raw_exchange(port: int, data: bytes, timeout: float = 10) -> RawResponse:
         (k.strip().lower(), v.strip()) for k, v in (line.split(":", 1) for line in lines[1:])
     ]
     return RawResponse(int(lines[0].split()[1]), headers, body)
+
+
+# --- the sidecar as a process ---------------------------------------------------------------
+
+NODE_PREFIX = "SERIATIM_NODE_"
+# A sidecar process has this long to listen or to exit. A cold Python start that imports the
+# package takes a few seconds on a slow CI runner; a failure still never waits for ever.
+PROCESS_S = 30.0
+
+# Runs `python -m seriatim_node` with a test-only trigger (R3): each line on stdin runs
+# `gc.collect()` in the sidecar, which then writes GC_DONE to stderr.
+GC_DONE = "test-hook: gc collected"
+GC_HOOK = f"""
+import gc, sys, threading
+
+def watch():
+    for _ in sys.stdin:
+        gc.collect()
+        print({GC_DONE!r}, file=sys.stderr, flush=True)
+
+threading.Thread(target=watch, daemon=True).start()
+from seriatim_node.__main__ import run
+sys.exit(run())
+"""
+
+
+def process_env(ollama_url: str, lock_dir: Path, port: int, **overrides: object) -> dict[str, str]:
+    """The child's environment: this one without any `SERIATIM_NODE_*`, plus test mode (which
+    allows the temporary lock directory), the listen port, the upstream and `overrides`."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(NODE_PREFIX)}
+    settings = {
+        "listen_port": port,
+        "ollama_url": ollama_url,
+        "lock_dir": lock_dir,
+        "allow_unauthenticated": "true",
+        "id": "node-a",
+    } | overrides
+    env |= {NODE_PREFIX + k.upper(): str(v) for k, v in settings.items()}
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+@dataclass
+class SidecarProcess:
+    proc: subprocess.Popen
+    port: int
+    lock_dir: Path
+    stderr_path: Path
+    spawned_at: float  # time.perf_counter() just before the spawn
+    _files: list[IO[bytes]]
+
+    @property
+    def url(self) -> str:
+        return f"http://{LOOPBACK}:{self.port}"
+
+    def stderr(self) -> str:
+        return self.stderr_path.read_text(encoding="utf-8", errors="replace")
+
+    def wait_listening(self, timeout: float = PROCESS_S) -> None:
+        """Wait until the sidecar accepts connections; fail if it exits first."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.proc.poll() is not None:
+                raise AssertionError(f"the sidecar exited {self.proc.returncode}: {self.stderr()}")
+            try:
+                socket.create_connection((LOOPBACK, self.port), timeout=1).close()
+                return
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise AssertionError("the sidecar did not start listening") from None
+                time.sleep(0.01)
+
+    def wait_exit(self, timeout: float = PROCESS_S) -> int:
+        return self.proc.wait(timeout)
+
+    def collect_garbage(self) -> None:
+        """Run `gc.collect()` in a sidecar started with `GC_HOOK`, and wait until it has."""
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(b"gc\n")
+        self.proc.stdin.flush()
+        wait_for(lambda: GC_DONE in self.stderr())
+
+    def kill(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.wait(PROCESS_S)
+        self.close_files()
+
+    def close_files(self) -> None:
+        for f in self._files:
+            f.close()
+        self._files.clear()
+        if self.proc.stdin is not None:
+            self.proc.stdin.close()
+
+
+def start_process(
+    ollama_url: str,
+    lock_dir: Path,
+    log_dir: Path,
+    *,
+    port: int | None = None,
+    gc_hook: bool = False,
+    **overrides: object,
+) -> SidecarProcess:
+    """Spawn a sidecar on `port` (a fresh one by default). Its stdout and stderr go to files
+    in `log_dir`, so a full pipe can never block it."""
+    port = port or closed_port()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"sidecar-{port}-{time.monotonic_ns()}"
+    out = open(log_dir / f"{stem}.out", "wb")  # closed by close_files
+    err_path = log_dir / f"{stem}.err"
+    err = open(err_path, "wb")  # closed by close_files
+    argv = [sys.executable, "-c", GC_HOOK] if gc_hook else [sys.executable, "-m", "seriatim_node"]
+    spawned_at = time.perf_counter()
+    proc = subprocess.Popen(  # nosec B603 # a fixed argv: this Python and the package
+        argv,
+        env=process_env(ollama_url, lock_dir, port, **overrides),
+        stdin=subprocess.PIPE if gc_hook else subprocess.DEVNULL,
+        stdout=out,
+        stderr=err,
+    )
+    return SidecarProcess(proc, port, lock_dir, err_path, spawned_at, [out, err])

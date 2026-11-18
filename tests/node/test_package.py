@@ -1,5 +1,6 @@
 """The S0a package skeleton: version and entry point."""
 
+import os
 import re
 import runpy
 import subprocess
@@ -16,8 +17,11 @@ def test_version_is_pep440_release_or_rc():
     assert re.fullmatch(r"\d+\.\d+\.\d+(rc\d+)?", seriatim_node.__version__)
 
 
-def test_run_exits_2_until_slice_1(monkeypatch, capsys):
-    monkeypatch.delitem(sys.modules, "seriatim_node.app", raising=False)
+def test_run_exits_2_without_the_app_module(monkeypatch, capsys):
+    def missing(name):
+        raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+
+    monkeypatch.setattr(entry.importlib, "import_module", missing)
     assert entry.run() == 2
     assert capsys.readouterr().err.strip() == entry.NOT_YET
 
@@ -46,6 +50,7 @@ def test_run_reraises_other_missing_modules(monkeypatch):
 
 
 def test_module_main_block_exits_with_run_status(monkeypatch):
+    monkeypatch.setenv("SERIATIM_NODE_SLOTS", "0")  # invalid, so main() exits 2 at once
     monkeypatch.delitem(sys.modules, "seriatim_node.app", raising=False)
     monkeypatch.delitem(sys.modules, "seriatim_node.__main__", raising=False)
     with pytest.raises(SystemExit) as e:
@@ -54,9 +59,15 @@ def test_module_main_block_exits_with_run_status(monkeypatch):
 
 
 @pytest.mark.process
-def test_module_entry_point_exits_2():
+def test_module_entry_point_runs_main():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SERIATIM_NODE_")}
+    env["SERIATIM_NODE_SLOTS"] = "0"  # invalid, so main() exits 2 before it binds anything
     r = subprocess.run(
-        [sys.executable, "-m", "seriatim_node"], capture_output=True, text=True, timeout=60
+        [sys.executable, "-m", "seriatim_node"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
     )
     assert r.returncode == 2
-    assert entry.NOT_YET in r.stderr
+    assert "SERIATIM_NODE_SLOTS" in r.stderr

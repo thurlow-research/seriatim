@@ -3,15 +3,17 @@
 S1-1 adds the error table: `ErrorCode`, `ERROR_TABLE` and `ErrorFactory`. `contract/openapi.yaml`
 is the source of truth, and K-OAS3 checks that this table equals its `x-seriatim-codes`.
 S1-5 adds `RequestLog`, `create_app` (the dispatcher and `/seriatim/health`) and the health
-client. S1-6 hands every other route to the proxy (`proxy.py`). The singleton lock and `main()`
-follow in S1-12.
+client. S1-6 hands every other route to the proxy (`proxy.py`). S1-12 adds the singleton
+lock (`acquire_singleton`) and `main()`.
 """
 
 from __future__ import annotations
 
 import contextlib
+import errno
 import http.cookiejar
 import json
+import os
 import re
 import sys
 import time
@@ -19,18 +21,19 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 import anyio
 import httpx
+import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route as StarletteRoute
 
-from seriatim_node.__main__ import NOT_YET
-from seriatim_node.config import Settings
+from seriatim_node.config import ConfigError, Settings, load_settings
 from seriatim_node.gate import SERIATIM_ROUTES, Gate, Kind, PathError, check_raw_path, classify
 
 
@@ -514,8 +517,91 @@ def create_app(
     return _Dispatcher(settings, gate, client)
 
 
+class SingletonError(Exception):
+    """The singleton lock is held by another sidecar, or cannot be taken (REQ-12b; exit 3)."""
+
+
+# The open, locked lock file. It is never unlocked, closed or deleted: the OS releases the lock
+# when the process exits, for any reason. An int, not a file object, so that nothing (garbage
+# collection included) can ever close it behind the code's back (TD §2.4 "Holding the lock").
+_SINGLETON_FD: int | None = None
+
+
+def lock_path(settings: Settings) -> Path:
+    """`<lock_dir>/upstream-<port>.lock`: one lock per upstream, since it is always loopback."""
+    return settings.lock_dir / f"upstream-{settings.ollama_url.port}.lock"
+
+
+def _lock(fd: int) -> None:
+    """A non-blocking exclusive lock on `fd`: `flock` on POSIX, one byte at offset 0 on
+    Windows. Raises `OSError` if it can't be taken."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _held(e: OSError) -> bool:
+    """Whether a failed lock means another process holds it (not that it can't be taken)."""
+    if sys.platform == "win32":
+        return e.errno == errno.EACCES
+    return isinstance(e, BlockingIOError)
+
+
+def acquire_singleton(settings: Settings) -> None:
+    """Take the host-wide lock for this sidecar's upstream (REQ-12b), or raise
+    `SingletonError`. Being unable to take it never lets the sidecar start."""
+    global _SINGLETON_FD
+    path = lock_path(settings)
+    try:
+        settings.lock_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        raise SingletonError(f"cannot lock {path}: {e.strerror or e}") from None
+    try:
+        _lock(fd)
+    except OSError as e:
+        os.close(fd)  # this descriptor holds nothing; the file itself is never removed
+        if _held(e):
+            raise SingletonError(f"another sidecar holds {path}") from None
+        raise SingletonError(f"cannot lock {path}: {e.strerror or e}") from None
+    _SINGLETON_FD = fd
+
+
 def main() -> int:
-    """Placeholder until S1-12: keeps `python -m seriatim_node` and the console script
-    exiting 2 with the S0a message now that this module exists."""
-    print(NOT_YET, file=sys.stderr)
-    return 2
+    """`seriatim-node` and `python -m seriatim_node` (TD §2.4). Returns the exit code: 2 for
+    invalid configuration, 3 if the singleton lock can't be taken, else 0 once uvicorn has
+    stopped."""
+    try:
+        settings = load_settings()
+    except ConfigError as e:
+        print(f"seriatim-node: {e}", file=sys.stderr)
+        return 2
+    try:
+        acquire_singleton(settings)
+    except SingletonError as e:
+        print(f"seriatim-node: {e}", file=sys.stderr)
+        return 3
+    app = create_app(settings)
+
+    # uvicorn inspects the app's signature to tell an app from a factory, so it is handed a
+    # plain 3-argument function, whatever the dispatcher's own signature looks like.
+    async def asgi(scope: Scope, receive: Receive, send: Send) -> None:
+        await app(scope, receive, send)
+
+    uvicorn.run(
+        asgi,
+        host=settings.listen_host,
+        port=settings.listen_port,
+        http="h11",
+        workers=1,  # REQ-21: the gate is in-process state
+        lifespan="on",
+        log_config=None,
+        server_header=False,
+        date_header=True,
+    )
+    return 0
