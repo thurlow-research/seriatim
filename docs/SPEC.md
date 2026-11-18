@@ -2145,16 +2145,33 @@ command output, and never just says "tests pass".
     `ubuntu-latest` is a required check** (ruling Q9).
   - Local runs are pre-checks on a designated CPU-only development host. A local run refuses to
     start unless the hostname matches the gitignored `ppe/.allowed-host`.
-  - CI declares itself explicitly with `ppe/ppe up --ci`, which is accepted only when
-    `GITHUB_ACTIONS=true`.
+  - CI declares itself explicitly with `--ci` (`ppe/ppe up --ci`, `down --ci`,
+    `purge --ci`), which is accepted only when `GITHUB_ACTIONS=true`. `up`, `down` and
+    `purge` all make this check.
   - The PPE never runs on, or connects to, a production or GPU machine.
 - **The guard** checks the *effective* Compose configuration (`docker compose config`) before
-  it starts, and refuses any of these:
-  - a sum of per-service limits above **4 CPUs or 6 GiB**;
+  it starts. It is an **allowlist**: a form it doesn't know is refused. It refuses any of
+  these:
+  - a service key that is not on the guard's list of known-safe keys, or a `deploy` key
+    other than resource limits (CPUs, memory), `replicas` and `placement`. Host-sharing keys
+    are therefore refused, for example `privileged`, `pid`, `ipc`, `userns_mode`,
+    `devices`, `security_opt`, `cgroup_parent`, `sysctls` and `volumes_from`, as are device
+    reservations;
+  - a `network_mode` other than `service:<another service of this project>`, such as
+    `host` or `container:<name>`;
+  - an external network or an external named volume, or a network with the `host` driver;
+  - a sum of per-service limits above **4 CPUs or 6 GiB**, where each service counts once
+    for every container its `scale` or `deploy.replicas` starts;
   - a published port that is not on `127.0.0.1`;
-  - `network_mode: host`, `privileged`, capabilities beyond `NET_RAW`/`NET_ADMIN` on the
-    capture containers, a Docker socket mount, or a bind mount outside `ppe/`;
+  - capabilities beyond `NET_RAW`/`NET_ADMIN` on the capture containers, a Docker socket
+    mount, or a bind mount outside `ppe/`;
   - a Docker context or `DOCKER_HOST` that is not the local socket.
+
+  **No gap between the check and the start.** The guard resolves every bind source to its
+  real path once, before it checks. It writes the configuration it checked, with those real
+  paths, to a file of mode 0600 in a fresh private temporary directory, checks the file's
+  hash again just before `compose up`, and starts the PPE from that file. Docker gets the
+  path the guard checked, so a symlink swapped in afterwards can't redirect a mount.
 - **Models.** These are real micro-models with real, different `parameter_size` metadata:
   - `qwen2.5:0.5b` (0.5B) on every node;
   - `all-minilm:22m`, a small embedding model, on every node, for the embedding cases of

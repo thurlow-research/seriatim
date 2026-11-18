@@ -117,7 +117,7 @@ jobs:
           retention-days: 7
       - name: Stop the PPE
         if: always()
-        run: ppe/ppe down
+        run: ppe/ppe down --ci
       # Ollama writes the models as root, some mode 0600, so the cache step (which runs as the
       # runner user after this job's steps) could not read them. Only on a cache miss.
       - name: Let the cache step read the models
