@@ -175,6 +175,16 @@ def declared_length(headers: Headers) -> int | None:
     return None
 
 
+def has_body(headers: Headers) -> bool:
+    """Whether the request declares a body: chunked, or a `Content-Length` above 0. A reply
+    sent before such a body is fully read must close the connection, because uvicorn would
+    otherwise keep reading the old body, and take a keep-alive retry's bytes as part of it."""
+    if any(k == b"transfer-encoding" for k, _ in headers):
+        return True
+    length = declared_length(headers)
+    return length is not None and length > 0
+
+
 async def read_body(receive: Receive, *, limit: int, timeout_s: float) -> bytes:
     """The whole request body, as received (REQ-20). Raises `BodyTooLarge` as soon as more
     than `limit` bytes have arrived, `BodyTimeout` if the body is not complete `timeout_s`
@@ -210,6 +220,7 @@ class Outcome:
     resp: httpx.Response | None = None
     status: int | None = None
     tail: bytes = b""
+    body_pending: bool = False  # a declared body not yet fully read: a reply must close
 
 
 async def watch_disconnect(receive: Receive, outcome: Outcome, scope: anyio.CancelScope) -> None:
@@ -244,11 +255,23 @@ class Proxy:
         self.errors = errors
 
     async def _reply(
-        self, send: Send, code: ErrorCode, message: str, *, gate_value: str, rid: str, **kw: Any
+        self,
+        send: Send,
+        code: ErrorCode,
+        message: str,
+        *,
+        gate_value: str,
+        rid: str,
+        close: bool,
+        **kw: Any,
     ) -> int:
+        """Send an error reply. `close` adds `Connection: close`, for a reply sent before the
+        request body was fully read (S1-8)."""
         status, headers, body = self.errors.response(
             code, message, gate_value=gate_value, request_id=rid, **kw
         )
+        if close:
+            headers = [*headers, (b"connection", b"close")]
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body, "more_body": False})
         return status
@@ -265,7 +288,7 @@ class Proxy:
             "scope": route.scope.value,
             "known": route.known,
         }
-        outcome = Outcome()
+        outcome = Outcome(body_pending=has_body(scope["headers"]))
         lease: Lease | None = None
         req_client: httpx.AsyncClient | None = None
         slot_end = "none"
@@ -277,6 +300,7 @@ class Proxy:
                 "the request body is too large",
                 gate_value="ungated",
                 rid=rid,
+                close=True,
             )
             self.log.emit(**where, outcome="rejected", status=status, slot_end="none")
             return
@@ -289,6 +313,7 @@ class Proxy:
                     "GPU busy: another request is running on this node",
                     gate_value="ungated",
                     rid=rid,
+                    close=outcome.body_pending,
                     retry_after=r.retry_after_s,
                     busy_for_s=round(r.busy_for_s, 1),
                 )
@@ -301,6 +326,7 @@ class Proxy:
                     "the node is starting",
                     gate_value="ungated",
                     rid=rid,
+                    close=outcome.body_pending,
                     retry_after=r.retry_after_s,
                 )
                 self.log.emit(**where, outcome="starting", status=status, slot_end="none")
@@ -388,6 +414,7 @@ class Proxy:
                 limit=self.settings.max_body_bytes,
                 timeout_s=self.settings.body_timeout_s,
             )
+            outcome.body_pending = False
             tg.start_soon(watch_disconnect, receive, outcome, tg.cancel_scope)
             client = req_client if req_client is not None else self.client
             query = scope["query_string"]
@@ -446,7 +473,7 @@ class Proxy:
         if code is ErrorCode.NODE_SATURATED:
             extra = {"retry_after": self.settings.retry_after_s}
         outcome.status = await self._reply(
-            send, code, message, gate_value=gate_value, rid=rid, **extra
+            send, code, message, gate_value=gate_value, rid=rid, close=outcome.body_pending, **extra
         )
 
 

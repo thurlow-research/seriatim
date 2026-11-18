@@ -376,9 +376,27 @@ lines 3 and 4 and step 1, §5).
   `BodyTimeout` → 408 `REQUEST_BODY_TIMEOUT`, "the request body did not arrive in time".
   Both are logged as `outcome: rejected` at `INFO`. After admission they carry
   `X-Seriatim-Gate: acquired` and the slot is freed with no drain, because nothing was sent.
-- **The unread rest of a body.** The sidecar adds no `Connection: close` to a 413, 408 or 429.
-  uvicorn 0.54 discards the unread body once the response is complete and keeps the
-  connection, and closes it if it can't. H29 accepts either result, and fails only on a 400.
+- **A reply sent before the body is fully read closes the connection** (#85 review).
+  uvicorn 0.54 never closes a connection for an unread body: once the response is complete
+  it keeps reading, and while h11 is still in `SEND_BODY` it takes the next bytes as the rest
+  of the old body. A keep-alive retry after a 408 (which is `retryable`) would therefore be
+  parsed as body bytes, giving a spurious 400 or a desync; and after a refused
+  `Expect: 100-continue` request, whose client never sends the body, the next request would
+  wait unanswered. So every reply sent while a declared body is still unread carries
+  `Connection: close`, and uvicorn closes the connection after it:
+  - the 413 before admission;
+  - the 429 and 503 refusals, when the request declares a body;
+  - the 413 (`BodyTooLarge`), the 408 (`BodyTimeout`) and the hold limit's 504 (E9) during
+    the read, and any other error reply before the read completes.
+  `has_body(headers)` says whether a body is declared: `Transfer-Encoding`, or a
+  `Content-Length` above 0. `Outcome.body_pending` starts as that and turns false once
+  `read_body` returns. A reply to a request with no body (a `GET` refused with 429) keeps the
+  connection, and so does an error after the body was read (502, 504 before the headers, 500).
+  RFC 9110 §15.5.9 says a server SHOULD close the connection on a 408.
+  H29 tests this: a refusal mid-body (408, 413 while the body is still streaming, 504) and a
+  refused `100-continue` request (413, 429, 503) are each followed by a request on the same
+  socket, which must be answered correctly or find the socket closed. A bodyless 429 keeps
+  the socket, and the next request on it is answered.
 - **`Transfer-Encoding` together with `Content-Length`** (asked on #58). h11 0.16 does not
   refuse this framing. It uses `Transfer-Encoding` alone (RFC 9112 §6.3) and keeps the
   connection open, so a request hidden after the chunked body would be served. The dispatcher
@@ -835,9 +853,9 @@ column shows the lease result for a gated request.
 | Unknown `/seriatim/*` path, or the wrong method on one | 404 `NOT_FOUND` / 405 `METHOD_NOT_ALLOWED` | — | none taken | `rejected` |
 | Starting | 503 `NODE_STARTING` + `Retry-After` + `X-Seriatim-Gate: refused` | — | none taken | `starting` |
 | No free slot | 429 `GPU_BUSY` + `Retry-After` + `X-Seriatim-Gate: busy` | — | none taken | `busy` |
-| `Content-Length` > limit (buffered routes) | 413 `BODY_TOO_LARGE` | — | none taken | `rejected` |
-| Body grows past the limit while being read | 413 `BODY_TOO_LARGE` | — | freed | `rejected` |
-| Body stalls (`BodyTimeout`) | 408 `REQUEST_BODY_TIMEOUT` | — | freed | `rejected` |
+| `Content-Length` > limit (buffered routes) | 413 `BODY_TOO_LARGE` (`Connection: close`) | — | none taken | `rejected` |
+| Body grows past the limit while being read | 413 `BODY_TOO_LARGE` (`Connection: close`) | — | freed | `rejected` |
+| Body stalls (`BodyTimeout`) | 408 `REQUEST_BODY_TIMEOUT` (`Connection: close`) | — | freed | `rejected` |
 | Client gone while sending the body | nothing sent | — | freed | `client_disconnect` |
 | Blob upload stalls or the client leaves after bytes were forwarded | 408 `UPLOAD_INTERRUPTED` (not replay-safe) | — | no slot (ungated) | `upload_interrupted` |
 | `ConnectError`, `ConnectTimeout` | 502 `UPSTREAM_UNAVAILABLE` (replay-safe) | — | freed | `upstream_unavailable` |
@@ -1016,7 +1034,7 @@ also run on `windows-latest` and `macos-latest`.
 | H26 | Ungated stalls. `ungated_read_timeout_s=0.5`: `/api/show` with the fake stalling before the headers → 502 `UPSTREAM_PROTOCOL_ERROR` within the bound; stalling after the headers → aborted. A client disconnect during an ungated stream → the fake sees the upstream close. In every case the shared pool has no connection in use afterwards, and every gate slot stays `FREE` throughout. When the shared response's `aclose()` blocks → `upstream_close_failed` at `ERROR` within `close_timeout_s`, and the client is answered or aborted within `2 × close_timeout_s` | 20, 26 |
 | H27 | The `NODE_SATURATED` response from H14 in full: `Retry-After` equals `retry_after`, `X-Seriatim-Gate: ungated`, and `retryable` and `replay_safe` are the `ERROR_TABLE` values (`replay_safe: true`); the body validates against `ErrorEnvelope` | 20, 25 |
 | H28 | Request smuggling, over a raw socket: two different `Content-Length` headers; `Content-Length: 5, 6`; `Content-Length: -1`; `Transfer-Encoding: chunked` together with `Content-Length`; `Transfer-Encoding: gzip, chunked`; and a chunked body with a trailer and a second request hidden in it → the invalid framings (two different `Content-Length` values, a list value, `-1`, and `Transfer-Encoding` together with `Content-Length`; RFC 9112 §6.1 and §6.3) are each **refused with 400 and a closed connection**. h11 refuses the first three; it accepts `Transfer-Encoding` with `Content-Length`, so the dispatcher refuses that one with 400 `BAD_REQUEST_BODY` and `Connection: close` (§2.3, S1-8), on Ollama paths and `/seriatim/*` alike. `Transfer-Encoding: gzip, chunked` is validly framed, but the sidecar supports no transfer coding except `chunked`. h11 refuses it, and uvicorn 0.54 (h11) answers every h11 protocol error with **400 and a closed connection**, so that is its exact result too. RFC 9112 §6.1 says a server SHOULD send 501 here, and 400 is still a refusal; the test asserts 400, so a uvicorn upgrade that changes it is caught. The valid chunked body with a trailer is parsed as exactly one request, with the body its framing gives, and the hidden request is never seen as a request. `fake_ollama` never records a request the client didn't frame, and no slot is taken by one | 21, 2 |
-| H29 | A refused request, then another on the same keep-alive socket: request 1 gets 429 (busy) after sending its 4 KiB body; request 2 follows on the same socket → request 2 gets **either** its own real response (200 once the holder ends) **or** a closed connection with no second response. A 400 (from request 1's body bytes being parsed as a request) fails the test. The same after a 413 | 3, 21 |
+| H29 | A refused request, then another on the same keep-alive socket: request 1 gets 429 (busy) after sending its 4 KiB body; request 2 follows on the same socket → request 2 gets **either** its own real response (200 once the holder ends) **or** a closed connection with no second response. A 400 (from request 1's body bytes being parsed as a request) fails the test. The same after a 413. And with the body still owed: part of a body, then a 408, a 413 (still streaming) or the hold limit's 504; and an `Expect: 100-continue` request refused with 413, 429 or 503 whose body is never sent. Each of those replies carries `Connection: close`, and the next request on the socket is answered correctly or finds it closed, never taken as body bytes. A 429 to a request with no body keeps the connection (§2.3, S1-8) | 3, 21 |
 | B1 | Request 1 is held at upstream; request 2 (`/api/chat`) → 429 within the bound, with `Retry-After: 15` and `X-Seriatim-Gate: busy`. The body validates against `ErrorEnvelope`: `error_code: GPU_BUSY`, `retryable: true`, `replay_safe: true`, `retry_after: 15`, `source: sidecar`, `busy_for_s ≥ 0`. `fake_ollama` recorded **one** request | 3, 4, 25 |
 | B2 | Request 1 ends cleanly → a new request 2 gets 200 at once | 10 |
 | B3 | Raw socket: request 1 is held; request 2 sends only the headers, with `Content-Length: 10485760` → the 429 arrives without any body being sent | 3 |

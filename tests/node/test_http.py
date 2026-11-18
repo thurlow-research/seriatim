@@ -1463,6 +1463,7 @@ def test_proxy_errors_before_the_headers(
 
     sent, gate, _ = _run_proxy(fail, monkeypatch=monkeypatch)
     assert sent[0]["status"] == ERROR_TABLE[code].status
+    assert b"connection" not in dict(sent[0]["headers"])  # the body was read: keep-alive is safe
     _error_doc(sent[1]["body"], code, envelope_validator)
     assert _slot_states(gate) == [slot]
     line = _one_line(capsys)
@@ -2190,7 +2191,10 @@ def _drip(sock: socket.socket, every_s: float, stop: threading.Event) -> concurr
 
 
 def _refused(resp: RawResponse, status_: int, code: ErrorCode, message: str, gate: str, v) -> None:
+    """Every refusal checked here is sent before the request body was fully read, so it closes
+    the connection (TD §2.3, S1-8)."""
     assert resp.status == status_
+    assert resp.header("connection") == ["close"]
     doc = _error_doc(resp.body, code, v)
     assert doc["error"] == message
     assert (doc["retryable"], doc["replay_safe"]) == (
@@ -2198,6 +2202,13 @@ def _refused(resp: RawResponse, status_: int, code: ErrorCode, message: str, gat
         ERROR_TABLE[code].replay_safe,
     )
     assert resp.header("x-seriatim-gate") == [gate]
+
+
+def test_has_body():
+    assert not proxy_module.has_body([(b"host", b"x")])
+    assert not proxy_module.has_body([(b"content-length", b"0")])
+    assert proxy_module.has_body([(b"content-length", b"1")])
+    assert proxy_module.has_body([(b"transfer-encoding", b"chunked")])
 
 
 def test_declared_length():
@@ -2642,3 +2653,100 @@ def test_h29_after_a_413_the_socket_is_clean(chunked, fake_ollama, sidecar):
     if second is not None:
         assert (second.status, second.body) == (200, b'{"done":true}')
     assert [r.body for r in fake_ollama.requests] == ([] if second is None else [CHAT])
+
+
+TAGS = b"GET /api/tags HTTP/1.1\r\nHost: x\r\n\r\n"  # the follow-up: ungated, no body
+
+
+def _follow_up_is_clean(sock: socket.socket, fake_ollama) -> bool:
+    """Send `TAGS` on a socket whose first request was refused before its body was read. It
+    must be answered as itself, or find the socket closed; it must never be taken as the rest
+    of the old body (which would hang until the socket's timeout) or parsed into a 400. Returns
+    whether the socket was closed."""
+    second = _next_or_closed(sock, TAGS)
+    if second is None:
+        return True
+    assert (second.status, second.body) == (200, b'{"models":[]}')
+    return False
+
+
+@pytest.mark.td("H29")
+@pytest.mark.parametrize(
+    ("settings", "gate_kwargs", "request_", "status_"),
+    [
+        ({"body_timeout_s": 0.5}, {}, _framed(b"x" * 100)[:-50], 408),
+        (
+            {"max_body_bytes": LIMIT},
+            {},
+            b"POST /api/chat HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"%x\r\n%s\r\n" % (LIMIT + 1, b"x" * (LIMIT + 1)),
+            413,
+        ),
+        ({"body_timeout_s": 30}, {"max_hold_s": 0.5}, _framed(b"x" * 100)[:-50], 504),
+    ],
+    ids=["408-stalled", "413-still-streaming", "504-hold-during-the-read"],
+)
+def test_h29_after_a_refusal_mid_body_the_next_request_is_clean(
+    settings, gate_kwargs, request_, status_, fake_ollama, sidecar
+):
+    """Part of the body is sent, then the refusal comes while the rest is still owed."""
+    fake_ollama.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    gate, _ = ready_gate(**gate_kwargs)
+    car = sidecar(fake_ollama.url, gate=gate, **settings)
+    with raw_connect(car.port) as sock:
+        sock.sendall(request_)
+        first = read_response(sock)
+        assert first.status == status_ and first.header("connection") == ["close"]
+        assert _follow_up_is_clean(sock, fake_ollama)  # closed, as the reply said
+    assert fake_ollama.requests == []
+
+
+@pytest.mark.td("H29")
+@pytest.mark.parametrize("refusal", ["413", "429", "503"])
+def test_h29_after_a_100_continue_refusal_the_next_request_is_clean(refusal, fake_ollama, sidecar):
+    """The client waits for `100 Continue` and never sends the body it declared."""
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    fake_ollama.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    if refusal == "503":
+        car = sidecar(fake_ollama.url, drain_s=600)
+    else:
+        gate, _ = ready_gate()
+        car = sidecar(fake_ollama.url, gate=gate, max_body_bytes=LIMIT)
+    held = None
+    if refusal == "429":
+        held = _in_background(_chat, car)
+        hold.wait_entered()
+    length = LIMIT + 1 if refusal == "413" else LIMIT
+    with raw_connect(car.port) as sock:
+        sock.sendall(
+            b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n"
+            b"Expect: 100-continue\r\n\r\n" % length
+        )
+        first = read_response(sock)
+        assert str(first.status) == refusal and first.header("connection") == ["close"]
+        assert _follow_up_is_clean(sock, fake_ollama)
+    if held is not None:
+        hold.release()
+        assert held.result(WAIT_S).status_code == 200
+    assert [r.raw_path for r in fake_ollama.requests] == ([b"/api/chat"] if held else [])
+
+
+@pytest.mark.td("H29")
+def test_h29_a_bodyless_refusal_keeps_the_connection(fake_ollama, sidecar):
+    """Only a reply that leaves a body unread closes: a 429 to a request with no body keeps the
+    connection, and the next request on it is answered."""
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    fake_ollama.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    with raw_connect(car.port) as sock:
+        sock.sendall(b"GET /api/chat HTTP/1.1\r\nHost: x\r\n\r\n")
+        first = read_response(sock)
+        assert first.status == 429 and first.header("connection") == []
+        assert not _follow_up_is_clean(sock, fake_ollama)  # answered on the same socket
+    hold.release()
+    assert held.result(WAIT_S).status_code == 200
