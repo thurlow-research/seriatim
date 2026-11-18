@@ -438,6 +438,23 @@ would then each hold a lock.
 - An `OSError` on the directory or the file gives `SingletonError("cannot lock <path>: …")`.
 - Being unable to take the lock never lets the sidecar start.
 
+**Details fixed by the code (S1-12).**
+- **`main() -> int`** returns the exit code (2, 3, or 0 once uvicorn has stopped) instead of
+  calling `sys.exit`. `python -m seriatim_node` and the `seriatim-node` script both exit with
+  it. Each message goes to stderr as one line, prefixed `seriatim-node: `.
+- **The app uvicorn gets** is a plain 3-argument ASGI function that calls the dispatcher.
+  uvicorn inspects the app's signature to tell an app from a factory, and under mutmut the
+  dispatcher's methods take `(*args, **kwargs)`; the harness's servers do the same.
+- **Helpers.** `lock_path(settings)` gives `lock_dir / f"upstream-{port}.lock"`. `_lock(fd)`
+  picks `fcntl` or `msvcrt` by `sys.platform` when it is called, so both branches are tested
+  on every OS with a stand-in module.
+- **Held or cannot lock.** Only an error from the lock call itself can mean "held": on POSIX
+  `BlockingIOError`, on Windows `EACCES`. Any other lock error, and any error from `mkdir` or
+  `os.open` (a `PermissionError` included), is `cannot lock <path>: <strerror>`, where `<path>`
+  is always the lock file's path, even when the directory is what failed.
+- **A refused attempt closes its own descriptor**, which holds no lock. The file is left in
+  place; only the winning descriptor is kept, in `_SINGLETON_FD`.
+
 ## 3. Lock and concurrency design
 
 ### 3.1 Invariants
@@ -1009,6 +1026,29 @@ also run on `windows-latest` and `macos-latest`.
 | R7 | Permission failures (POSIX, not root; Windows is covered by R4): a lock directory with mode `0500`, and a lock file with mode `000` → exit 3 with `cannot lock` | 12b |
 | R8 | The lock file is never removed: three graceful stops (`Popen.terminate()`) and restarts → after each exit the file exists with the same inode (`os.stat().st_ino`) | 12b |
 | R9 | Two sidecars with the same lock directory and different upstream ports → both serve | 12b |
+
+**Details fixed by the code (S1-12).**
+- **The `gc.collect()` trigger (R3)** is a line on the sidecar's stdin, not a signal, so R3 runs
+  the same on Windows. The harness starts that sidecar through a small wrapper (`GC_HOOK` in
+  `harness.py`) that watches stdin in a thread, collects, writes an acknowledgement to stderr
+  and then calls the package's normal entry point. The sidecar's own code has no hook.
+- **`sidecar_process`** picks a free listen port (`closed_port()`), removes every
+  `SERIATIM_NODE_*` from the inherited environment, sets test mode
+  (`ALLOW_UNAUTHENTICATED=true`, so the temporary `LOCK_DIR` is accepted) and writes stdout and
+  stderr to files, so a full pipe can never block the child. Waiting for the port or for an
+  exit allows 30 s (`PROCESS_S`), because a cold interpreter start on a CI runner is not an
+  event from a fake. R3's "within 5 s" is asserted with `WAIT_S`.
+- **"Answers `NODE_STARTING` until `drain_s` has passed" (R1, R2)** is checked with
+  `drain_s=2`: the first gated request is 503 `NODE_STARTING`, every one after it is too until
+  one is admitted, and that one arrives at least `drain_s` after the spawn and at most
+  `drain_s` plus the poll interval and `TIMING_BOUND_S` after the port first accepted.
+- **R2's "same port"** is the same listen port, upstream and lock directory.
+- **R8** does not assert an exit code: after a graceful stop uvicorn re-raises the `SIGTERM`
+  it caught. On Windows `Popen.terminate()` is `TerminateProcess`, so R8 there checks the file
+  after a hard stop.
+- **The S0a placeholder's tests** go: `test_package.py` now checks that
+  `python -m seriatim_node` reaches `main()` (an invalid `SLOTS` exits 2), and simulates the
+  missing module for `__main__`'s own fallback.
 
 ### 8.6 `tests/behaviour/test_sidecar.py` (black-box, PPE)
 

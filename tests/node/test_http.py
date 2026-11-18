@@ -56,7 +56,6 @@ from seriatim_node.app import (
     NoCookies,
     RequestLog,
     create_app,
-    main,
     new_health_client,
     request_id_from,
 )
@@ -281,11 +280,6 @@ def test_non_finite_extra_is_refused():
         FACTORY.response(
             ErrorCode.GPU_BUSY, "m", gate_value="ungated", request_id="r", busy_for_s=float("nan")
         )
-
-
-def test_main_is_a_placeholder_until_s1_12(capsys):
-    assert main() == 2
-    assert "not implemented until slice 1" in capsys.readouterr().err
 
 
 def test_node_id_comes_from_the_factory():
