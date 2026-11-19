@@ -1,0 +1,3 @@
+# The build backend node/pyproject.toml's [build-system] requires. Compile it to
+# build-constraints.txt with the command in that file's header (SPEC REQ-68; #68).
+hatchling==1.33.0

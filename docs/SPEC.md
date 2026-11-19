@@ -1704,6 +1704,14 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
     are the tag's version: `X.Y.Z`, or the PEP 440 form `X.Y.ZrcN` for an rc. Nothing is
     rewritten at build time.
   - **What it builds:** the sdist and wheels, and from S10 the gateway container image.
+  - **The build backend is hash-pinned.** `uv build` runs with `--build-constraints
+    node/build-constraints.txt --require-hashes`, so the build backend and each of its
+    dependencies is installed only from a file whose SHA-256 that committed file lists. The
+    file is compiled from `node/build-constraints.in` by `uv pip compile --generate-hashes`,
+    with the exact command recorded in its header. Before building, the build job checks
+    that the file pins every `[build-system]` requirement in `node/pyproject.toml` at its
+    exact version (`tools/ci/release_checks.py build-constraints`), so a backend bump without
+    a recompiled file fails. CI runs the same check and the same build on every pull request.
   - **What it publishes:** a GitHub Release with a SHA-256 checksum for every asset, and a
     build-provenance attestation (`actions/attest-build-provenance`) for each. The image
     goes to GHCR, and deployers refer to it **by digest**, never by tag.
