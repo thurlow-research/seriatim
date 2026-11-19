@@ -447,12 +447,16 @@ class RawUpstream:
     it. `requests` keeps what `read_request` returned for each connection, and `closed` is
     set once a handler has seen the peer close (through `wait_closed`)."""
 
-    def __init__(self, handler: Callable[[RawUpstream, socket.socket], None]) -> None:
+    def __init__(
+        self, handler: Callable[[RawUpstream, socket.socket], None], *, rcvbuf: int | None = None
+    ) -> None:
         self.handler = handler
         self.requests: list[bytes] = []
         self.accepted = 0
         self._stop = threading.Event()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if rcvbuf is not None:  # set before listen(), so every accepted socket inherits it
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
         self._sock.bind((LOOPBACK, 0))
         self._sock.listen(16)
         self._sock.settimeout(0.05)

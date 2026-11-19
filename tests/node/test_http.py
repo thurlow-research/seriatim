@@ -3031,7 +3031,9 @@ def test_e16_client_construction_fails_after_admission(
 
 
 UNGATED_SLOTS = 16  # the shared client's max_connections (TD §2.4)
-POOL_WAIT_S = 0.5  # connect_timeout_s, which is also the shared pool's timeout
+# connect_timeout_s, which is also the shared pool's timeout. A loopback connect on a slow
+# Windows runner can take a good part of a second, so this leaves room for each connect.
+POOL_WAIT_S = 1.0
 
 
 def _saturated(fake_ollama, sidecar):
@@ -3044,8 +3046,14 @@ def _saturated(fake_ollama, sidecar):
     gate, _ = ready_gate()
     car = sidecar(fake_ollama.url, gate=gate, connect_timeout_s=POOL_WAIT_S)
     show = lambda: httpx.post(car.url + "/api/show", content=b"{}", timeout=WAIT_S)  # noqa: E731
-    held = [_in_background(show) for _ in range(UNGATED_SLOTS)]
-    hold.wait_entered(UNGATED_SLOTS)
+    held: list[concurrent.futures.Future] = []
+    for i in range(UNGATED_SLOTS):  # one at a time, so no burst of connects is ever needed
+        held.append(_in_background(show))
+        try:
+            hold.wait_entered(i + 1)
+        except AssertionError as exc:  # say what the requests that already ended got
+            early = [f.exception() or f.result().status_code for f in held if f.done()]
+            raise AssertionError(f"request {i + 1} never reached the fake; ended: {early}") from exc
     started = time.perf_counter()
     resp = show()
     return car, resp, time.perf_counter() - started, hold, held

@@ -634,6 +634,24 @@ def test_f5_ollama_crashes_before_the_headers(raw_upstream, sidecar, envelope_va
 
 CHAT_ROUTE = classify("POST", b"/api/chat")
 BIG = 32 * 1024 * 1024  # S11, S14, F2: far more than every socket buffer on the path holds
+# On the Windows runner, loopback buffers that are left to the OS absorbed a whole 32 MiB
+# write to a peer that read nothing. So a test that needs the upstream write to block sets
+# both ends small: the sidecar's send buffer and the fake's receive buffer.
+SMALL_BUFFER = 4096
+
+
+def _small_send_buffers(monkeypatch) -> None:
+    """Every upstream client the proxy builds gets a 4 KiB send buffer: the real client, with
+    its transport rebuilt with the same limits and that socket option."""
+    real = proxy_module.new_client
+
+    def new_client(settings, *, limits, timeout):
+        client = real(settings, limits=limits, timeout=timeout)
+        option = (socket.SOL_SOCKET, socket.SO_SNDBUF, SMALL_BUFFER)
+        client._transport = httpx.AsyncHTTPTransport(limits=limits, socket_options=[option])
+        return client
+
+    monkeypatch.setattr(proxy_module, "new_client", new_client)
 
 
 def _chat_scope(body_len: int = 2) -> dict:
@@ -816,7 +834,7 @@ def _s11_body_read(fake_ollama, raw_upstream):
 
 def _s11_upstream_write(fake_ollama, raw_upstream):
     upstream = _StopsReading()
-    url = raw_upstream(upstream).url
+    url = raw_upstream(upstream, rcvbuf=SMALL_BUFFER).url
     ready = lambda sent: upstream.head.is_set()  # noqa: E731
     return url, _chat_scope(BIG), _body_once(b"x" * BIG), ready, upstream
 
@@ -850,6 +868,7 @@ def test_s11_an_external_cancellation_in_each_phase(
     phase, slot, fake_ollama, raw_upstream, monkeypatch, capsys
 ):
     url, scope, receive, ready, upstream = phase(fake_ollama, raw_upstream)
+    _small_send_buffers(monkeypatch)
     gate, _ = ready_gate()
     ends = _record_ends(monkeypatch)
     made: list[httpx.AsyncClient] = []
@@ -1176,10 +1195,13 @@ def test_s16_a_disconnect_at_the_moment_upstream_completes(
 
 
 @pytest.mark.td("F2")
-def test_f2_a_disconnect_during_a_blocked_upstream_write(raw_upstream, sidecar, capsys):
+def test_f2_a_disconnect_during_a_blocked_upstream_write(
+    raw_upstream, sidecar, monkeypatch, capsys
+):
     upstream = _StopsReading()
+    _small_send_buffers(monkeypatch)
     gate, _ = ready_gate()
-    car = sidecar(raw_upstream(upstream).url, gate=gate)
+    car = sidecar(raw_upstream(upstream, rcvbuf=SMALL_BUFFER).url, gate=gate)
     with raw_connect(car.port) as sock:
         sock.sendall(_request(b"/api/chat", b"x" * BIG))
         assert upstream.head.wait(WAIT_S)  # the sidecar read the body and is writing it
