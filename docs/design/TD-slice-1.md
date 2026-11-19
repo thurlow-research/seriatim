@@ -407,6 +407,61 @@ lines 3 and 4 and step 1, §5).
   `app.py` to S1-8's files. The other invalid framings of H28 are refused by h11, and uvicorn
   answers those with its own `text/plain` 400 and a close.
 
+**Details fixed by the code (S1-9).** S1-9 implements the framing rule of §3.3 step 5 and
+the errors after the headers of §4 and §5.
+- **The framing rule** is `upstream_framed(method, status, headers, received)`, with the
+  bodyless rule (`bodyless(method, status)`: `HEAD`, 1xx, 204, 304) checked first.
+  - A response with `Transfer-Encoding` counts as framed. h11 accepts only `chunked` there,
+    and raises `RemoteProtocolError` itself when the terminating chunk never comes or a
+    chunk-size line is malformed (S20), so an iterator that ended normally saw the end.
+  - A `content-length` must equal the bytes `aiter_raw()` yielded. h11 already raises on a
+    short body (H13), so this comparison is defence in depth.
+  - A close-delimited response raises `Unframed`, a subclass of `httpx.RemoteProtocolError`.
+    It therefore takes the same path as any transport error after the headers: a record if
+    the framing allows one, an abort, a drain, and log `outcome: upstream_error`.
+- **Which failures get a record.** The hold limit gives `LOCK_HOLD_EXCEEDED`, and any
+  `httpx.TransportError` (including `Unframed` and an ungated read timeout) gives
+  `UPSTREAM_STREAM_BROKEN`. The messages are "the request exceeded the hold limit" and
+  "Ollama's response stream broke". An internal error or an external cancellation after the
+  headers aborts with no record, because the contract's `StreamErrorRecord` allows only
+  those two codes. A disconnect sends nothing.
+- **`record_framing`.** The media type is compared after trimming and in lower case, and so
+  is `content-encoding` against `identity`. Any `content-length` at all refuses a record. The
+  NDJSON boundary is a final `\n`, and the SSE boundary is a final `\n\n`, so an SSE stream
+  that uses `\r\n` gets no record. Ollama sends `\n`.
+- **When the record is sent.** It goes in step (c), after the close proof and the end of the
+  lease, as one `http.response.body` with `more_body=True`. The proxy then returns without
+  the final message.
+- **The traceback of an internal error** (E5) goes in the request's own log line, as a
+  `traceback` field (`traceback.format_exception`, with no local values), so there is still
+  exactly one line per request (L2). The client gets only the generic `internal error`.
+- **The `raw_upstream` fixture** (§7) is `RawUpstream` in `harness.py`: a blocking socket
+  server that runs `handler(fake, conn)` for each connection on its own thread, with
+  `read_request` and `wait_closed` helpers. It is not an `asyncio.start_server`: a thread is
+  simpler, and works the same on every OS. A fake Ollama reset is `reset_after(headers,
+  *chunks)`, which returns without finishing the response.
+- **F1's error.** When the fake closes at once, the sidecar sees `RemoteProtocolError`,
+  `ReadError` or `WriteError`, depending on the OS and on timing. Each one is a
+  `TransportError` that is not in `_NOT_SENT`, so each gives 502 `UPSTREAM_PROTOCOL_ERROR`
+  and a drain.
+- **S7's ordering.** The test wraps `Lease.finish` and blocks the sidecar's event loop in it
+  until the fake has seen the disconnect. The fake can see it then only if the sidecar had
+  already closed the socket, so "the disconnect came before `DRAINING`" is proven, not
+  timed.
+- **S9 and S19 run in process.** They call the proxy directly, with httpx's `MockTransport`,
+  so the chunk boundaries are exact (a socket may merge one-byte chunks), and so the
+  disconnect and the deadline share one event loop's clock. S9 pins each order rather than
+  sampling the race: with `max_hold_s=0.4`, a disconnect 150 ms before the deadline must
+  log `client_disconnect` with nothing sent after it; one 150 ms after must log
+  `hold_exceeded` with exactly one write (the record) and nothing after it; and in a third
+  case the deadline wins and that one write fails, which must be caught, still log
+  `hold_exceeded` and write nothing more. Every case drains the slot exactly once. The
+  margin keeps each order fixed on a slow runner; no case sits on the race itself.
+- **S21's `HEAD /`** is an ungated route, so its case checks the log line (`ok`). The
+  gated cases are the 204 and the 304, which the raw fake sends with no length and no
+  chunking, and with the connection left open. Without the bodyless rule, each would look
+  close-delimited and drain.
+
 ### 2.4 `app.py`
 
 ```python

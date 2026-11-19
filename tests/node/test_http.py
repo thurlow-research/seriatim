@@ -4,7 +4,8 @@ S1-1: the error table against the contract (K-OAS3). S1-3: the contract against 
 (K-OAS1). S1-5: the dispatcher and health over real sockets (H12, H22, H23, E2, HL1-HL7,
 HL9), with the harness in `harness.py`. S1-6: the proxy core over real sockets (H1, H2,
 H4-H8, H25, B1-B5, E1). S1-7: the header rules (H3, H9, H11, H15-H18, H20, H21, H24).
-S1-8: the request limits (E3, E4, E7-E11, B6, B7, H28, H29).
+S1-8: the request limits (E3, E4, E7-E11, B6, B7, H28, H29). S1-9: the framing rule, the
+in-stream record and internal errors (H13, E5, E15).
 """
 
 from __future__ import annotations
@@ -1339,7 +1340,8 @@ def _run_proxy(
 
 def _ok(request):
     # A stream body: MockTransport treats `content=` as already read, so aiter_raw would fail.
-    return httpx.Response(200, stream=_Stream([b'{"done":true}']))
+    # The `content-length` frames it: a close-delimited response is broken (S1-9).
+    return httpx.Response(200, headers={"content-length": "13"}, stream=_Stream([b'{"done":true}']))
 
 
 def _one_line(capsys) -> dict:
@@ -1785,7 +1787,7 @@ def test_create_app_uses_an_injected_shared_client():
 
     def handler(request):
         seen.append(request.url.raw_path)
-        return httpx.Response(200, stream=_Stream([b"{}"]))
+        return httpx.Response(200, headers={"content-length": "2"}, stream=_Stream([b"{}"]))
 
     shared = httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:1"
@@ -2750,3 +2752,224 @@ def test_h29_a_bodyless_refusal_keeps_the_connection(fake_ollama, sidecar):
         assert not _follow_up_is_clean(sock, fake_ollama)  # answered on the same socket
     hold.release()
     assert held.result(WAIT_S).status_code == 200
+
+
+# --- S1-9: the end of the response, the in-stream record and internal errors -----------------
+
+
+@pytest.mark.parametrize(
+    ("method", "status_", "headers", "received", "framed"),
+    [
+        ("HEAD", 200, {"content-length": "1234"}, 0, True),  # the bodyless rule comes first
+        ("GET", 100, {}, 0, True),
+        ("GET", 199, {}, 0, True),
+        ("GET", 204, {}, 0, True),
+        ("GET", 304, {}, 0, True),
+        ("GET", 200, {}, 0, False),  # close-delimited
+        ("GET", 99, {}, 0, False),
+        ("GET", 200, {}, 5, False),
+        ("GET", 205, {}, 0, False),
+        ("GET", 303, {}, 0, False),
+        ("GET", 200, {"transfer-encoding": "chunked"}, 7, True),
+        ("GET", 200, {"content-length": "5"}, 5, True),
+        ("GET", 200, {"content-length": "5"}, 4, False),
+        ("GET", 200, {"content-length": "5"}, 6, False),
+        ("POST", 200, {"content-length": "0"}, 0, True),
+    ],
+)  # fmt: skip
+def test_upstream_framed(method, status_, headers, received, framed):
+    assert proxy_module.upstream_framed(method, status_, httpx.Headers(headers), received) is framed
+
+
+@pytest.mark.parametrize(
+    ("headers", "tail", "framing"),
+    [
+        ({"content-type": "application/x-ndjson"}, b"", "ndjson"),
+        ({"content-type": "application/x-ndjson"}, b"}\n", "ndjson"),
+        ({"content-type": "application/x-ndjson"}, b"\n\n", "ndjson"),
+        ({"content-type": "application/x-ndjson"}, b"\n}", None),
+        ({"content-type": " Application/X-NDJSON ; charset=utf-8"}, b"\n", "ndjson"),
+        ({"content-type": "text/event-stream"}, b"\n\n", "sse"),
+        ({"content-type": "text/event-stream; charset=utf-8"}, b"", "sse"),
+        ({"content-type": "text/event-stream"}, b"x\n", None),
+        ({"content-type": "text/event-stream"}, b"\n", None),
+        ({"content-type": "application/json"}, b"\n", None),
+        ({}, b"", None),
+        ({"content-type": "application/x-ndjson", "content-length": "9"}, b"\n", None),
+        ({"content-type": "application/x-ndjson", "content-encoding": "gzip"}, b"\n", None),
+        ({"content-type": "application/x-ndjson", "content-encoding": " Identity "}, b"\n",
+         "ndjson"),
+    ],
+)  # fmt: skip
+def test_record_framing(headers, tail, framing):
+    assert proxy_module.record_framing(httpx.Headers(headers), tail) == framing
+
+
+def test_stream_error_record_exactly():
+    record = proxy_module.stream_error_record
+    assert record("ndjson", "UPSTREAM_STREAM_BROKEN", 'a "b"') == (
+        b'{"error":"a \\"b\\"","error_code":"UPSTREAM_STREAM_BROKEN"}\n'
+    )
+    assert record("sse", "LOCK_HOLD_EXCEEDED", "x") == (
+        b'data: {"error":"x","error_code":"LOCK_HOLD_EXCEEDED"}\n\n'
+    )
+
+
+def _close_delimited(fake, conn):
+    fake.read(conn)
+    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"done":true}')
+
+
+def _cut_at_50(fake, conn):
+    fake.read(conn)
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + b"x" * 50)
+
+
+@pytest.mark.td("H13")
+@pytest.mark.parametrize(
+    ("handler", "sent"), [(_close_delimited, b'{"done":true}'), (_cut_at_50, b"x" * 50)],
+    ids=["close-delimited", "content-length-cut-short"],
+)  # fmt: skip
+def test_h13_an_unframed_or_cut_short_response_is_broken(
+    handler, sent, raw_upstream, sidecar, capsys
+):
+    upstream = raw_upstream(handler)
+    gate, _ = ready_gate()
+    car = sidecar(upstream.url, gate=gate)
+    got = b""
+    headers = {"X-Forwarded-For": "192.0.2.1", "Forwarded": "for=192.0.2.1"}
+    with httpx.stream(
+        "POST", car.url + "/api/chat", content=CHAT, headers=headers, timeout=WAIT_S
+    ) as resp:
+        with pytest.raises(httpx.RemoteProtocolError):  # aborted, never a clean end
+            for chunk in resp.iter_raw():
+                got += chunk
+    assert (resp.status_code, got) == (200, sent)  # no record: the framing forbids one
+    wait_for(lambda: _slot_states(gate) == ["draining"])
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["slot_end"]) == ("upstream_error", "draining")
+    (request,) = upstream.requests
+    names = [h.split(b":")[0].lower() for h in request.split(b"\r\n\r\n")[0].split(b"\r\n")[1:]]
+    assert b"x-forwarded-for" not in names and b"forwarded" not in names
+
+
+@pytest.mark.td("E5")
+def test_e5_an_unexpected_exception_is_a_generic_500(
+    fake_ollama, sidecar, envelope_validator, capsys, monkeypatch
+):
+    def broken(*args, **kwargs):
+        raise RuntimeError("e5-detail-only-in-the-log")
+
+    monkeypatch.setattr(proxy_module, "downstream_headers", broken)
+    fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _chat(car)
+    assert resp.status_code == 500
+    doc = _error_doc(resp.content, ErrorCode.INTERNAL, envelope_validator)
+    assert doc["error"] == "internal error"
+    assert b"e5-detail" not in resp.content and b"Traceback" not in resp.content
+    assert len(fake_ollama.requests) == 1
+    wait_for(lambda: _slot_states(gate) == ["draining"])  # the request reached upstream
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["level"], line["outcome"], line["slot_end"]) == (
+        "ERROR",
+        "internal_error",
+        "draining",
+    )
+    assert line["traceback"].startswith("Traceback (most recent call last):\n  File ")
+    assert '\n  File "' in line["traceback"].split("\n", 1)[1]  # the frames, line by line
+    assert line["traceback"].endswith("RuntimeError: e5-detail-only-in-the-log\n")
+
+
+@pytest.mark.td("E15")
+def test_e15_an_internal_error_before_anything_is_sent(
+    fake_ollama, sidecar, envelope_validator, capsys, monkeypatch
+):
+    def broken(*args, **kwargs):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(proxy_module, "upstream_headers", broken)
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _chat(car)
+    assert resp.status_code == 500
+    _error_doc(resp.content, ErrorCode.INTERNAL, envelope_validator)
+    assert resp.headers.get_list("x-seriatim-gate") == ["acquired"]
+    assert fake_ollama.requests == []
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["slot_end"]) == ("internal_error", "free")
+    assert all_free(gate)  # freed with no drain (the fake clock never moved)
+
+
+@pytest.mark.td("E15")
+def test_e15_an_internal_error_after_the_response_started(monkeypatch, capsys):
+    def handler(request):
+        headers = {"content-type": "application/x-ndjson"}  # a record would be allowed
+        return httpx.Response(200, headers=headers, stream=_Stream([b"a\n"], then=KeyError("x")))
+
+    sent, gate, _ = _run_proxy(handler, monkeypatch=monkeypatch)
+    assert [m["type"] for m in sent].count("http.response.start") == 1
+    assert [(m["type"], m.get("more_body")) for m in sent] == [
+        ("http.response.start", None),
+        ("http.response.body", True),  # Ollama's line, then an abort: no record, no end
+    ]
+    assert _slot_states(gate) == ["draining"]
+    line = _one_line(capsys)
+    assert (line["level"], line["outcome"], line["status"]) == ("ERROR", "internal_error", 200)
+    assert "KeyError: 'x'" in line["traceback"]
+
+
+def test_a_close_delimited_ndjson_stream_ends_with_a_record(monkeypatch, capsys):
+    """A close-delimited response is broken even when it ends cleanly, so a record follows."""
+
+    def handler(request):
+        headers = {"content-type": "application/x-ndjson"}
+        return httpx.Response(200, headers=headers, stream=_Stream([b"a\n"]))
+
+    sent, gate, _ = _run_proxy(handler, monkeypatch=monkeypatch)
+    assert [m.get("more_body") for m in sent] == [None, True, True]
+    assert json.loads(sent[2]["body"])["error_code"] == "UPSTREAM_STREAM_BROKEN"
+    assert _slot_states(gate) == ["draining"]
+    line = _one_line(capsys)
+    assert (line["outcome"], line["slot_end"]) == ("upstream_error", "draining")
+    assert "traceback" not in line
+
+
+def test_a_length_counts_every_chunk(monkeypatch, capsys):
+    """`content-length` is compared with the bytes of all the chunks, not of the last one."""
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-length": "4"}, stream=_Stream([b"ab", b"cd"]))
+
+    sent, gate, _ = _run_proxy(handler, monkeypatch=monkeypatch)
+    assert [m.get("more_body") for m in sent] == [None, True, True, False]  # a clean end
+    assert all_free(gate)
+    assert _one_line(capsys)["outcome"] == "ok"
+
+
+def test_a_cancellation_after_the_headers_never_ends_the_response(monkeypatch, capsys):
+    def handler(request):
+        headers = {"content-type": "application/x-ndjson"}
+        return httpx.Response(200, headers=headers, stream=_Stream([b"a\n"], then="stall"))
+
+    sent, gate, _ = _run_proxy(handler, monkeypatch=monkeypatch, cancel_after=0.2)
+    assert [m.get("more_body") for m in sent] == [None, True]  # no record and no final message
+    assert _slot_states(gate) == ["draining"]
+    assert _one_line(capsys)["outcome"] == "cancelled"
+
+
+def test_the_hold_limit_record_mid_stream(monkeypatch, capsys):
+    gate, _ = ready_gate(max_hold_s=0.2)
+    sse = {"content-type": "text/event-stream"}
+
+    def handler(request):
+        return httpx.Response(200, headers=sse, stream=_Stream([b"data: a\n\n"], then="stall"))
+
+    sent, _, _ = _run_proxy(handler, gate=gate, monkeypatch=monkeypatch)
+    assert [m.get("more_body") for m in sent] == [None, True, True]
+    assert sent[2]["body"] == (
+        b'data: {"error":"the request exceeded the hold limit",'
+        b'"error_code":"LOCK_HOLD_EXCEEDED"}\n\n'
+    )
+    assert _one_line(capsys)["outcome"] == "hold_exceeded"

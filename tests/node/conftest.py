@@ -6,7 +6,14 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-from harness import FakeOllama, Sidecar, SidecarProcess, start_process, start_sidecar
+from harness import (
+    FakeOllama,
+    RawUpstream,
+    Sidecar,
+    SidecarProcess,
+    start_process,
+    start_sidecar,
+)
 
 
 @pytest.fixture
@@ -15,6 +22,20 @@ def fake_ollama() -> Iterator[FakeOllama]:
     fake = FakeOllama().start()
     yield fake
     fake.stop()
+
+
+@pytest.fixture
+def raw_upstream() -> Iterator[Callable[..., RawUpstream]]:
+    """`raw_upstream(handler)` starts a socket fake (TD §7); every one stops at teardown."""
+    started: list[RawUpstream] = []
+
+    def start(handler) -> RawUpstream:
+        started.append(RawUpstream(handler).start())
+        return started[-1]
+
+    yield start
+    for fake in started:
+        fake.stop()
 
 
 @pytest.fixture

@@ -3,6 +3,7 @@
 - `FakeOllama`: a real uvicorn server on 127.0.0.1 running a small ASGI app that each test
   scripts per route. Every request is recorded with its raw method, path, query, headers and
   body.
+- `RawUpstream`: a plain socket server for the faults an ASGI app can't produce.
 - `start_sidecar`: runs `create_app(settings)` under a real uvicorn server (h11) on
   127.0.0.1, with `ollama_url` pointing at the fake (or at a port nothing listens on).
 - `start_process`: runs `python -m seriatim_node` as a subprocess (`test_process.py`).
@@ -389,6 +390,108 @@ class FakeOllama:
         self.release.set()
         if self.server is not None:
             self.server.stop()
+
+
+def reset_after(headers: list[tuple[bytes, bytes]], *chunks: bytes) -> Behaviour:
+    """Send a 200 with these headers and chunks, then return without finishing: uvicorn
+    closes the connection, so the sidecar sees the stream break (an upstream reset). With no
+    `content-length`, uvicorn chunks the body and never sends the terminating chunk."""
+
+    async def run(send, fake, receive=None):
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        for chunk in chunks:
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+
+    return run
+
+
+# --- raw_upstream ---------------------------------------------------------------------------
+
+
+def read_request(conn: socket.socket) -> bytes:
+    """Read one request with a `Content-Length` body (the sidecar always sends one for a
+    buffered body), and return it as received."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = conn.recv(65536)
+        if not chunk:
+            return buf
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value)
+    while len(body) < length:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+    return head + b"\r\n\r\n" + body
+
+
+def wait_closed(conn: socket.socket) -> None:
+    """Block until the peer closes the connection (or STALL_LIMIT_S passes)."""
+    try:
+        while conn.recv(65536):
+            pass
+    except OSError:
+        pass
+
+
+class RawUpstream:
+    """TD §7 `raw_upstream`: a plain socket server, for faults an ASGI app can't produce (a
+    close at once, a malformed status line, broken chunking, a close-delimited body). Each
+    connection runs `handler(conn)` in its own thread; the harness closes the socket after
+    it. `requests` keeps what `read_request` returned for each connection, and `closed` is
+    set once a handler has seen the peer close (through `wait_closed`)."""
+
+    def __init__(self, handler: Callable[[RawUpstream, socket.socket], None]) -> None:
+        self.handler = handler
+        self.requests: list[bytes] = []
+        self.accepted = 0
+        self._stop = threading.Event()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.bind((LOOPBACK, 0))
+        self._sock.listen(16)
+        self._sock.settimeout(0.05)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://{LOOPBACK}:{self._sock.getsockname()[1]}"
+
+    def read(self, conn: socket.socket) -> bytes:
+        request = read_request(conn)
+        self.requests.append(request)
+        return request
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except (TimeoutError, OSError):
+                continue
+            self.accepted += 1
+            threading.Thread(target=self._run, args=(conn,), daemon=True).start()
+
+    def _run(self, conn: socket.socket) -> None:
+        conn.settimeout(STALL_LIMIT_S)
+        with conn:
+            try:
+                self.handler(self, conn)
+            except OSError:
+                pass
+
+    def start(self) -> RawUpstream:
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(10)
+        self._sock.close()
 
 
 # --- the gate and the sidecar ---------------------------------------------------------------
