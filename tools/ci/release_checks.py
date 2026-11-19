@@ -4,6 +4,7 @@
     release_checks.py tag    --ref <github.ref> [--github-output <file>]
     release_checks.py source --ref <github.ref> --sha <github.sha> --main-ref <ref> --init <path>
     release_checks.py dist   --ref <github.ref> --sums <file> <dist dir>
+    release_checks.py build-constraints --pyproject <pyproject.toml> --constraints <file>
 
 Every check fails closed: anything it can't confirm is a failure.
 
@@ -15,6 +16,10 @@ Every check fails closed: anything it can't confirm is a failure.
   is rewritten at build time (#10, answer 8(a)).
 - dist: the build produced exactly one wheel and one sdist of seriatim-node, both carrying the
   tag's version in their names and their metadata. It then writes SHA256SUMS for them.
+- build-constraints: every [build-system] requirement in pyproject.toml is an exact pin
+  name==version, and the constraints file pins that same version with at least one sha256
+  hash, as does every other entry in it. `uv build --build-constraints <file> --require-hashes`
+  then installs only those files (#68). A backend bump without a recompiled file fails here.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import tomllib
 import zipfile
 from dataclasses import dataclass
 from email.parser import HeaderParser
@@ -40,6 +46,11 @@ UV_GITIGNORE = ".gitignore"
 NUM = r"(?:0|[1-9][0-9]*)"
 TAG_RE = re.compile(rf"v(?P<core>{NUM}\.{NUM}\.{NUM})(?:-rc\.(?P<rc>[1-9][0-9]*))?")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
+# An exact pin, `name==version` (matched whole, so no ranges, extras or markers).
+PIN_RE = re.compile(
+    r"(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*==\s*(?P<ver>[^\s;=]+)"
+)
+HASH_RE = re.compile(r"--hash=sha256:(?P<hex>[0-9a-f]{64})(?=\s|$)")
 
 
 class CheckFailed(Exception):
@@ -189,6 +200,71 @@ def sha256sums(paths: list[Path]) -> str:
     return "".join(lines)
 
 
+def normalize(name: str) -> str:
+    """The PEP 503 normalized form of a distribution name."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def build_requires(pyproject: Path) -> dict[str, str]:
+    """{normalized name: version} for [build-system] requires; each must be an exact pin."""
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CheckFailed(f"cannot read {pyproject}: {exc}") from exc
+    requires = data.get("build-system", {}).get("requires")
+    if not isinstance(requires, list) or not requires:
+        raise CheckFailed(f"{pyproject}: [build-system] requires is missing or empty")
+    pins: dict[str, str] = {}
+    for req in requires:
+        m = PIN_RE.fullmatch(req.strip()) if isinstance(req, str) else None
+        if m is None:
+            raise CheckFailed(f"{pyproject}: build requirement {req!r} is not name==version")
+        pins[normalize(m.group("name"))] = m.group("ver")
+    return pins
+
+
+def constraint_pins(path: Path) -> dict[str, tuple[str, list[str]]]:
+    """{normalized name: (version, sha256 hashes)} for each entry in a hashed constraints file."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        raise CheckFailed(f"cannot read {path}: {exc}") from exc
+    entries: dict[str, tuple[str, list[str]]] = {}
+    for logical in text.replace("\\\n", " ").splitlines():
+        line = logical.split(" #", 1)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        spec, _, rest = line.partition(" --hash=")
+        spec = spec.split(";", 1)[0].strip()
+        m = PIN_RE.fullmatch(spec)
+        if m is None:
+            raise CheckFailed(f"{path}: {line!r} is not an exact name==version pin")
+        rest = "--hash=" + rest if rest else ""
+        hashes = [h.group("hex") for h in HASH_RE.finditer(rest)]
+        if not hashes or HASH_RE.sub("", rest).strip():
+            raise CheckFailed(f"{path}: {spec} has no sha256 hash, or a malformed one")
+        name = normalize(m.group("name"))
+        if name in entries:
+            raise CheckFailed(f"{path}: {name} is listed twice")
+        entries[name] = (m.group("ver"), hashes)
+    return entries
+
+
+def check_build_constraints(pyproject: Path, constraints: Path) -> dict[str, str]:
+    """The build requirements, after checking that the constraints file pins each by hash."""
+    wanted = build_requires(pyproject)
+    pinned = constraint_pins(constraints)
+    for name, version in wanted.items():
+        if name not in pinned:
+            raise CheckFailed(f"{constraints} does not pin {name}, which {pyproject} requires")
+        if pinned[name][0] != version:
+            raise CheckFailed(
+                f"{pyproject} requires {name}=={version} but {constraints} pins "
+                f"{name}=={pinned[name][0]}; recompile it with the command in its header"
+            )
+    return wanted
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -204,8 +280,16 @@ def main(argv: list[str] | None = None) -> int:
     p_dist.add_argument("--ref", required=True)
     p_dist.add_argument("--sums", required=True, type=Path)
     p_dist.add_argument("dist", type=Path)
+    p_bc = sub.add_parser("build-constraints")
+    p_bc.add_argument("--pyproject", required=True, type=Path)
+    p_bc.add_argument("--constraints", required=True, type=Path)
     args = ap.parse_args(argv)
     try:
+        if args.cmd == "build-constraints":
+            pins = check_build_constraints(args.pyproject, args.constraints)
+            reqs = ", ".join(f"{n}=={v}" for n, v in sorted(pins.items()))
+            print(f"release: {args.constraints} pins {reqs} by sha256")
+            return 0
         tag = parse_ref(args.ref)
         if args.cmd == "tag":
             outputs = (

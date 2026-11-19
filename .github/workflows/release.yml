@@ -51,7 +51,16 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
-      - run: uv build --package seriatim-node --no-sources --out-dir "$RUNNER_TEMP/dist"
+      # The build backend is installed only from files whose sha256 the committed constraints
+      # pin, at the version node/pyproject.toml's [build-system] asks for (#68).
+      - name: The build constraints pin node/pyproject.toml's build backend by hash
+        run: >-
+          python3 -I tools/ci/release_checks.py build-constraints
+          --pyproject node/pyproject.toml --constraints node/build-constraints.txt
+      - run: >-
+          uv build --package seriatim-node --no-sources
+          --build-constraints node/build-constraints.txt --require-hashes
+          --out-dir "$RUNNER_TEMP/dist"
       - name: The wheel and sdist carry the tag's version; write SHA256SUMS
         env:
           REF: ${{ github.ref }}
