@@ -4,6 +4,7 @@ S1-1: the error table against the contract (K-OAS3). S1-3: the contract against 
 (K-OAS1). S1-5: the dispatcher and health over real sockets (H12, H22, H23, E2, HL1-HL7,
 HL9), with the harness in `harness.py`. S1-6: the proxy core over real sockets (H1, H2,
 H4-H8, H25, B1-B5, E1). S1-7: the header rules (H3, H9, H11, H15-H18, H20, H21, H24).
+S1-8: the request limits (E3, E4, E7-E11, B6, B7, H28, H29).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import concurrent.futures
 import json
 import random
 import re
+import socket
 import threading
 import time
 from pathlib import Path
@@ -26,6 +28,7 @@ from harness import (
     WAIT_S,
     FakeOllama,
     Hold,
+    RawResponse,
     ThreadServer,
     abort_body,
     all_free,
@@ -1460,6 +1463,7 @@ def test_proxy_errors_before_the_headers(
 
     sent, gate, _ = _run_proxy(fail, monkeypatch=monkeypatch)
     assert sent[0]["status"] == ERROR_TABLE[code].status
+    assert b"connection" not in dict(sent[0]["headers"])  # the body was read: keep-alive is safe
     _error_doc(sent[1]["body"], code, envelope_validator)
     assert _slot_states(gate) == [slot]
     line = _one_line(capsys)
@@ -1614,7 +1618,7 @@ def test_read_body_joins_chunks_and_sees_a_disconnect():
         async def receive():
             return messages.pop(0)
 
-        return await proxy_module.read_body(receive)
+        return await proxy_module.read_body(receive, limit=3, timeout_s=WAIT_S)
 
     parts = [
         {"type": "http.request", "body": b"ab", "more_body": True},
@@ -2128,3 +2132,621 @@ def test_h24_the_body_is_opaque_bytes(body, fake_ollama, sidecar):
     (req,) = fake_ollama.requests
     assert req.body == body
     assert [v for k, v in req.headers if k == b"content-length"] == [str(len(body)).encode()]
+
+
+# --- S1-8: the request limits (TD §3.3 steps 3-4 and step 1, §5; SPEC REQ-20) ---------------
+
+LIMIT = 2048  # max_body_bytes in these tests; the setting's minimum is 1024
+TOO_LARGE = "the request body is too large"
+TOO_SLOW = "the request body did not arrive in time"
+
+
+def _framed(
+    body: bytes,
+    *,
+    chunked: bool = False,
+    method: bytes = b"POST",
+    path: bytes = b"/api/chat",
+) -> bytes:
+    """A request with `body` framed by an honest `Content-Length`, or chunked in 1000-byte
+    chunks with no length."""
+    head = b"%s %s HTTP/1.1\r\nHost: x\r\n" % (method, path)
+    if not chunked:
+        return head + b"Content-Length: %d\r\n\r\n%s" % (len(body), body)
+    parts = [body[i : i + 1000] for i in range(0, len(body), 1000)]
+    chunks = b"".join(b"%x\r\n%s\r\n" % (len(part), part) for part in parts)
+    return head + b"Transfer-Encoding: chunked\r\n\r\n" + chunks + b"0\r\n\r\n"
+
+
+def _count_acquires(gate) -> list:
+    """Record every `try_acquire` result, so a test can tell 'no slot taken' from 'freed'."""
+    results: list = []
+    original = gate.try_acquire
+
+    def counted(*args, **kwargs):
+        results.append(original(*args, **kwargs))
+        return results[-1]
+
+    gate.try_acquire = counted
+    return results
+
+
+def _send_and_read(car, data: bytes) -> RawResponse:
+    with raw_connect(car.port) as sock:
+        sock.sendall(data)
+        return read_response(sock)
+
+
+def _drip(sock: socket.socket, every_s: float, stop: threading.Event) -> concurrent.futures.Future:
+    """Send one body byte every `every_s` seconds until `stop` is set or the socket fails."""
+
+    def run() -> None:
+        while not stop.wait(every_s):
+            try:
+                sock.sendall(b" ")
+            except OSError:
+                return
+
+    return _in_background(run)
+
+
+def _refused(resp: RawResponse, status_: int, code: ErrorCode, message: str, gate: str, v) -> None:
+    """Every refusal checked here is sent before the request body was fully read, so it closes
+    the connection (TD §2.3, S1-8)."""
+    assert resp.status == status_
+    assert resp.header("connection") == ["close"]
+    doc = _error_doc(resp.body, code, v)
+    assert doc["error"] == message
+    assert (doc["retryable"], doc["replay_safe"]) == (
+        ERROR_TABLE[code].retryable,
+        ERROR_TABLE[code].replay_safe,
+    )
+    assert resp.header("x-seriatim-gate") == [gate]
+
+
+def test_has_body():
+    assert not proxy_module.has_body([(b"host", b"x")])
+    assert not proxy_module.has_body([(b"content-length", b"0")])
+    assert proxy_module.has_body([(b"content-length", b"1")])
+    assert proxy_module.has_body([(b"transfer-encoding", b"chunked")])
+
+
+def test_declared_length():
+    assert proxy_module.declared_length([(b"host", b"x")]) is None
+    assert proxy_module.declared_length([(b"host", b"x"), (b"content-length", b"0")]) == 0
+    assert proxy_module.declared_length([(b"content-length", b"2049")]) == 2049
+
+
+def test_read_body_limit_and_total_timeout():
+    async def read(messages, *, limit=4, timeout_s=WAIT_S):
+        async def receive():
+            if messages:
+                return messages.pop(0)
+            await anyio.sleep(30)
+
+        return await proxy_module.read_body(receive, limit=limit, timeout_s=timeout_s)
+
+    def part(body: bytes, more: bool = True) -> dict:
+        return {"type": "http.request", "body": body, "more_body": more}
+
+    assert anyio.run(read, [part(b"ab"), part(b"cd", False)]) == b"abcd"  # exactly the limit
+    assert anyio.run(read, [part(b"", False)]) == b""
+    with pytest.raises(proxy_module.BodyTooLarge):
+        anyio.run(read, [part(b"ab"), part(b"cde")])  # never waits for the rest
+    started = time.perf_counter()
+    with pytest.raises(proxy_module.BodyTimeout):
+        anyio.run(lambda: read([part(b"a")], timeout_s=0.2))
+    assert 0.2 * 0.9 <= time.perf_counter() - started < 0.2 + TIMING_BOUND_S
+
+
+@pytest.mark.td("E3")
+def test_e3_an_honest_length_over_the_limit_takes_no_slot(fake_ollama, sidecar, envelope_validator):
+    gate, _ = ready_gate()
+    acquires = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate, max_body_bytes=LIMIT)
+    resp = _send_and_read(car, _framed(b"x" * 4096))
+    _refused(resp, 413, ErrorCode.BODY_TOO_LARGE, TOO_LARGE, "ungated", envelope_validator)
+    assert acquires == [] and fake_ollama.requests == []
+
+
+@pytest.mark.td("E3")
+def test_e3_a_chunked_body_over_the_limit_frees_the_slot(
+    fake_ollama, sidecar, envelope_validator, capsys
+):
+    gate, _ = ready_gate()
+    acquires = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate, max_body_bytes=LIMIT)
+    resp = _send_and_read(car, _framed(b"x" * 4096, chunked=True))
+    _refused(resp, 413, ErrorCode.BODY_TOO_LARGE, TOO_LARGE, "acquired", envelope_validator)
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"], line["slot_end"]) == ("rejected", 413, "free")
+    assert len(acquires) == 1 and _slot_states(gate) == ["free"]  # freed with no drain
+    assert fake_ollama.requests == []
+
+
+@pytest.mark.td("E4")
+def test_e4_a_stalled_body_gets_408(fake_ollama, sidecar, envelope_validator, capsys):
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, body_timeout_s=0.5)
+    with raw_connect(car.port) as sock:
+        started = time.perf_counter()
+        sock.sendall(_framed(b"x" * 100)[:-50])  # the headers and half the body, then a stall
+        resp = read_response(sock)
+        elapsed = time.perf_counter() - started
+    _refused(resp, 408, ErrorCode.REQUEST_BODY_TIMEOUT, TOO_SLOW, "acquired", envelope_validator)
+    assert 0.5 * 0.9 <= elapsed < 0.5 + TIMING_BOUND_S
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"], line["slot_end"]) == ("rejected", 408, "free")
+    assert _slot_states(gate) == ["free"]
+    assert fake_ollama.requests == []
+
+
+@pytest.mark.td("E7")
+def test_e7_the_client_leaves_during_a_gated_body(fake_ollama, sidecar, capsys):
+    gate, _ = ready_gate()
+    acquires = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_framed(b"x" * 100)[:-50])
+        wait_for(lambda: len(acquires) == 1)  # admitted, and reading the body
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"], line["slot_end"]) == (
+        "client_disconnect",
+        None,
+        "free",
+    )
+    assert _slot_states(gate) == ["free"]  # no drain: nothing was sent
+    assert fake_ollama.requests == []
+
+
+@pytest.mark.td("E8")
+def test_e8_the_body_timeout_is_total(fake_ollama, sidecar, envelope_validator, capsys):
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, body_timeout_s=1)
+    stop = threading.Event()
+    with raw_connect(car.port) as sock:
+        started = time.perf_counter()
+        sock.sendall(_framed(b"x" * 100)[:-100])  # the headers only
+        dripping = _drip(sock, 0.3, stop)  # a byte every 0.3 s: never idle for 1 s
+        try:
+            resp = read_response(sock)
+            elapsed = time.perf_counter() - started
+        finally:
+            stop.set()
+            dripping.result(WAIT_S)
+    _refused(resp, 408, ErrorCode.REQUEST_BODY_TIMEOUT, TOO_SLOW, "acquired", envelope_validator)
+    assert 0.95 <= elapsed < 1 + TIMING_BOUND_S
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["slot_end"]) == ("rejected", "free")
+    assert _slot_states(gate) == ["free"]
+    assert fake_ollama.requests == []
+
+
+@pytest.mark.td("E9")
+def test_e9_the_hold_limit_during_a_gated_body(fake_ollama, sidecar, envelope_validator, capsys):
+    gate, _ = ready_gate(max_hold_s=1)  # the fake clock stands still: 1 s of real time
+    car = sidecar(fake_ollama.url, gate=gate, body_timeout_s=30)
+    stop = threading.Event()
+    with raw_connect(car.port) as sock:
+        started = time.perf_counter()
+        sock.sendall(_framed(b"x" * 100)[:-100])
+        dripping = _drip(sock, 0.2, stop)
+        try:
+            resp = read_response(sock)
+            elapsed = time.perf_counter() - started
+        finally:
+            stop.set()
+            dripping.result(WAIT_S)
+    _refused(
+        resp,
+        504,
+        ErrorCode.LOCK_HOLD_EXCEEDED,
+        "the request exceeded the hold limit",
+        "acquired",
+        envelope_validator,
+    )
+    assert elapsed < 1 + TIMING_BOUND_S
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["level"], line["outcome"], line["slot_end"]) == (
+        "CRITICAL",
+        "hold_exceeded",
+        "free",
+    )
+    assert _slot_states(gate) == ["free"]  # freed with no drain: nothing was sent
+    assert fake_ollama.requests == []
+
+
+@pytest.mark.td("E10")
+@pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
+@pytest.mark.parametrize("size", [0, LIMIT])
+def test_e10_empty_and_at_the_limit_are_forwarded(size, chunked, fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, max_body_bytes=LIMIT)
+    body = random.Random(size).randbytes(size)
+    resp = _send_and_read(car, _framed(body, chunked=chunked))
+    assert (resp.status, resp.body) == (200, b'{"done":true}')
+    (req,) = fake_ollama.requests
+    assert req.body == body
+    assert [v for k, v in req.headers if k == b"content-length"] == [str(size).encode()]
+
+
+@pytest.mark.td("E10")
+@pytest.mark.parametrize(
+    ("chunked", "gate_value", "acquired"),
+    [(False, "ungated", 0), (True, "acquired", 1)],
+    ids=["content-length", "chunked"],
+)
+def test_e10_one_byte_over_the_limit_is_413(
+    chunked, gate_value, acquired, fake_ollama, sidecar, envelope_validator, capsys
+):
+    gate, _ = ready_gate()
+    acquires = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate, max_body_bytes=LIMIT)
+    resp = _send_and_read(car, _framed(b"x" * (LIMIT + 1), chunked=chunked))
+    _refused(resp, 413, ErrorCode.BODY_TOO_LARGE, TOO_LARGE, gate_value, envelope_validator)
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"]) == ("rejected", 413)
+    assert line["slot_end"] == ("free" if acquired else "none")
+    assert len(acquires) == acquired and all_free(gate)
+    assert fake_ollama.requests == []
+
+
+UNGATED_BUFFERED = [(b"POST", b"/api/show"), (b"POST", b"/api/pull"), (b"DELETE", b"/api/delete")]
+
+
+@pytest.mark.td("E11")
+@pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
+@pytest.mark.parametrize(("method", "path"), UNGATED_BUFFERED)
+def test_e11_ungated_routes_enforce_the_size_limit(
+    method, path, chunked, fake_ollama, sidecar, envelope_validator, capsys
+):
+    gate, _ = ready_gate()
+    acquires = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate, max_body_bytes=LIMIT)
+    resp = _send_and_read(car, _framed(b"x" * 4096, chunked=chunked, method=method, path=path))
+    _refused(resp, 413, ErrorCode.BODY_TOO_LARGE, TOO_LARGE, "ungated", envelope_validator)
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["kind"], line["outcome"], line["slot_end"]) == ("ungated", "rejected", "none")
+    assert acquires == [] and fake_ollama.requests == []
+
+
+@pytest.mark.td("E11")
+@pytest.mark.parametrize(("method", "path"), UNGATED_BUFFERED)
+def test_e11_ungated_routes_enforce_the_body_timeout(
+    method, path, fake_ollama, sidecar, envelope_validator
+):
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, body_timeout_s=0.5)
+    resp = _send_and_read(car, _framed(b"x" * 100, method=method, path=path)[:-50])
+    _refused(resp, 408, ErrorCode.REQUEST_BODY_TIMEOUT, TOO_SLOW, "ungated", envelope_validator)
+    assert fake_ollama.requests == []
+
+
+def _head(sock: socket.socket) -> bytes:
+    """Read up to the end of the first response head, and no further."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(1)
+        assert chunk, f"the connection closed before a response: {buf!r}"
+        buf += chunk
+    return buf
+
+
+EXPECT_10_MIB = (
+    b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Length: 10485760\r\n"
+    b"Expect: 100-continue\r\n\r\n"
+)
+
+
+@pytest.mark.td("B6")
+def test_b6_an_admitted_request_does_get_100_continue(fake_ollama, sidecar):
+    """The contrast that makes the refusals below meaningful: reading the body is what sends
+    `100 Continue`."""
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    with raw_connect(car.port) as sock:
+        sock.sendall(
+            b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n"
+            b"Expect: 100-continue\r\n\r\n"
+        )
+        assert _head(sock).startswith(b"HTTP/1.1 100 ")
+        sock.sendall(b"{}")
+        assert read_response(sock).status == 200
+
+
+@pytest.mark.td("B6")
+def test_b6_expect_100_continue_while_busy(fake_ollama, sidecar, envelope_validator):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    with raw_connect(car.port) as sock:
+        sock.sendall(EXPECT_10_MIB)
+        resp = read_response(sock)  # its first line: no `100 Continue` came before it
+    assert resp.status == 429
+    _error_doc(resp.body, ErrorCode.GPU_BUSY, envelope_validator)
+    assert resp.header("x-seriatim-gate") == ["busy"]
+    assert len(fake_ollama.requests) == 1
+    hold.release()
+    assert held.result(WAIT_S).status_code == 200
+
+
+@pytest.mark.td("B6")
+def test_b6_expect_100_continue_while_starting(fake_ollama, sidecar, envelope_validator):
+    car = sidecar(fake_ollama.url, drain_s=600)  # the lifespan's Gate starts in quarantine
+    with raw_connect(car.port) as sock:
+        sock.sendall(EXPECT_10_MIB)
+        resp = read_response(sock)
+    assert resp.status == 503
+    _error_doc(resp.body, ErrorCode.NODE_STARTING, envelope_validator)
+    assert resp.header("x-seriatim-gate") == ["refused"]
+    assert fake_ollama.requests == []
+
+
+def _over_the_limit_headers() -> bytes:
+    return b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % (LIMIT + 1)
+
+
+@pytest.mark.td("B7")
+def test_b7_413_comes_before_429(fake_ollama, sidecar, envelope_validator):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, max_body_bytes=LIMIT)
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    assert _slot_states(gate) == ["held"]
+    resp = _send_and_read(car, _over_the_limit_headers())
+    _refused(resp, 413, ErrorCode.BODY_TOO_LARGE, TOO_LARGE, "ungated", envelope_validator)
+    assert len(fake_ollama.requests) == 1
+    hold.release()
+    assert held.result(WAIT_S).status_code == 200
+
+
+@pytest.mark.td("B7")
+def test_b7_413_comes_before_503_starting(fake_ollama, sidecar, envelope_validator):
+    car = sidecar(fake_ollama.url, drain_s=600, max_body_bytes=LIMIT)
+    resp = _send_and_read(car, _over_the_limit_headers())
+    _refused(resp, 413, ErrorCode.BODY_TOO_LARGE, TOO_LARGE, "ungated", envelope_validator)
+    assert car.gate.starting()
+    assert fake_ollama.requests == []
+
+
+HIDDEN = b"GET /api/tags HTTP/1.1\r\nHost: x\r\n\r\n"  # a second request, smuggled after the first
+
+
+@pytest.mark.td("H28")
+@pytest.mark.parametrize(
+    "framing",
+    [
+        b"Content-Length: 5\r\nContent-Length: 6\r\n\r\nhello!",
+        b"Content-Length: 5, 6\r\n\r\nhello!",
+        b"Content-Length: -1\r\n\r\n",
+        b"Transfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+    ],
+    ids=["two-lengths", "length-list", "negative-length", "gzip-chunked"],
+)
+def test_h28_h11_refuses_invalid_framing_and_closes(framing, fake_ollama, sidecar):
+    """h11 refuses these itself, and uvicorn 0.54 answers every h11 protocol error with its
+    own 400 and a close. RFC 9112 §6.1 would allow 501 for `gzip, chunked`; asserting 400
+    catches a uvicorn upgrade that changes it."""
+    fake_ollama.script("GET", "/api/tags", status(200, b"{}"))
+    gate, _ = ready_gate()
+    acquires = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate)
+    request = b"POST /api/chat HTTP/1.1\r\nHost: x\r\n" + framing + HIDDEN
+    resp = raw_exchange(car.port, request, timeout=WAIT_S)  # returns once the server closes
+    assert resp.status == 400
+    assert resp.header("connection") == ["close"]
+    assert b"HTTP/1.1" not in resp.body  # one response only: the hidden request got none
+    assert acquires == [] and fake_ollama.requests == []
+
+
+@pytest.mark.td("H28")
+@pytest.mark.parametrize(
+    ("line", "framing"),
+    [
+        (b"POST /api/chat", b"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n"),
+        (b"POST /api/chat", b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n"),
+        (b"GET /seriatim/health", b"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n"),
+        (b"GET /a//b", b"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n"),
+    ],
+    ids=["te-then-length", "length-then-te", "seriatim-path", "before-the-path-check"],
+)
+def test_h28_the_sidecar_refuses_te_with_length_and_closes(
+    line, framing, fake_ollama, sidecar, envelope_validator, capsys
+):
+    """h11 accepts this framing (it uses Transfer-Encoding alone, RFC 9112 §6.3) and would
+    keep the connection open, serving the hidden request. The dispatcher refuses it and closes
+    the connection, as §6.1 requires."""
+    fake_ollama.script("GET", "/api/tags", status(200, b"{}"))
+    gate, _ = ready_gate()
+    acquires = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate)
+    request = line + b" HTTP/1.1\r\nHost: x\r\n" + framing + b"\r\n0\r\n\r\n" + HIDDEN
+    resp = raw_exchange(car.port, request, timeout=WAIT_S)  # returns once the server closes
+    _refused(
+        resp,
+        400,
+        ErrorCode.BAD_REQUEST_BODY,
+        "Transfer-Encoding and Content-Length together",
+        "ungated",
+        envelope_validator,
+    )
+    assert resp.header("connection") == ["close"]
+    assert b"HTTP/1.1" not in resp.body  # one response only: the hidden request got none
+    (log,) = _wait_log_lines(capsys, 1)
+    assert (log["outcome"], log["status"], log["slot_end"]) == ("rejected", 400, "none")
+    assert acquires == [] and fake_ollama.requests == []
+
+
+@pytest.mark.td("H28")
+def test_h28_a_chunked_body_with_a_trailer_is_one_request(fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    fake_ollama.script("GET", "/api/tags", status(200, b"{}"))
+    gate, _ = ready_gate()
+    acquires = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate)
+    request = (
+        b"POST /api/chat HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n\r\n"
+        b"%x\r\n%s\r\n0\r\nX-Trailer: 1\r\n\r\n" % (len(HIDDEN), HIDDEN)
+    )
+    with raw_connect(car.port) as sock:
+        sock.sendall(request)
+        received = b""
+        while chunk := sock.recv(65536):
+            received += chunk
+    assert received.count(b"HTTP/1.1 ") == 1 and received.startswith(b"HTTP/1.1 200 ")
+    assert received.endswith(b'{"done":true}')
+    (req,) = fake_ollama.requests  # the hidden request is only body bytes
+    assert (req.method, req.raw_path, req.body) == ("POST", b"/api/chat", HIDDEN)
+    assert len(acquires) == 1
+
+
+def _next_or_closed(sock: socket.socket, request: bytes) -> RawResponse | None:
+    """Send `request` on a used socket: its response, or None if the server closed it."""
+    try:
+        sock.sendall(request)
+        if not sock.recv(1, socket.MSG_PEEK):
+            return None
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+        return None
+    return read_response(sock)
+
+
+@pytest.mark.td("H29")
+def test_h29_after_a_429_the_socket_is_clean(fake_ollama, sidecar):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", sequence(hold, status(200, b'{"done":true}')))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    with raw_connect(car.port) as sock:
+        sock.sendall(_framed(b"x" * 4096))  # request 1 and its whole 4 KiB body
+        assert read_response(sock).status == 429
+        hold.release()
+        assert held.result(WAIT_S).status_code == 200
+        wait_for(lambda: all_free(gate))
+        second = _next_or_closed(sock, _framed(CHAT))
+    if second is not None:  # never a 400 from request 1's body parsed as a request
+        assert (second.status, second.body) == (200, b'{"done":true}')
+    assert [r.body for r in fake_ollama.requests] == [CHAT] * (1 if second is None else 2)
+
+
+@pytest.mark.td("H29")
+@pytest.mark.parametrize("chunked", [False, True], ids=["before-admission", "after-admission"])
+def test_h29_after_a_413_the_socket_is_clean(chunked, fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, max_body_bytes=LIMIT)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_framed(b"x" * 4096, chunked=chunked))
+        assert read_response(sock).status == 413
+        wait_for(lambda: all_free(gate))
+        second = _next_or_closed(sock, _framed(CHAT))
+    if second is not None:
+        assert (second.status, second.body) == (200, b'{"done":true}')
+    assert [r.body for r in fake_ollama.requests] == ([] if second is None else [CHAT])
+
+
+TAGS = b"GET /api/tags HTTP/1.1\r\nHost: x\r\n\r\n"  # the follow-up: ungated, no body
+
+
+def _follow_up_is_clean(sock: socket.socket, fake_ollama) -> bool:
+    """Send `TAGS` on a socket whose first request was refused before its body was read. It
+    must be answered as itself, or find the socket closed; it must never be taken as the rest
+    of the old body (which would hang until the socket's timeout) or parsed into a 400. Returns
+    whether the socket was closed."""
+    second = _next_or_closed(sock, TAGS)
+    if second is None:
+        return True
+    assert (second.status, second.body) == (200, b'{"models":[]}')
+    return False
+
+
+@pytest.mark.td("H29")
+@pytest.mark.parametrize(
+    ("settings", "gate_kwargs", "request_", "status_"),
+    [
+        ({"body_timeout_s": 0.5}, {}, _framed(b"x" * 100)[:-50], 408),
+        (
+            {"max_body_bytes": LIMIT},
+            {},
+            b"POST /api/chat HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"%x\r\n%s\r\n" % (LIMIT + 1, b"x" * (LIMIT + 1)),
+            413,
+        ),
+        ({"body_timeout_s": 30}, {"max_hold_s": 0.5}, _framed(b"x" * 100)[:-50], 504),
+    ],
+    ids=["408-stalled", "413-still-streaming", "504-hold-during-the-read"],
+)
+def test_h29_after_a_refusal_mid_body_the_next_request_is_clean(
+    settings, gate_kwargs, request_, status_, fake_ollama, sidecar
+):
+    """Part of the body is sent, then the refusal comes while the rest is still owed."""
+    fake_ollama.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    gate, _ = ready_gate(**gate_kwargs)
+    car = sidecar(fake_ollama.url, gate=gate, **settings)
+    with raw_connect(car.port) as sock:
+        sock.sendall(request_)
+        first = read_response(sock)
+        assert first.status == status_ and first.header("connection") == ["close"]
+        assert _follow_up_is_clean(sock, fake_ollama)  # closed, as the reply said
+    assert fake_ollama.requests == []
+
+
+@pytest.mark.td("H29")
+@pytest.mark.parametrize("refusal", ["413", "429", "503"])
+def test_h29_after_a_100_continue_refusal_the_next_request_is_clean(refusal, fake_ollama, sidecar):
+    """The client waits for `100 Continue` and never sends the body it declared."""
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    fake_ollama.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    if refusal == "503":
+        car = sidecar(fake_ollama.url, drain_s=600)
+    else:
+        gate, _ = ready_gate()
+        car = sidecar(fake_ollama.url, gate=gate, max_body_bytes=LIMIT)
+    held = None
+    if refusal == "429":
+        held = _in_background(_chat, car)
+        hold.wait_entered()
+    length = LIMIT + 1 if refusal == "413" else LIMIT
+    with raw_connect(car.port) as sock:
+        sock.sendall(
+            b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n"
+            b"Expect: 100-continue\r\n\r\n" % length
+        )
+        first = read_response(sock)
+        assert str(first.status) == refusal and first.header("connection") == ["close"]
+        assert _follow_up_is_clean(sock, fake_ollama)
+    if held is not None:
+        hold.release()
+        assert held.result(WAIT_S).status_code == 200
+    assert [r.raw_path for r in fake_ollama.requests] == ([b"/api/chat"] if held else [])
+
+
+@pytest.mark.td("H29")
+def test_h29_a_bodyless_refusal_keeps_the_connection(fake_ollama, sidecar):
+    """Only a reply that leaves a body unread closes: a 429 to a request with no body keeps the
+    connection, and the next request on it is answered."""
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    fake_ollama.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    with raw_connect(car.port) as sock:
+        sock.sendall(b"GET /api/chat HTTP/1.1\r\nHost: x\r\n\r\n")
+        first = read_response(sock)
+        assert first.status == 429 and first.header("connection") == []
+        assert not _follow_up_is_clean(sock, fake_ollama)  # answered on the same socket
+    hold.release()
+    assert held.result(WAIT_S).status_code == 200
