@@ -441,6 +441,10 @@ def test_parse_terms_with_whole_word_and_exceptions():
         ("myhost !!", "empty phrase"),
         ("myhost !! MyProduct myhost !!  ", "empty phrase"),
         ("myhost !!  !! MyProduct myhost", "empty phrase"),
+        ("==myhost", "a term starts with '='"),
+        ("= =myhost", "a term starts with '='"),
+        ("myhost !! =MyProduct myhost", "a phrase starts with '='"),
+        ("=myhost !!  = myhost-docs", "a phrase starts with '='"),
         ("myhost !! MyProduct", "a phrase does not contain the term"),
         ("=myhost !! MyProduct myhosts", "a phrase does not contain"),  # never a whole word
     ],

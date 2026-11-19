@@ -228,10 +228,14 @@ def parse_terms(raw: str) -> list[Rule]:
         term = head[1:].strip() if whole_word else head
         if not term:
             raise ScanError(f"term list line {number}: empty term")
+        if term.startswith(b"="):  # a doubled prefix would silently weaken the rule
+            raise ScanError(f"term list line {number}: a term starts with '='")
         rule = Rule(term, whole_word, tuple(sorted(set(rest))))
         for phrase in rest:
             if not phrase:
                 raise ScanError(f"term list line {number}: empty phrase")
+            if phrase.startswith(b"="):
+                raise ScanError(f"term list line {number}: a phrase starts with '='")
             if not occurrences(phrase, rule):
                 raise ScanError(f"term list line {number}: a phrase does not contain the term")
         rules.add(rule)
