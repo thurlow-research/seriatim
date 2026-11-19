@@ -332,11 +332,24 @@ def _body_then_disconnect(delay_s: float, gone: dict):
     return receive
 
 
+S9_HOLD_S = 0.4
+S9_MARGIN_S = 0.15  # far from the race, so each order is fixed even on a slow runner
+
+
 @pytest.mark.td("S9")
-@pytest.mark.parametrize("offset_s", [-0.02, -0.005, 0.0, 0.005, 0.02])
-def test_s9_a_disconnect_races_the_hold_deadline(offset_s, monkeypatch, capsys):
-    hold_s = 0.3
-    gate, _ = ready_gate(max_hold_s=hold_s)
+@pytest.mark.parametrize(
+    ("offset_s", "write_fails", "expected"),
+    [
+        (-S9_MARGIN_S, False, "client_disconnect"),  # the disconnect is clearly first
+        (S9_MARGIN_S, False, "hold_exceeded"),  # the deadline is clearly first
+        (S9_MARGIN_S, True, "hold_exceeded"),  # ... and the client is gone at its write
+    ],
+    ids=["disconnect-first", "deadline-first", "deadline-first-write-fails"],
+)
+def test_s9_a_disconnect_and_the_hold_deadline(
+    offset_s, write_fails, expected, monkeypatch, capsys
+):
+    gate, _ = ready_gate(max_hold_s=S9_HOLD_S)
     ends: list[bool] = []
     original = Lease.finish
 
@@ -347,33 +360,34 @@ def test_s9_a_disconnect_races_the_hold_deadline(offset_s, monkeypatch, capsys):
     monkeypatch.setattr(Lease, "finish", finish)
     gone = {"recorded": False}
     after_disconnect: list[dict] = []
-    after_line: list[dict] = []
-    leaves_at = [float("inf")]
+    after_line: list[dict] = []  # every send attempted after Ollama's line
 
     async def send(message):
         if gone["recorded"]:
             after_disconnect.append(message)
         if message.get("body") == LINE_1:
-            leaves_at[0] = time.monotonic() + hold_s + offset_s
-        elif message["type"] == "http.response.body":
+            return
+        if message["type"] == "http.response.body":
             after_line.append(message)
-            if time.monotonic() >= leaves_at[0]:
+            if write_fails:
                 raise OSError("the client is gone")
 
-    receive = _body_then_disconnect(hold_s + offset_s, gone)
+    receive = _body_then_disconnect(S9_HOLD_S + offset_s, gone)
     _direct(
         NDJSON, [LINE_1], stall=True, gate=gate, receive=receive, send=send, monkeypatch=monkeypatch
     )
     (line,) = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
-    assert line["outcome"] in ("client_disconnect", "hold_exceeded")  # one line, one outcome
-    assert line["slot_end"] == "draining"
+    assert (line["outcome"], line["slot_end"]) == (expected, "draining")  # one line, one outcome
     assert ends == [True]  # the slot drains exactly once
     assert _slot_states(gate) == ["draining"]
-    if line["outcome"] == "client_disconnect":
-        assert after_disconnect == []  # nothing is sent once the disconnect is recorded
+    if expected == "client_disconnect":
+        assert gone["recorded"]
+        assert after_disconnect == [] and after_line == []  # nothing once it is recorded
     else:
-        assert len(after_line) <= 1  # at most the one record, and never the final message
-        assert all(m["more_body"] is True for m in after_line)
+        assert not gone["recorded"]  # the deadline cancelled the watcher first
+        (record,) = after_line  # exactly one write attempted, and nothing after it
+        assert record["more_body"] is True
+        assert json.loads(record["body"])["error_code"] == "LOCK_HOLD_EXCEEDED"
 
 
 @pytest.mark.td("S10")

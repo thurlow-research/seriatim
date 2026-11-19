@@ -450,8 +450,13 @@ the errors after the headers of §4 and §5.
   timed.
 - **S9 and S19 run in process.** They call the proxy directly, with httpx's `MockTransport`,
   so the chunk boundaries are exact (a socket may merge one-byte chunks), and so the
-  disconnect and the deadline share one event loop's clock. S9 runs the disconnect at five
-  offsets around the deadline (−20 ms to +20 ms), so both orders are exercised.
+  disconnect and the deadline share one event loop's clock. S9 pins each order rather than
+  sampling the race: with `max_hold_s=0.4`, a disconnect 150 ms before the deadline must
+  log `client_disconnect` with nothing sent after it; one 150 ms after must log
+  `hold_exceeded` with exactly one write (the record) and nothing after it; and in a third
+  case the deadline wins and that one write fails, which must be caught, still log
+  `hold_exceeded` and write nothing more. Every case drains the slot exactly once. The
+  margin keeps each order fixed on a slow runner; no case sits on the race itself.
 - **S21's `HEAD /`** is an ungated route, so its case checks the log line (`ok`). The
   gated cases are the 204 and the 304, which the raw fake sends with no length and no
   chunking, and with the connection left open. Without the bodyless rule, each would look
