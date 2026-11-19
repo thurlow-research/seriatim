@@ -5,17 +5,20 @@ watcher, the relay, the hold limit, and the shielded `finally` that proves upstr
 before it ends the lease, then talks to the client. Later PRs add to it without changing that
 structure. S1-7 adds the full header strip lists of §4 and `prune_httpx_defaults`. S1-8
 adds the request limits: the size limit and the total timeout in `read_body`, and the
-`Content-Length` check before admission. Still to come:
-- S1-9: the in-stream error records and the framing rule for a clean end;
+`Content-Length` check before admission. S1-9 adds the framing rule for a clean end
+(`upstream_framed`, with the bodyless rule first) and the in-stream error record sent before
+an abort after the headers (`record_framing`, `stream_error_record`). Still to come:
 - S1-10: the cancellation and close edge cases;
 - S1-11: streamed blob uploads (`body_stream`).
 """
 
 from __future__ import annotations
 
+import json
+import traceback
 from collections.abc import Awaitable, Callable, MutableMapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 import httpx
@@ -149,6 +152,73 @@ def downstream_headers(
         (b"x-seriatim-node", node_id.encode()),
         (b"x-request-id", request_id.encode()),
     ]
+
+
+# --- the end of the response and the in-stream record (TD §3.3 step 5, §4) ----------------
+
+Framing = Literal["ndjson", "sse"]
+_RECORD_TYPES: dict[str, Framing] = {"application/x-ndjson": "ndjson", "text/event-stream": "sse"}
+_BOUNDARY: dict[Framing, bytes] = {"ndjson": b"\n", "sse": b"\n\n"}
+
+
+class Unframed(httpx.RemoteProtocolError):
+    """The upstream response ended without its framing proving it complete: it had no
+    `content-length` or chunking (close-delimited), so a crash would look the same."""
+
+
+def bodyless(method: str, status: int) -> bool:
+    """A response with no body by HTTP's rules: to `HEAD`, or a 1xx, 204 or 304 (S21)."""
+    return method == "HEAD" or 100 <= status < 200 or status in (204, 304)
+
+
+def upstream_framed(method: str, status: int, headers: httpx.Headers, received: int) -> bool:
+    """Whether a response whose body iterator ended normally is complete (§3.3 step 5).
+
+    The bodyless rule comes first: a `HEAD` response's `content-length` describes the body a
+    `GET` would have had. Otherwise a chunked response is complete (h11 raises if the
+    terminating chunk never came, S20), and so is one whose `content-length` the received
+    bytes match. A close-delimited response is not."""
+    if bodyless(method, status):
+        return True
+    if "transfer-encoding" in headers:  # h11 accepts only chunked, and checks its end
+        return True
+    length = headers.get("content-length")
+    return length is not None and int(length) == received
+
+
+def record_framing(resp_headers: httpx.Headers, tail: bytes) -> Framing | None:
+    """The record format a broken stream can still end with, or None when a record would
+    corrupt the body (§4): only for an NDJSON or SSE body with no `content-length` and no
+    content coding, whose last bytes sent end a record (or nothing was sent)."""
+    if "content-length" in resp_headers:
+        return None
+    if resp_headers.get("content-encoding", "identity").strip().lower() != "identity":
+        return None
+    media = resp_headers.get("content-type", "").split(";")[0].strip().lower()
+    framing = _RECORD_TYPES.get(media)
+    if framing is None:
+        return None
+    if tail and not tail.endswith(_BOUNDARY[framing]):
+        return None
+    return framing
+
+
+def stream_error_record(framing: Framing, code: str, message: str) -> bytes:
+    """One NDJSON line, or one SSE event, carrying a `StreamErrorRecord` (§4)."""
+    doc = json.dumps({"error": message, "error_code": code}, separators=(",", ":"))
+    if framing == "sse":
+        return b"data: " + doc.encode() + b"\n\n"
+    return doc.encode() + b"\n"
+
+
+def _stream_error(outcome: Outcome) -> tuple[ErrorCode, str] | None:
+    """The in-stream record's code for an abort after the headers (§5), or None: an internal
+    error or a cancellation aborts with no record."""
+    if outcome.hold_exceeded:
+        return ErrorCode.LOCK_HOLD_EXCEEDED, "the request exceeded the hold limit"
+    if isinstance(outcome.error, httpx.TransportError):
+        return ErrorCode.UPSTREAM_STREAM_BROKEN, "Ollama's response stream broke"
+    return None
 
 
 # --- the request body and the watcher (TD §3.3 steps 1 and 2) -------------------------------
@@ -381,6 +451,9 @@ class Proxy:
                     except Exception:
                         pass
                 result, level = _log_outcome(outcome)
+                if result == "internal_error" and outcome.error is not None:
+                    # §5: the traceback goes to the log only, never to the client (E5)
+                    where["traceback"] = "".join(traceback.format_exception(outcome.error))
                 if close_failed:  # REQ-11: CRITICAL when a slot is at stake, else ERROR
                     where["upstream_close_failed"] = True
                     if lease is not None or level == "CRITICAL":
@@ -445,10 +518,14 @@ class Proxy:
             )
             outcome.started = True
             outcome.status = resp.status_code
+            received = 0
             async for chunk in resp.aiter_raw():
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
                 outcome.tail = (outcome.tail + chunk)[-2:]
-            outcome.upstream_done = True  # S1-9 adds the framing rule (§3.3 step 5)
+                received += len(chunk)
+            if not upstream_framed(scope["method"], resp.status_code, resp.headers, received):
+                raise Unframed("the upstream response was not framed")
+            outcome.upstream_done = True
         except ClientGone:
             outcome.disconnected = True
         except Exception as exc:
@@ -464,7 +541,18 @@ class Proxy:
         if outcome.started:
             if outcome.upstream_done and outcome.error is None and not outcome.hold_exceeded:
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
-            return  # an abort: returning without the final message (S1-9 adds the record)
+                return
+            # An abort: a record if the framing allows one, then return without the final
+            # message, so uvicorn closes the connection and the client sees it cut short.
+            failure = _stream_error(outcome)
+            if failure is None:
+                return
+            assert outcome.resp is not None  # set before the headers were sent
+            framing = record_framing(outcome.resp.headers, outcome.tail)
+            if framing is not None:
+                record = stream_error_record(framing, failure[0].value, failure[1])
+                await send({"type": "http.response.body", "body": record, "more_body": True})
+            return
         gate_value = "acquired" if lease is not None else "ungated"
         reply = _error_reply(outcome)
         if reply is None:
