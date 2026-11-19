@@ -5,7 +5,8 @@ S1-1: the error table against the contract (K-OAS3). S1-3: the contract against 
 HL9), with the harness in `harness.py`. S1-6: the proxy core over real sockets (H1, H2,
 H4-H8, H25, B1-B5, E1). S1-7: the header rules (H3, H9, H11, H15-H18, H20, H21, H24).
 S1-8: the request limits (E3, E4, E7-E11, B6, B7, H28, H29). S1-9: the framing rule, the
-in-stream record and internal errors (H13, E5, E15).
+in-stream record and internal errors (H13, E5, E15). S1-10: client construction after
+admission, the full ungated pool and the ungated stalls and closes (E16, H14, H26, H27).
 """
 
 from __future__ import annotations
@@ -2973,3 +2974,280 @@ def test_the_hold_limit_record_mid_stream(monkeypatch, capsys):
         b'"error_code":"LOCK_HOLD_EXCEEDED"}\n\n'
     )
     assert _one_line(capsys)["outcome"] == "hold_exceeded"
+
+
+# --- S1-10: client construction, the ungated pool and ungated stalls (TD §2.4, §3.3, §5) -----
+
+
+@pytest.mark.td("E16")
+def test_e16_client_construction_fails_after_admission(
+    fake_ollama, sidecar, monkeypatch, envelope_validator, capsys
+):
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
+    real = proxy_module.new_gated_client
+    calls: list[int] = []
+
+    def fails_once(settings):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("no client")  # right after the slot is taken
+        return real(settings)
+
+    ends: list[tuple[object, str, bool]] = []
+    finish, stuck = proxy_module.Lease.finish, proxy_module.Lease.stuck
+
+    def finish_(self, *, clean):
+        ends.append((self, "finish", finish(self, clean=clean)))
+        return ends[-1][2]
+
+    def stuck_(self):
+        ends.append((self, "stuck", stuck(self)))
+        return ends[-1][2]
+
+    monkeypatch.setattr(proxy_module, "new_gated_client", fails_once)
+    monkeypatch.setattr(proxy_module.Lease, "finish", finish_)
+    monkeypatch.setattr(proxy_module.Lease, "stuck", stuck_)
+    gate, _ = ready_gate()
+    acquired = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate)
+    resp = _chat(car)
+    assert resp.status_code == 500
+    _error_doc(resp.content, ErrorCode.INTERNAL, envelope_validator)
+    assert resp.json()["error"] == "internal error"
+    assert resp.headers.get_list("x-seriatim-gate") == ["acquired"]
+    assert fake_ollama.requests == []
+    assert all_free(gate)  # nothing was sent: freed with no drain
+    assert [(kind, effective) for _, kind, effective in ends] == [("finish", True)]
+    assert _chat(car).status_code == 200  # the next request is admitted
+    wait_for(lambda: len(ends) == 2)
+    assert [lease for lease, _, _ in ends] == acquired  # each lease had exactly one end
+    first, _ = _wait_log_lines(capsys, 2)
+    assert (first["level"], first["outcome"], first["slot_end"]) == (
+        "ERROR",
+        "internal_error",
+        "free",
+    )
+    assert "RuntimeError: no client" in first["traceback"]
+
+
+UNGATED_SLOTS = 16  # the shared client's max_connections (TD §2.4)
+POOL_WAIT_S = 0.5  # connect_timeout_s, which is also the shared pool's timeout
+
+
+def _saturated(fake_ollama, sidecar):
+    """Fill the shared pool with 16 held `/api/show` requests and send a 17th. Returns the
+    sidecar, the 17th response, the time it took, the hold and the held requests."""
+    hold = Hold()
+    fake_ollama.script("POST", "/api/show", hold)
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
+    fake_ollama.script("GET", "/api/version", VERSION_OK)
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, connect_timeout_s=POOL_WAIT_S)
+    show = lambda: httpx.post(car.url + "/api/show", content=b"{}", timeout=WAIT_S)  # noqa: E731
+    held = [_in_background(show) for _ in range(UNGATED_SLOTS)]
+    hold.wait_entered(UNGATED_SLOTS)
+    started = time.perf_counter()
+    resp = show()
+    return car, resp, time.perf_counter() - started, hold, held
+
+
+@pytest.mark.td("H14")
+def test_h14_a_full_ungated_pool_saturates_only_ungated_traffic(
+    fake_ollama, sidecar, health_validator, capsys
+):
+    car, resp, elapsed, hold, held = _saturated(fake_ollama, sidecar)
+    assert resp.status_code == 503
+    assert resp.json()["error_code"] == "NODE_SATURATED"
+    assert POOL_WAIT_S <= elapsed < POOL_WAIT_S + TIMING_BOUND_S  # the pool's own timeout
+    assert hold.entered == UNGATED_SLOTS  # the 17th never reached Ollama
+    chat = _chat(car)  # gated: its own client, never the shared pool
+    assert (chat.status_code, chat.headers["x-seriatim-gate"]) == (200, "acquired")
+    assert _health(car, health_validator).status_code == 200  # the health client is its own
+    hold.release_all()
+    assert [f.result(WAIT_S).status_code for f in held] == [200] * UNGATED_SLOTS
+    lines = [line for line in _wait_log_lines(capsys, 18) if line.get("path") == "/api/show"]
+    assert sorted(line["outcome"] for line in lines) == ["ok"] * UNGATED_SLOTS + ["saturated"]
+    (saturated,) = [line for line in lines if line["outcome"] == "saturated"]
+    assert (saturated["status"], saturated["slot_end"], saturated["kind"]) == (
+        503,
+        "none",
+        "ungated",
+    )
+
+
+@pytest.mark.td("H27")
+def test_h27_the_node_saturated_response_in_full(fake_ollama, sidecar, envelope_validator):
+    car, resp, _, hold, held = _saturated(fake_ollama, sidecar)
+    spec = ERROR_TABLE[ErrorCode.NODE_SATURATED]
+    assert resp.status_code == spec.status == 503
+    doc = _error_doc(resp.content, ErrorCode.NODE_SATURATED, envelope_validator)
+    assert (doc["retryable"], doc["replay_safe"]) == (spec.retryable, spec.replay_safe)
+    assert doc["replay_safe"] is True
+    assert doc["error"] == "the node has no free upstream connection"
+    assert resp.headers.get_list("retry-after") == [str(doc["retry_after"])]
+    assert doc["retry_after"] == car.settings.retry_after_s
+    assert resp.headers.get_list("x-seriatim-gate") == ["ungated"]
+    assert resp.headers.get_list("x-seriatim-node") == ["node-a"]
+    assert resp.headers["content-type"] == "application/json"
+    hold.release_all()
+    assert all(f.result(WAIT_S).status_code == 200 for f in held)
+
+
+UNGATED_READ_S = 0.5  # H26's ungated_read_timeout_s
+CLOSE_S = 0.5  # H26's close_timeout_s, where the shared response's aclose() blocks
+
+
+def _connections_in_use(pool) -> list:
+    """The shared pool's connections still in use, and any request still waiting for one."""
+    return [c for c in pool.connections if not (c.is_idle() or c.is_closed())] + pool._requests
+
+
+def _ungated_case(car, capsys, outcome: str) -> dict:
+    """The checks every H26 case shares: one log line with `outcome`, and no connection of the
+    shared pool still in use."""
+    (line,) = [x for x in _wait_log_lines(capsys, 1) if x.get("kind") == "ungated"]
+    assert line["outcome"] == outcome and line["slot_end"] == "none"
+    assert _connections_in_use(_pool(car.app.client)) == []
+    return line
+
+
+@pytest.mark.td("H26")
+def test_h26_a_stall_before_the_headers_is_a_502(fake_ollama, sidecar, envelope_validator, capsys):
+    fake_ollama.script("POST", "/api/show", stall_headers())
+    gate, _ = ready_gate()
+    acquired = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate, ungated_read_timeout_s=UNGATED_READ_S)
+    started = time.perf_counter()
+    resp = httpx.post(car.url + "/api/show", content=b"{}", timeout=WAIT_S)
+    elapsed = time.perf_counter() - started
+    assert resp.status_code == 502
+    _error_doc(resp.content, ErrorCode.UPSTREAM_PROTOCOL_ERROR, envelope_validator)
+    assert resp.headers.get_list("x-seriatim-gate") == ["ungated"]
+    assert UNGATED_READ_S <= elapsed < UNGATED_READ_S + TIMING_BOUND_S
+    _ungated_case(car, capsys, "upstream_error")
+    assert acquired == [] and all_free(gate)
+
+
+@pytest.mark.td("H26")
+def test_h26_a_stall_after_the_headers_aborts(fake_ollama, sidecar, capsys):
+    fake_ollama.script("POST", "/api/show", stall_body(b'{"a":', 100))
+    gate, _ = ready_gate()
+    acquired = _count_acquires(gate)
+    car = sidecar(fake_ollama.url, gate=gate, ungated_read_timeout_s=UNGATED_READ_S)
+    got = b""
+    started = time.perf_counter()
+    with httpx.stream("POST", car.url + "/api/show", content=b"{}", timeout=WAIT_S) as resp:
+        with pytest.raises(httpx.RemoteProtocolError):  # cut short: an abort
+            for chunk in resp.iter_raw():
+                got += chunk
+    elapsed = time.perf_counter() - started
+    assert (resp.status_code, got) == (200, b'{"a":')  # a content-length: no record
+    assert UNGATED_READ_S <= elapsed < UNGATED_READ_S + TIMING_BOUND_S
+    _ungated_case(car, capsys, "upstream_error")
+    assert acquired == [] and all_free(gate)
+
+
+@pytest.mark.td("H26")
+def test_h26_a_disconnect_during_an_ungated_stream_closes_upstream(fake_ollama, sidecar, capsys):
+    hold = Hold(headers=[(b"content-type", b"application/x-ndjson")], first=b'{"status":"a"}\n')
+    fake_ollama.script("POST", "/api/pull", hold)
+    gate, _ = ready_gate()
+    acquired = _count_acquires(gate)
+    # A read timeout far beyond the disconnect, so the disconnect always comes first.
+    car = sidecar(fake_ollama.url, gate=gate, ungated_read_timeout_s=WAIT_S)
+    with raw_connect(car.port) as sock:
+        sock.sendall(b"POST /api/pull HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+        received = b""
+        while b'{"status":"a"}' not in received:
+            received += sock.recv(65536)
+    hold.wait_disconnected()  # the fake sees the upstream close
+    _ungated_case(car, capsys, "client_disconnect")
+    assert acquired == [] and all_free(gate)
+
+
+class _HangOnClose(httpx.AsyncByteStream):
+    """A response stream whose `aclose()` closes the real stream, then blocks for ever."""
+
+    def __init__(self, inner: httpx.AsyncByteStream) -> None:
+        self.inner = inner
+
+    async def __aiter__(self):
+        async for chunk in self.inner:
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
+        await anyio.sleep_forever()
+
+
+class _HangingCloses(httpx.AsyncBaseTransport):
+    """The shared client's real transport, with every response's `aclose()` blocking."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self.inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        resp = await self.inner.handle_async_request(request)
+        return httpx.Response(
+            resp.status_code,
+            headers=resp.headers,
+            stream=_HangOnClose(resp.stream),
+            extensions=resp.extensions,
+        )
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
+
+
+async def _chunked_tags(send, fake, receive=None) -> None:
+    """A clean, chunked response: the client sees its end only with the final message."""
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b'{"models":[]}', "more_body": True})
+    await send({"type": "http.response.body", "body": b""})
+
+
+@pytest.mark.td("H26")
+@pytest.mark.parametrize("end", ["clean", "stalled"])
+def test_h26_a_blocked_close_of_the_shared_response_is_bounded(end, fake_ollama, capsys):
+    if end == "clean":
+        fake_ollama.script("GET", "/api/tags", _chunked_tags)
+    else:
+        fake_ollama.script("GET", "/api/tags", stall_body(b'{"a":', 100))
+    settings = make_settings(
+        fake_ollama.url, ungated_read_timeout_s=UNGATED_READ_S, close_timeout_s=CLOSE_S
+    )
+    shared = proxy_module.new_ungated_client(settings)
+    shared._transport = _HangingCloses(shared._transport)
+    gate, _ = ready_gate()
+    acquired = _count_acquires(gate)
+    server = ThreadServer(
+        create_app(settings, client=shared, gate=gate), reserve_socket(), lifespan="on"
+    ).start()
+    url = f"http://127.0.0.1:{server.port}/api/tags"
+    got = b""
+    try:
+        started = time.perf_counter()
+        with httpx.stream("GET", url, timeout=WAIT_S) as resp:
+            if end == "clean":
+                got = resp.read()  # answered
+            else:
+                with pytest.raises(httpx.RemoteProtocolError):  # aborted
+                    for chunk in resp.iter_raw():
+                        got += chunk
+        elapsed = time.perf_counter() - started
+        (line,) = _wait_log_lines(capsys, 1)
+        assert _connections_in_use(shared._transport.inner._pool) == []  # closed under the hang
+    finally:
+        server.stop()
+    fault_s = 0 if end == "clean" else UNGATED_READ_S  # when the exchange ended
+    assert got == (b'{"models":[]}' if end == "clean" else b'{"a":')
+    # Step (a) gave up on the close after close_timeout_s; the client was then answered or
+    # aborted well within 2 x close_timeout_s of the exchange's end.
+    assert fault_s + CLOSE_S <= elapsed < fault_s + 2 * CLOSE_S
+    assert (line["level"], line["upstream_close_failed"], line["slot_end"]) == (
+        "ERROR",
+        True,
+        "none",
+    )
+    assert line["outcome"] == ("ok" if end == "clean" else "upstream_error")
+    assert acquired == [] and all_free(gate)

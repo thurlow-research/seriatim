@@ -3,14 +3,22 @@
 S1-6: passthrough without buffering, captured stream replays, and client disconnects during a
 stream and while waiting for the headers (S1-S5). S1-9: errors after the headers, the
 in-stream record and its framing, the bodyless rule, and upstream faults (S6-S10, S17-S21,
-F1, F3, F5). The tests run the sidecar and a fake Ollama on real loopback sockets
+F1, F3, F5). S1-10: external cancellation in each phase, a second cancellation during the
+close, a request while the close is pending, a slow reader, a final write that fails, a
+disconnect as upstream completes, a blocked upstream write and an unproven close (S11-S16,
+F2, F4). The tests run the sidecar and a fake Ollama on real loopback sockets
 (`harness.py`), except where a chunk boundary or a race must be exact: those call the proxy
 directly.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import io
 import json
+import socket
+import threading
 import time
 from pathlib import Path
 
@@ -616,3 +624,630 @@ def test_f5_ollama_crashes_before_the_headers(raw_upstream, sidecar, envelope_va
 
     _upstream_fault(handler, raw_upstream, sidecar, envelope_validator, capsys)
     assert upstream_requests[0].endswith(b"\r\n\r\n{}")  # the body was read in full first
+
+
+# --- S1-10: cancellation and the close proof (TD §3.3, §5) -----------------------------------
+# A server shutting down cancels the request's task with asyncio's `Task.cancel()`, so these
+# tests do exactly that, on a task that runs the proxy directly. Where the upstream must see
+# the close (S11), it is a real fake on a loopback socket; where a step's timing must be exact
+# (S12, S13, S15, S16), it is httpx's MockTransport.
+
+CHAT_ROUTE = classify("POST", b"/api/chat")
+BIG = 32 * 1024 * 1024  # S11, S14, F2: far more than every socket buffer on the path holds
+
+
+def _chat_scope(body_len: int = 2) -> dict:
+    return {
+        "type": "http",
+        "method": "POST",
+        "raw_path": b"/api/chat",
+        "query_string": b"",
+        "headers": [(b"content-length", str(body_len).encode())],
+    }
+
+
+def _body_once(body: bytes = b"{}"):
+    """A `receive` that gives the whole body, then waits (no disconnect comes)."""
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive():
+        if messages:
+            return messages.pop()
+        await anyio.sleep_forever()
+
+    return receive
+
+
+async def _until(predicate) -> None:
+    """Poll inside the event loop; fail (never pass) after WAIT_S."""
+    with anyio.fail_after(WAIT_S):
+        while not predicate():
+            await anyio.sleep(0.002)
+
+
+class _Body(httpx.AsyncByteStream):
+    """An upstream body: these chunks, then `then` raised, or the end (`at_end` runs first)."""
+
+    def __init__(self, chunks: list[bytes], *, at_end=None, then=None) -> None:
+        self.chunks, self.at_end, self.then = chunks, at_end, then
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+        if self.then is not None:
+            raise self.then
+        if self.at_end is not None:
+            self.at_end()
+
+
+def _framed(at_end=None) -> httpx.Response:
+    body = LINE_1 + LINE_2
+    headers = [*NDJSON, (b"content-length", str(len(body)).encode())]
+    return httpx.Response(200, headers=headers, stream=_Body([LINE_1, LINE_2], at_end=at_end))
+
+
+def _clean(request) -> httpx.Response:
+    return _framed()
+
+
+def _broken(request) -> httpx.Response:
+    reset = httpx.ReadError("reset")
+    return httpx.Response(200, headers=NDJSON, stream=_Body([LINE_1], then=reset))
+
+
+def _mock_client(handler) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:1")
+
+
+class _SlowClose(httpx.AsyncClient):
+    """A gated client whose `aclose()` takes `delay_s`, and notes the slots as it returns."""
+
+    def __init__(self, handler, delay_s: float, gate) -> None:
+        super().__init__(transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:1")
+        self.delay_s, self.gate = delay_s, gate
+        self.close_started = self.close_done = False
+        self.slots_at_return: list[str] = []
+
+    async def aclose(self) -> None:
+        self.close_started = True
+        await anyio.sleep(self.delay_s)
+        await super().aclose()
+        self.slots_at_return = _slot_states(self.gate)
+        self.close_done = True
+
+
+def _record_ends(monkeypatch) -> list[tuple[str, bool]]:
+    """Every `finish` and `stuck` call, with what it returned (True: the effective end)."""
+    ends: list[tuple[str, bool]] = []
+    finish, stuck = Lease.finish, Lease.stuck
+
+    def finish_(self, *, clean):
+        ends.append(("finish", finish(self, clean=clean)))
+        return ends[-1][1]
+
+    def stuck_(self):
+        ends.append(("stuck", stuck(self)))
+        return ends[-1][1]
+
+    monkeypatch.setattr(Lease, "finish", finish_)
+    monkeypatch.setattr(Lease, "stuck", stuck_)
+    return ends
+
+
+def _proxy(gate, monkeypatch, gated, ollama_url: str = "http://127.0.0.1:1", **overrides) -> Proxy:
+    monkeypatch.setattr(proxy_module, "new_gated_client", gated)
+    settings = make_settings(ollama_url, **overrides)
+    shared = httpx.AsyncClient(base_url=ollama_url)
+    log = RequestLog(settings.log_level, "node-a")
+    return Proxy(settings, gate, shared, log, ErrorFactory("node-a"))
+
+
+def _log(capsys) -> list[dict]:
+    return [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.startswith("{")]
+
+
+class _StopsReading:
+    """A raw upstream that reads the request's headers, then stops reading until `go` is
+    set; it then reads to EOF and counts the bytes it got (S11's write phase, F2)."""
+
+    def __init__(self) -> None:
+        self.head = threading.Event()
+        self.go = threading.Event()
+        self.eof = threading.Event()
+        self.read = 0
+
+    def __call__(self, fake, conn) -> None:
+        buf = b""
+        while b"\r\n\r\n" not in buf:  # the headers, and on purpose not the body
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+        self.head.set()
+        self.go.wait(WAIT_S)
+        try:
+            while chunk := conn.recv(65536):
+                self.read += len(chunk)
+        except OSError:
+            pass  # a reset is the sidecar closing its socket too
+        self.eof.set()
+
+    def seen_close(self) -> bool:
+        self.go.set()
+        return self.eof.wait(WAIT_S)
+
+
+def _cancel_when(proxy, scope, receive, ready) -> tuple[asyncio.Task, list[dict], list[dict]]:
+    """Run the proxy as a task, cancel it with `Task.cancel()` once `ready(sent)` holds, and
+    wait for it. Returns the task and the messages sent before and after the cancel."""
+    before: list[dict] = []
+    after: list[dict] = []
+    cancelled = threading.Event()
+
+    async def send(message):
+        (after if cancelled.is_set() else before).append(message)
+
+    async def main() -> asyncio.Task:
+        task = asyncio.ensure_future(proxy(scope, receive, send, CHAT_ROUTE, "rid"))
+        await _until(lambda: ready(before))
+        cancelled.set()
+        task.cancel()
+        with anyio.fail_after(WAIT_S), pytest.raises(asyncio.CancelledError):
+            await task
+        return task
+
+    return asyncio.run(main()), before, after
+
+
+# Each phase gives (upstream URL, scope, receive, ready(sent), the upstream's close check).
+
+
+def _s11_body_read(fake_ollama, raw_upstream):
+    calls: list[int] = []
+
+    async def receive():
+        calls.append(1)
+        if len(calls) == 1:
+            return {"type": "http.request", "body": b"{", "more_body": True}
+        await anyio.sleep_forever()
+
+    return fake_ollama.url, _chat_scope(), receive, lambda sent: len(calls) >= 2, None
+
+
+def _s11_upstream_write(fake_ollama, raw_upstream):
+    upstream = _StopsReading()
+    url = raw_upstream(upstream).url
+    ready = lambda sent: upstream.head.is_set()  # noqa: E731
+    return url, _chat_scope(BIG), _body_once(b"x" * BIG), ready, upstream
+
+
+def _s11_wait_for_headers(fake_ollama, raw_upstream):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    ready = lambda sent: hold.entered >= 1  # noqa: E731
+    return fake_ollama.url, _chat_scope(), _body_once(), ready, hold
+
+
+def _s11_streaming(fake_ollama, raw_upstream):
+    hold = Hold(headers=NDJSON, first=LINE_1)
+    fake_ollama.script("POST", "/api/chat", hold)
+    ready = lambda sent: any(m.get("body") == LINE_1 for m in sent)  # noqa: E731
+    return fake_ollama.url, _chat_scope(), _body_once(), ready, hold
+
+
+@pytest.mark.td("S11")
+@pytest.mark.parametrize(
+    ("phase", "slot"),
+    [
+        (_s11_body_read, "free"),
+        (_s11_upstream_write, "draining"),
+        (_s11_wait_for_headers, "draining"),
+        (_s11_streaming, "draining"),
+    ],
+    ids=["body-read", "upstream-write", "wait-for-headers", "streaming"],
+)
+def test_s11_an_external_cancellation_in_each_phase(
+    phase, slot, fake_ollama, raw_upstream, monkeypatch, capsys
+):
+    url, scope, receive, ready, upstream = phase(fake_ollama, raw_upstream)
+    gate, _ = ready_gate()
+    ends = _record_ends(monkeypatch)
+    made: list[httpx.AsyncClient] = []
+    real = proxy_module.new_gated_client
+
+    def gated(settings):
+        made.append(real(settings))
+        return made[-1]
+
+    proxy = _proxy(gate, monkeypatch, gated, url)
+    task, before, after = _cancel_when(proxy, scope, receive, ready)
+    assert task.cancelled()  # the cancellation propagated
+    (client,) = made
+    assert client.is_closed  # the shielded finally closed the per-request client
+    if isinstance(upstream, Hold):
+        upstream.wait_disconnected()  # the fake saw the upstream connection close
+    elif isinstance(upstream, _StopsReading):
+        assert upstream.seen_close()
+        assert upstream.read < BIG  # the write was cut short, never finished
+    else:
+        assert fake_ollama.requests == []  # nothing was sent upstream
+    assert _slot_states(gate) == [slot]  # drained if anything was sent, else freed
+    assert ends == [("finish", True)]
+    assert after == []  # nothing more for the client: no reply, no record, no final message
+    streaming = phase is _s11_streaming
+    types = ["http.response.start", "http.response.body"] if streaming else []
+    assert [m["type"] for m in before] == types
+    (line,) = _log(capsys)
+    assert (line["outcome"], line["slot_end"], line["status"]) == (
+        "cancelled",
+        slot,
+        200 if streaming else None,
+    )
+
+
+SLOW_CLOSE_S = 0.5  # S12, S13: the slow aclose(); close_timeout_s is 2, so it is never cut
+
+
+@pytest.mark.td("S12")
+def test_s12_a_second_cancellation_while_the_close_is_pending(monkeypatch, capsys):
+    gate, _ = ready_gate()
+    ends = _record_ends(monkeypatch)
+    clients: list[_SlowClose] = []
+    entered: list[int] = []
+
+    async def handler(request):
+        entered.append(1)
+        await anyio.sleep(30)  # waiting for Ollama's headers
+
+    def gated(_settings):
+        clients.append(_SlowClose(handler, SLOW_CLOSE_S, gate))
+        return clients[-1]
+
+    proxy = _proxy(gate, monkeypatch, gated, close_timeout_s=2)
+    seen: dict[str, object] = {}
+
+    async def send(message):
+        raise AssertionError("nothing is sent to a cancelled request's client")
+
+    async def main() -> asyncio.Task:
+        task = asyncio.ensure_future(proxy(_chat_scope(), _body_once(), send, CHAT_ROUTE, "rid"))
+        await _until(lambda: entered)
+        task.cancel()  # the first: the shielded finally starts step (a)
+        await _until(lambda: clients[0].close_started)
+        seen["at_second"] = (clients[0].close_done, _slot_states(gate))
+        task.cancel()  # the second, while aclose() is still running
+        with anyio.fail_after(WAIT_S), pytest.raises(asyncio.CancelledError):
+            await task
+        return task
+
+    started = time.perf_counter()
+    task = asyncio.run(main())
+    assert time.perf_counter() - started >= SLOW_CLOSE_S
+    assert task.cancelled()
+    assert seen == {"at_second": (False, ["held"])}
+    (client,) = clients
+    assert client.close_done  # aclose() ran to its end despite the second cancellation
+    assert client.slots_at_return == ["held"]  # the slot was not freed before it returned
+    assert _slot_states(gate) == ["draining"]  # then (b): the request had reached upstream
+    assert ends == [("finish", True)]  # exactly one end
+    (line,) = _log(capsys)
+    assert (line["outcome"], line["slot_end"]) == ("cancelled", "draining")
+    assert "upstream_close_failed" not in line
+
+
+@pytest.mark.td("S12")
+def test_s12_a_cancellation_that_first_arrives_during_the_close(monkeypatch, capsys):
+    """The `finally` was entered by a clean end, so no cancellation is in flight: the one
+    absorbed while aclose() runs must still be raised once the cleanup has ended."""
+    gate, _ = ready_gate()
+    ends = _record_ends(monkeypatch)
+    clients: list[_SlowClose] = []
+
+    def gated(_settings):
+        clients.append(_SlowClose(_clean, SLOW_CLOSE_S, gate))
+        return clients[-1]
+
+    proxy = _proxy(gate, monkeypatch, gated, close_timeout_s=2)
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def main() -> asyncio.Task:
+        task = asyncio.ensure_future(proxy(_chat_scope(), _body_once(), send, CHAT_ROUTE, "rid"))
+        await _until(lambda: clients and clients[0].close_started)
+        task.cancel()  # the only cancellation, inside step (a)
+        with anyio.fail_after(WAIT_S), pytest.raises(asyncio.CancelledError):
+            await task
+        return task
+
+    task = asyncio.run(main())
+    assert task.cancelled()  # raised again after the cleanup
+    (client,) = clients
+    assert client.close_done and client.slots_at_return == ["held"]
+    assert _slot_states(gate) == ["free"] and ends == [("finish", True)]  # a clean end
+    assert [m.get("more_body") for m in sent] == [None, True, True, False]  # (c) still ran
+    (line,) = _log(capsys)
+    assert (line["outcome"], line["slot_end"]) == ("ok", "free")
+
+
+@pytest.mark.td("S13")
+@pytest.mark.parametrize(
+    ("handler", "slot"), [(_clean, "free"), (_broken, "draining")], ids=["clean", "broken"]
+)
+def test_s13_another_request_while_the_close_is_pending(handler, slot, monkeypatch, capsys):
+    gate, _ = ready_gate()
+    ends = _record_ends(monkeypatch)
+    clients: list[_SlowClose] = []
+
+    def gated(_settings):
+        clients.append(_SlowClose(handler, SLOW_CLOSE_S, gate))
+        return clients[-1]
+
+    proxy = _proxy(gate, monkeypatch, gated, close_timeout_s=2)
+    second: list[dict] = []
+    seen: dict[str, object] = {}
+
+    async def ignore(message):
+        pass
+
+    async def send_second(message):
+        second.append(message)
+
+    async def main() -> None:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(proxy, _chat_scope(), _body_once(), ignore, CHAT_ROUTE, "first")
+            await _until(lambda: clients and clients[0].close_started)
+            await proxy(_chat_scope(), _body_once(), send_second, CHAT_ROUTE, "second")
+            seen["after_second"] = (clients[0].close_done, _slot_states(gate))
+
+    anyio.run(main)
+    assert seen == {"after_second": (False, ["held"])}  # answered while the close was pending
+    assert second[0]["status"] == 429
+    assert json.loads(second[1]["body"])["error_code"] == "GPU_BUSY"
+    (client,) = clients  # the 429 took no slot and built no client
+    assert client.slots_at_return == ["held"]
+    assert _slot_states(gate) == [slot]  # then §3.3 (b): a clean end frees, a broken one drains
+    assert ends == [("finish", True)]
+    lines = {line["request_id"]: line for line in _log(capsys)}
+    assert (lines["second"]["outcome"], lines["second"]["slot_end"]) == ("busy", "none")
+    assert lines["first"]["slot_end"] == slot
+
+
+@pytest.mark.td("S14")
+def test_s14_a_slow_reader_until_the_hold_deadline(raw_upstream, sidecar, capsys):
+    written: dict[str, float | None] = {"bytes": 0, "failed_at": None}
+
+    def streams_32_mib(fake, conn):
+        fake.read(conn)
+        head = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+        conn.sendall(head + b"Content-Length: " + str(BIG).encode() + b"\r\n\r\n")
+        chunk = b"x" * 65536
+        try:
+            while written["bytes"] < BIG:
+                conn.sendall(chunk)  # blocks once every buffer on the path is full
+                written["bytes"] += len(chunk)
+        except OSError:
+            written["failed_at"] = time.perf_counter()  # the sidecar closed the connection
+
+    upstream = raw_upstream(streams_32_mib)
+    gate, _ = ready_gate(max_hold_s=1)
+    car = sidecar(upstream.url, gate=gate)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)  # and it reads nothing
+        sock.settimeout(WAIT_S)
+        started = time.perf_counter()
+        sock.connect(("127.0.0.1", car.port))
+        sock.sendall(_request(b"/api/chat", b"{}"))
+        wait_for(lambda: written["failed_at"] is not None)
+        wait_for(lambda: _slot_states(gate) == ["draining"])
+    assert written["bytes"] < BIG  # the fake's writes blocked: the upstream reads paused
+    assert 1 <= written["failed_at"] - started < 1 + TIMING_BOUND_S
+    (line,) = _chat_lines(capsys, 1)
+    assert (line["level"], line["outcome"], line["slot_end"]) == (
+        "CRITICAL",
+        "hold_exceeded",
+        "draining",
+    )
+
+
+FINAL_CLOSE_S = 0.5  # S15's close_timeout_s
+
+
+@pytest.mark.td("S15")
+@pytest.mark.parametrize("final", ["hang", "raise"])
+def test_s15_the_final_write_hangs_or_raises(final, monkeypatch, capsys):
+    gate, _ = ready_gate()
+    ends = _record_ends(monkeypatch)
+    gated = lambda _s: _mock_client(_clean)  # noqa: E731
+    proxy = _proxy(gate, monkeypatch, gated, close_timeout_s=FINAL_CLOSE_S, log_level="DEBUG")
+    at_final: list[list[str]] = []
+
+    async def send(message):
+        if message.get("more_body") is False:  # the final, empty body message
+            at_final.append(_slot_states(gate))
+            if final == "hang":
+                await anyio.sleep(30)
+            raise OSError("the client is gone")
+
+    started = time.perf_counter()
+    anyio.run(proxy, _chat_scope(), _body_once(), send, CHAT_ROUTE, "rid")
+    elapsed = time.perf_counter() - started
+    assert at_final == [["free"]]  # the slot was already free when the write began
+    assert _slot_states(gate) == ["free"] and ends == [("finish", True)]  # and it stays free
+    if final == "hang":
+        assert FINAL_CLOSE_S <= elapsed < FINAL_CLOSE_S + TIMING_BOUND_S  # abandoned on time
+    else:
+        assert elapsed < TIMING_BOUND_S
+    debug, line = _log(capsys)
+    assert (debug["level"], debug["event"], debug["request_id"], debug["reason"]) == (
+        "DEBUG",
+        "client_write_failed",
+        "rid",
+        "timeout" if final == "hang" else "OSError",
+    )
+    assert (line["level"], line["event"], line["outcome"], line["slot_end"]) == (
+        "INFO",
+        "request",
+        "ok",
+        "free",
+    )
+
+
+@pytest.mark.td("S15")
+def test_s15_a_final_write_that_succeeds_logs_one_line(monkeypatch, capsys):
+    """The contrast: at DEBUG, a clean end whose final write succeeds logs no
+    `client_write_failed`, only the request's own line."""
+    gate, _ = ready_gate()
+    gated = lambda _s: _mock_client(_clean)  # noqa: E731
+    proxy = _proxy(gate, monkeypatch, gated, log_level="DEBUG")
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    anyio.run(proxy, _chat_scope(), _body_once(), send, CHAT_ROUTE, "rid")
+    assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+    (line,) = _log(capsys)
+    assert (line["event"], line["outcome"], line["slot_end"]) == ("request", "ok", "free")
+
+
+S16_RUNS = 50
+
+
+def _s16_run(order: str, monkeypatch) -> tuple[list, list[dict], list[dict], list[str]]:
+    """One run of S16: the client's disconnect is tied to a pinned point of the end."""
+    gate, _ = ready_gate()
+    ends = _record_ends(monkeypatch)
+    moment = anyio.Event()
+
+    def upstream_ends():
+        if order == "with-the-end":
+            moment.set()  # the stream's last step: upstream has just completed
+
+    gated = lambda _s: _mock_client(lambda request: _framed(upstream_ends))  # noqa: E731
+    proxy = _proxy(gate, monkeypatch, gated)
+    sent: list[dict] = []
+    body = [{"type": "http.request", "body": b"{}", "more_body": False}]
+
+    async def receive():
+        if body:
+            return body.pop()
+        await moment.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+        if order == "with-the-last-chunk" and message.get("body") == LINE_2:
+            moment.set()  # the client goes as the last chunk is written to it
+            await anyio.sleep(30)  # so this write never completes; the watcher cancels it
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        anyio.run(proxy, _chat_scope(), receive, send, CHAT_ROUTE, "rid")
+    lines = [json.loads(x) for x in out.getvalue().splitlines()]
+    return ends, sent, lines, _slot_states(gate)
+
+
+@pytest.mark.td("S16")
+@pytest.mark.parametrize(
+    ("order", "outcome", "slot", "bodies"),
+    [
+        # The watcher records the disconnect while the last chunk is still being written, so
+        # the stream never ended cleanly: a drain, and nothing more is written.
+        ("with-the-last-chunk", "client_disconnect", "draining", [LINE_1, LINE_2]),
+        # The disconnect is delivered in the same step as upstream's end. The exchange runs
+        # on to its end with no await, and the task group cancels the watcher before it
+        # wakes, so the disconnect is never recorded: a clean end, and the final message.
+        ("with-the-end", "ok", "free", [LINE_1, LINE_2, b""]),
+    ],
+    ids=["with-the-last-chunk", "with-the-end"],
+)
+def test_s16_a_disconnect_at_the_moment_upstream_completes(
+    order, outcome, slot, bodies, monkeypatch
+):
+    for _ in range(S16_RUNS):
+        with monkeypatch.context() as patch:
+            ends, sent, lines, slots = _s16_run(order, patch)
+        assert ends == [("finish", True)]  # one effective end in every run
+        (line,) = lines  # and one log line
+        assert (line["outcome"], line["slot_end"], slots) == (outcome, slot, [slot])
+        assert [m.get("body") for m in sent[1:]] == bodies
+
+
+@pytest.mark.td("F2")
+def test_f2_a_disconnect_during_a_blocked_upstream_write(raw_upstream, sidecar, capsys):
+    upstream = _StopsReading()
+    gate, _ = ready_gate()
+    car = sidecar(raw_upstream(upstream).url, gate=gate)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_request(b"/api/chat", b"x" * BIG))
+        assert upstream.head.wait(WAIT_S)  # the sidecar read the body and is writing it
+        sock.shutdown(socket.SHUT_WR)  # the client goes: uvicorn takes EOF as a disconnect
+        wait_for(lambda: _slot_states(gate) == ["draining"])
+        assert upstream.seen_close()  # the fake sees EOF: the sidecar closed its socket
+        try:
+            rest = sock.recv(65536)
+        except OSError:
+            rest = b""
+    assert upstream.read < BIG  # the write was cancelled, never finished
+    assert rest == b""  # no 5xx was written to the gone client
+    (line,) = _chat_lines(capsys, 1)
+    assert (line["outcome"], line["status"], line["slot_end"]) == (
+        "client_disconnect",
+        None,
+        "draining",
+    )
+
+
+def _faulty_pool(how: str):
+    """A gated-client factory whose connection pool's `aclose` hangs for ever or raises (F4):
+    the fault is injected at the transport, beneath httpx's own `aclose`."""
+    real = proxy_module.new_gated_client
+
+    def gated(settings):
+        client = real(settings)
+
+        async def aclose():
+            if how == "hang":
+                await anyio.sleep_forever()
+            raise OSError("the pool would not close")
+
+        client._transport._pool.aclose = aclose
+        return client
+
+    return gated
+
+
+F4_CLOSE_S = 1.0
+VERSION = status(200, b'{"version":"0.40.16"}', [(b"content-type", b"application/json")])
+
+
+@pytest.mark.td("F4")
+@pytest.mark.parametrize("how", ["hang", "raise"])
+def test_f4_an_unproven_close_marks_the_slot_stuck(how, fake_ollama, sidecar, monkeypatch, capsys):
+    fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    fake_ollama.script("GET", "/api/version", VERSION)
+    monkeypatch.setattr(proxy_module, "new_gated_client", _faulty_pool(how))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, close_timeout_s=F4_CLOSE_S)
+    started = time.perf_counter()
+    resp = httpx.post(car.url + "/api/chat", content=b"{}", timeout=WAIT_S)
+    elapsed = time.perf_counter() - started
+    assert (resp.status_code, resp.content) == (200, b'{"done":true}')  # still answered
+    assert elapsed < 2 * F4_CLOSE_S
+    wait_for(lambda: _slot_states(gate) == ["stuck"])
+    stuck_after = time.perf_counter() - started
+    if how == "hang":  # step (a) waited for its bound, then gave up
+        assert F4_CLOSE_S <= stuck_after < F4_CLOSE_S + TIMING_BOUND_S
+    else:
+        assert stuck_after < TIMING_BOUND_S
+    busy = httpx.post(car.url + "/api/chat", content=b"{}", timeout=WAIT_S)
+    assert busy.status_code == 429  # never two at once: a stuck slot is never admitted again
+    assert len(fake_ollama.requests) == 1
+    health = httpx.get(car.url + "/seriatim/health", timeout=WAIT_S)
+    assert (health.status_code, health.json()["reasons"]) == (503, ["slot_stuck"])
+    first, second = _chat_lines(capsys, 2)
+    assert (first["level"], first["outcome"], first["slot_end"]) == ("CRITICAL", "ok", "stuck")
+    assert first["upstream_close_failed"] is True
+    assert (second["outcome"], second["slot_end"]) == ("busy", "none")

@@ -462,6 +462,60 @@ the errors after the headers of §4 and §5.
   chunking, and with the connection left open. Without the bodyless rule, each would look
   close-delimited and drain.
 
+**Details fixed by the code (S1-10).** S1-10 implements the cancellation and close edge
+cases of §3.3 and §5 and tests the ungated pool and its timeouts over the wire.
+- **A second cancellation** (S12). anyio's shield holds off anyio's own cancellations only.
+  uvicorn cancels a request's task on shutdown with asyncio's `Task.cancel()`, and a second
+  such call lands inside the shielded `finally`: it would cut `aclose()` short and skip
+  step (b), so the lease would never end. The `finally` therefore runs steps (a) to (c) and
+  the log line (`Proxy._end`) in a task of its own (`_uninterrupted`), which the request's
+  task awaits through `asyncio.shield`. A cancellation that arrives meanwhile is noted, the
+  wait goes on, and the cancellation is raised again once the cleanup has ended, so the task
+  still ends cancelled. Each step keeps its own `close_timeout_s` bound, so the wait is at
+  most `2 × close_timeout_s`. This ties the proxy to asyncio, which is what uvicorn runs.
+- **Every upstream close is in step (a)** (H26). `aiter_raw()` closes the response itself
+  when the body ends, inside the exchange, where nothing bounds an ungated request. So the
+  relay iterates `resp.stream` instead: the same raw bytes, with httpx's exceptions, and no
+  close at the end. For an ungated request, step (a)'s `resp.aclose()` is then the close on
+  every path, a clean end included, and `close_timeout_s` bounds it. For a gated one,
+  `req_client.aclose()` closes the connection, as before.
+- **`client_write_failed`** (§3.3 line 40, S15). When step (c) raises or passes
+  `close_timeout_s`, the proxy writes a separate line at `DEBUG`: `event:
+  client_write_failed`, the `request_id`, and a `reason` (`timeout`, or the exception's class
+  name). It comes before the request's own line, which is unchanged (`outcome: ok`,
+  `slot_end: free` after a clean end). At the default `INFO` it is not written, so a request
+  still has exactly one line.
+- **S11 to S13 run in process**, with the proxy as an asyncio task cancelled by
+  `Task.cancel()`, as uvicorn does. S11 uses real fakes upstream, so the fake sees each
+  close: the body read (nothing sent; freed), the upstream write (a raw fake that stops
+  reading a 32 MiB body; it then reads to EOF and got less than the body), the wait for the
+  headers and the stream (a `Hold`; drained). S12 and S13 use a gated client whose
+  `aclose()` takes 0.5 s, with `close_timeout_s=2`, and record the slots at the moment it
+  returns: still `HELD`. S13 checks both ends of (b): a clean end frees and a broken one
+  drains.
+- **S16 pins each order** rather than sampling the race, in process, 50 runs each. A
+  disconnect recorded while the last chunk is still being written gives `client_disconnect`
+  and a drain, with nothing written after it. A disconnect delivered in the same step as
+  upstream's end is never recorded: the exchange runs on to its end with no `await`, and the
+  task group cancels the watcher before it wakes, so the response ends cleanly (`ok`, freed,
+  the final message). Every run has one effective end and one log line.
+- **S14 and F2 use 32 MiB**, far more than every socket buffer on the path, so the fake can
+  never finish while the other side stalls: in S14 the client sets a 4 KiB receive buffer
+  and reads nothing, and the fake's `sendall` fails when the sidecar closes at the deadline;
+  in F2 the fake reads only the headers, and the client half-closes its socket, which
+  uvicorn takes as a disconnect.
+- **F4 injects the fault at the transport**: the per-request client's `httpcore` pool gets
+  an `aclose` that sleeps for ever or raises, beneath httpx's own `aclose`. A clean response
+  with a `content-length` reaches the client before step (a), so the test times the slot
+  turning `STUCK` (at `close_timeout_s`, or at once when the close raises) and checks the
+  client's whole exchange against `2 × close_timeout_s`.
+- **H14 and H27** fill the shared pool with 16 `/api/show` requests held before the headers,
+  with `connect_timeout_s=0.5`, which is also the pool timeout, so the 17th gets its 503
+  after 0.5 s. **H26** injects the blocking `aclose()` into the shared client's transport
+  (each response's stream closes the real one, then sleeps for ever), for a clean chunked
+  end (answered) and a read timeout mid-stream (aborted). Its disconnect case uses a read
+  timeout far beyond the disconnect, so the order is fixed.
+
 ### 2.4 `app.py`
 
 ```python
@@ -502,9 +556,10 @@ or health, and so that closing a gated request's upstream connection can be prov
   exchange: `Limits(max_connections=1, max_keepalive_connections=0)`. Its cleanup is
   `await req_client.aclose()`, which closes the connection pool and with it the only
   connection. That one awaited call is the proof of closure that invariant 3 needs. httpx's
-  implicit closes (in `send()` on failure, or when `aiter_raw()` is exhausted) may already
-  have closed the stream. They never stand in for the pool close: `aclose()` is still called,
-  and only its return counts. A loopback connect costs well under a millisecond.
+  implicit close in `send()` on failure may already have closed the stream. It never stands
+  in for the pool close: `aclose()` is still called, and only its return counts. (Since
+  S1-10 the body is read from `resp.stream`, so the end of the body closes nothing; see
+  "Details fixed by the code (S1-10)".) A loopback connect costs well under a millisecond.
 - **One shared client for ungated routes**, with `Limits(max_connections=16,
   max_keepalive_connections=8)` and `Timeout(connect=connect_timeout_s,
   read=ungated_read_timeout_s, write=ungated_read_timeout_s, pool=connect_timeout_s)`. If the
@@ -816,7 +871,8 @@ The body never includes the Ollama version or any address. Probes are logged at 
 ## 4. Streaming passthrough and headers
 
 **Bytes.**
-- The proxy uses `resp.aiter_raw()`, so nothing is decoded.
+- The proxy reads the raw bytes (`resp.stream`, the bytes `resp.aiter_raw()` would give,
+  without its close at the end; S1-10), so nothing is decoded.
 - Chunks are forwarded as they arrive, never collected.
 - A gated request body is the exact bytes received. An ungated body is streamed as received.
 
