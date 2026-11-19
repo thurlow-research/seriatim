@@ -29,8 +29,8 @@ def raw_upstream() -> Iterator[Callable[..., RawUpstream]]:
     """`raw_upstream(handler)` starts a socket fake (TD §7); every one stops at teardown."""
     started: list[RawUpstream] = []
 
-    def start(handler, **kwargs) -> RawUpstream:
-        started.append(RawUpstream(handler, **kwargs).start())
+    def start(handler) -> RawUpstream:
+        started.append(RawUpstream(handler).start())
         return started[-1]
 
     yield start

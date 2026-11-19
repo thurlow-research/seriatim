@@ -3036,10 +3036,34 @@ UNGATED_SLOTS = 16  # the shared client's max_connections (TD §2.4)
 POOL_WAIT_S = 1.0
 
 
+class _Parked:
+    """Holds each request before its headers until `release_all()`. Unlike `Hold`, it polls
+    every 50 ms, not every 2 ms, so 16 parked requests put little load on the fake's loop
+    (and, through the GIL, on the sidecar's) on a slow runner."""
+
+    def __init__(self) -> None:
+        self.entered = 0
+        self._go = threading.Event()
+
+    def wait_entered(self, n: int) -> None:
+        wait_for(lambda: self.entered >= n)
+
+    def release_all(self) -> None:
+        self._go.set()
+
+    async def __call__(self, send, fake, receive=None) -> None:
+        self.entered += 1
+        while not self._go.is_set() and not fake.release.is_set():
+            await anyio.sleep(0.05)
+        start = {"type": "http.response.start", "status": 200}
+        await send({**start, "headers": [(b"content-length", b"2")]})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+
 def _saturated(fake_ollama, sidecar):
-    """Fill the shared pool with 16 held `/api/show` requests and send a 17th. Returns the
+    """Fill the shared pool with 16 parked `/api/show` requests and send a 17th. Returns the
     sidecar, the 17th response, the time it took, the hold and the held requests."""
-    hold = Hold()
+    hold = _Parked()
     fake_ollama.script("POST", "/api/show", hold)
     fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
     fake_ollama.script("GET", "/api/version", VERSION_OK)
@@ -3055,7 +3079,14 @@ def _saturated(fake_ollama, sidecar):
             early = [f.exception() or f.result().status_code for f in held if f.done()]
             raise AssertionError(f"request {i + 1} never reached the fake; ended: {early}") from exc
     started = time.perf_counter()
-    resp = show()
+    try:
+        resp = show()
+    except httpx.TimeoutException as exc:  # say where the 17th went
+        pool = _pool(car.app.client)
+        raise AssertionError(
+            f"the 17th got no answer in {WAIT_S} s: {hold.entered} reached the fake; the pool "
+            f"has {len(pool.connections)} connections and {len(pool._requests)} requests"
+        ) from exc
     return car, resp, time.perf_counter() - started, hold, held
 
 

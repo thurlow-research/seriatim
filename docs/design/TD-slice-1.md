@@ -503,21 +503,24 @@ cases of §3.3 and §5 and tests the ungated pool and its timeouts over the wire
   never finish while the other side stalls: in S14 the client sets a 4 KiB receive buffer
   and reads nothing, and the fake's `sendall` fails when the sidecar closes at the deadline;
   in F2 the fake reads only the headers, and the client half-closes its socket, which
-  uvicorn takes as a disconnect. Where the upstream write must block (F2 and S11's write
-  phase), the buffers are also set small at both ends: a 4 KiB `SO_SNDBUF` on the
-  sidecar's upstream socket (the test rebuilds the client's transport with that socket
-  option) and a 4 KiB `SO_RCVBUF` on the fake (`RawUpstream(rcvbuf=…)`). On the Windows
-  runner, buffers left to the OS absorbed the whole 32 MiB write, so the write finished
-  and the case never reached the phase it names.
+  uvicorn takes as a disconnect. **"The write was cut short" is checked on POSIX only.**
+  On POSIX, anyio's close aborts the transport, so the bytes it had not yet written are
+  dropped and the fake reads less than the body. On Windows, asyncio's proactor hands the
+  whole 32 MiB to the OS as one overlapped send. The OS completes it once the fake reads,
+  even after the cancel and the close, so the fake reads the whole body and then EOF (seen
+  on the Windows runner, with or without small socket buffers). Every other clause of F2
+  and S11's write phase runs on every OS: the cancel during the pending write, the close
+  the fake sees, the drain, and nothing written to the client. The sidecar is deployed on
+  Linux.
 - **F4 injects the fault at the transport**: the per-request client's `httpcore` pool gets
   an `aclose` that sleeps for ever or raises, beneath httpx's own `aclose`. A clean response
   with a `content-length` reaches the client before step (a), so the test times the slot
   turning `STUCK` (at `close_timeout_s`, or at once when the close raises) and checks the
   client's whole exchange against `2 × close_timeout_s`.
 - **H14 and H27** fill the shared pool with 16 `/api/show` requests held before the headers,
-  started one at a time, each once the previous one has reached the fake, so no burst of
-  connects is needed. `connect_timeout_s=1` is also the pool timeout, so the 17th gets its
-  503 after 1 s. **H26** injects the blocking `aclose()` into the shared client's transport
+  started one at a time, each once the previous one has reached the fake. The fake parks
+  them with a 50 ms poll rather than `Hold`'s 2 ms, so 16 of them add little load.
+  `connect_timeout_s=1` is also the pool timeout, so the 17th gets its 503 after 1 s. **H26** injects the blocking `aclose()` into the shared client's transport
   (each response's stream closes the real one, then sleeps for ever), for a clean chunked
   end (answered) and a read timeout mid-stream (aborted). Its disconnect case uses a read
   timeout far beyond the disconnect, so the order is fixed.
