@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import tracemalloc
+import types
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -4217,6 +4218,22 @@ def test_every_path_one_line_seriatims_headers_and_a_valid_body(
     check_contract_bodies(contract_bodies, contract_schemas)
 
 
+def test_ms_rounds_to_two_decimal_places():
+    assert proxy_module._ms(1.234567) == 1234.57
+    assert proxy_module._ms(0.0000404) == 0.04  # Appendix A's wait_ms
+    assert proxy_module._ms(0) == 0
+
+
+def test_the_hold_is_timed_from_admission_to_the_lease_end(monkeypatch, capsys):
+    """hold_ms and wait_ms come from perf_counter(): the gate's answer, then step (b)."""
+    ticks = iter([100.0, 100.5, 103.0])  # arrival, the gate's answer, the lease's end
+    clock = types.SimpleNamespace(perf_counter=lambda: next(ticks))  # proxy.py's own `time`
+    monkeypatch.setattr(proxy_module, "time", clock)
+    _run_proxy(_ok, monkeypatch=monkeypatch)
+    line = _one_line(capsys)
+    assert (line["wait_ms"], line["hold_ms"]) == (500.0, 2500.0)
+
+
 # --- S1-13: K-OAS2, the hook itself -------------------------------------------------------
 
 
@@ -4359,8 +4376,10 @@ def _l1_s4(fake_ollama, sidecar):
 def test_l1_one_line_each_with_appendix_a_fields_and_no_secret(
     scenario, fake_ollama, sidecar, capsys
 ):
+    started = time.perf_counter()
     expected = scenario(fake_ollama, sidecar)
     lines, text = _captured(capsys, "l1-", len(expected))
+    elapsed = time.perf_counter() - started
     assert [
         (d["request_id"], d["outcome"], d["status"], d["slot_end"], d["bytes_in"], d["bytes_out"])
         for d in lines
@@ -4372,8 +4391,11 @@ def test_l1_one_line_each_with_appendix_a_fields_and_no_secret(
         assert (d["method"], d["path"], d["kind"], d["scope"], d["known"]) == (
             "POST", "/api/chat", "gated", "infer", True,
         )  # fmt: skip
-        assert _number(d["wait_ms"])  # every one of these asked the gate
-        assert _number(d["hold_ms"]) if d["slot_end"] != "none" else d["hold_ms"] is None
+        assert _number(d["wait_ms"]) and d["wait_ms"] < WAIT_S * 1000  # each asked the gate
+        if d["slot_end"] == "none":
+            assert d["hold_ms"] is None
+        else:  # held from admission to the lease's end, within the test's own time
+            assert _number(d["hold_ms"]) and d["hold_ms"] < elapsed * 1000
     assert BODY_MARK in SECRET_BODY and text  # the markers were sent, and lines were read
     for mark in (BODY_MARK, AUTH_MARK, KEY_MARK):
         assert mark not in text
@@ -4446,11 +4468,15 @@ def test_l3_no_secret_reaches_the_log(scenario, fake_ollama, sidecar, monkeypatc
         assert MARK not in logged
 
 
-def test_l3_httpx_would_log_the_query(fake_ollama, sidecar, caplog):
+def test_l3_httpx_would_log_the_query(fake_ollama, sidecar, caplog, monkeypatch):
     """The contrast that keeps L3's `caplog` check from passing vacuously: with httpx's logger
     at INFO again, its own line for the same request carries the query."""
     fake_ollama.script("GET", "/api/tags", status(200, b"{}"))
+    for name in ("httpx", "httpcore"):  # as before any sidecar was made in this process
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+    root = logging.getLogger().level
     car = sidecar(fake_ollama.url, gate=ready_gate()[0])
+    assert logging.getLogger().level == root  # only the two libraries' loggers are set
     assert logging.getLogger("httpx").level == logging.WARNING  # set by create_app
     assert logging.getLogger("httpcore").level == logging.WARNING
     caplog.set_level(logging.INFO, logger="httpx")
