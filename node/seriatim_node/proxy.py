@@ -7,16 +7,19 @@ structure. S1-7 adds the full header strip lists of §4 and `prune_httpx_default
 adds the request limits: the size limit and the total timeout in `read_body`, and the
 `Content-Length` check before admission. S1-9 adds the framing rule for a clean end
 (`upstream_framed`, with the bodyless rule first) and the in-stream error record sent before
-an abort after the headers (`record_framing`, `stream_error_record`). Still to come:
-- S1-10: the cancellation and close edge cases;
+an abort after the headers (`record_framing`, `stream_error_record`). S1-10 makes the
+shielded `finally` survive a second cancellation (`_uninterrupted`), bounds every upstream
+close by `close_timeout_s` (the body is read from `resp.stream`, so no close happens inside
+the exchange) and logs a failed final write. Still to come:
 - S1-11: streamed blob uploads (`body_stream`).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import traceback
-from collections.abc import Awaitable, Callable, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -304,6 +307,26 @@ async def watch_disconnect(receive: Receive, outcome: Outcome, scope: anyio.Canc
             return
 
 
+async def _uninterrupted(work: Coroutine[Any, Any, None]) -> None:
+    """Run `work` to its end in a task of its own, whatever cancels this task meanwhile (S12).
+
+    anyio's shield holds off anyio's own cancellations only. A server shutting down cancels
+    the request's task with asyncio's `Task.cancel()`, and a second such call would land
+    inside the shielded `finally`, cutting the close proof short and skipping the end of the
+    lease. Here it lands on `asyncio.shield`, the work goes on, and the cancellation is
+    raised again once the work has ended. The sidecar runs on uvicorn's asyncio loop."""
+    task = asyncio.ensure_future(work)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 # --- the proxy (TD §3.3) --------------------------------------------------------------------
 
 
@@ -361,7 +384,6 @@ class Proxy:
         outcome = Outcome(body_pending=has_body(scope["headers"]))
         lease: Lease | None = None
         req_client: httpx.AsyncClient | None = None
-        slot_end = "none"
         length = declared_length(scope["headers"])
         if length is not None and length > self.settings.max_body_bytes:  # before admission (B7)
             status = await self._reply(
@@ -402,7 +424,6 @@ class Proxy:
                 self.log.emit(**where, outcome="starting", status=status, slot_end="none")
                 return
             lease = r
-        close_failed = False
         try:
             if lease is not None:
                 req_client = new_gated_client(self.settings)  # inside the try (E16)
@@ -415,54 +436,75 @@ class Proxy:
             outcome.error = outcome.error or exc
         finally:
             with anyio.CancelScope(shield=True):
-                # (a) prove upstream closure, within a time bound
-                closed = True
-                if req_client is not None:
-                    closed = False
-                    with anyio.move_on_after(self.settings.close_timeout_s):
-                        try:
-                            await req_client.aclose()
-                            closed = True
-                        except Exception:
-                            pass
-                    close_failed = not closed
-                elif outcome.resp is not None:  # ungated: the shared client; no slot at stake
-                    with anyio.move_on_after(self.settings.close_timeout_s) as ungated_close:
-                        try:
-                            await outcome.resp.aclose()
-                        except Exception:
-                            close_failed = True
-                    close_failed = close_failed or ungated_close.cancelled_caught
-                # (b) end the lease: synchronous, so nothing can block or skip it
-                if lease is not None:
-                    if not closed:
-                        lease.stuck()
-                        slot_end = "stuck"
-                    elif outcome.upstream_done or not outcome.sent_upstream:
-                        lease.finish(clean=True)
-                        slot_end = "free"
-                    else:
-                        lease.finish(clean=False)
-                        slot_end = "draining"
-                # (c) only now talk to the client; a failure here never matters to the slot
-                with anyio.move_on_after(self.settings.close_timeout_s):
-                    try:
-                        await self._finish_response(send, outcome, lease, rid)
-                    except Exception:
-                        pass
-                result, level = _log_outcome(outcome)
-                if result == "internal_error" and outcome.error is not None:
-                    # §5: the traceback goes to the log only, never to the client (E5)
-                    where["traceback"] = "".join(traceback.format_exception(outcome.error))
-                if close_failed:  # REQ-11: CRITICAL when a slot is at stake, else ERROR
-                    where["upstream_close_failed"] = True
-                    if lease is not None or level == "CRITICAL":
-                        level = "CRITICAL"
-                    else:
-                        level = "ERROR"
-                self.log.emit(
-                    level=level, **where, outcome=result, status=outcome.status, slot_end=slot_end
-                )
+                await _uninterrupted(self._end(send, where, outcome, lease, req_client))
+
+    async def _end(
+        self,
+        send: Send,
+        where: dict[str, Any],
+        outcome: Outcome,
+        lease: Lease | None,
+        req_client: httpx.AsyncClient | None,
+    ) -> None:
+        """The `finally` of §3.3: (a) prove upstream closure, (b) end the lease, (c) talk to
+        the client, then log. Each awaited step has its own `close_timeout_s` bound."""
+        rid = where["request_id"]
+        close_failed = False
+        # (a) prove upstream closure, within a time bound
+        closed = True
+        if req_client is not None:
+            closed = False
+            with anyio.move_on_after(self.settings.close_timeout_s):
+                try:
+                    await req_client.aclose()
+                    closed = True
+                except Exception:
+                    pass
+            close_failed = not closed
+        elif outcome.resp is not None:  # ungated: the shared client; no slot at stake
+            with anyio.move_on_after(self.settings.close_timeout_s) as ungated_close:
+                try:
+                    await outcome.resp.aclose()
+                except Exception:
+                    close_failed = True
+            close_failed = close_failed or ungated_close.cancelled_caught
+        # (b) end the lease: synchronous, so nothing can block or skip it
+        slot_end = "none"
+        if lease is not None:
+            if not closed:
+                lease.stuck()
+                slot_end = "stuck"
+            elif outcome.upstream_done or not outcome.sent_upstream:
+                lease.finish(clean=True)
+                slot_end = "free"
+            else:
+                lease.finish(clean=False)
+                slot_end = "draining"
+        # (c) only now talk to the client; a failure here never matters to the slot
+        write_failed: str | None = None
+        with anyio.move_on_after(self.settings.close_timeout_s) as finishing:
+            try:
+                await self._finish_response(send, outcome, lease, rid)
+            except Exception as exc:
+                write_failed = type(exc).__name__
+        if finishing.cancelled_caught:
+            write_failed = "timeout"
+        if write_failed is not None:  # the client is gone or stalled: noted on the one line
+            # (L2 wins over §3.3's "log DEBUG" wording; ruled on #60)
+            where["client_write_failed"] = True
+            where["client_write_failed_reason"] = write_failed
+        result, level = _log_outcome(outcome)
+        if result == "internal_error" and outcome.error is not None:
+            # §5: the traceback goes to the log only, never to the client (E5)
+            where["traceback"] = "".join(traceback.format_exception(outcome.error))
+        if close_failed:  # REQ-11: CRITICAL when a slot is at stake, else ERROR
+            # Only a gated request can be CRITICAL already (the hold limit), so the slot
+            # alone decides.
+            where["upstream_close_failed"] = True
+            level = "CRITICAL" if lease is not None else "ERROR"
+        self.log.emit(
+            level=level, **where, outcome=result, status=outcome.status, slot_end=slot_end
+        )
 
     def _hold_remaining(self, lease: Lease | None) -> float | None:
         """Seconds left before the hold limit; None (no limit) for an ungated request."""
@@ -519,7 +561,9 @@ class Proxy:
             outcome.started = True
             outcome.status = resp.status_code
             received = 0
-            async for chunk in resp.aiter_raw():
+            # The raw bytes, as `aiter_raw()` gives them, but without its close at the end:
+            # every upstream close is in step (a), where `close_timeout_s` bounds it (H26).
+            async for chunk in resp.stream:
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
                 outcome.tail = (outcome.tail + chunk)[-2:]
                 received += len(chunk)
