@@ -7,17 +7,20 @@ H4-H8, H25, B1-B5, E1). S1-7: the header rules (H3, H9, H11, H15-H18, H20, H21, 
 S1-8: the request limits (E3, E4, E7-E11, B6, B7, H28, H29). S1-9: the framing rule, the
 in-stream record and internal errors (H13, E5, E15). S1-10: client construction after
 admission, the full ungated pool and the ungated stalls and closes (E16, H14, H26, H27).
+S1-11: streamed blob uploads (H10, E6, E12-E14).
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import random
 import re
 import socket
 import threading
 import time
+import tracemalloc
 from pathlib import Path
 
 import anyio
@@ -3290,3 +3293,431 @@ def test_h26_a_blocked_close_of_the_shared_response_is_bounded(end, fake_ollama,
     )
     assert line["outcome"] == ("ok" if end == "clean" else "upstream_error")
     assert acquired == [] and all_free(gate)
+
+
+# --- S1-11: blob uploads (TD §3.3 step 1, §5) ------------------------------------------------
+
+MIB = 1 << 20
+BLOB = b"/api/blobs/sha256:" + b"ab" * 32
+INTERRUPTED = "the upload was interrupted"
+
+
+def _blob_head(length: int | None) -> bytes:
+    """A blob upload's request head: an honest `Content-Length`, or chunked when None."""
+    framing = b"Transfer-Encoding: chunked" if length is None else b"Content-Length: %d" % length
+    return b"POST %s HTTP/1.1\r\nHost: x\r\n%s\r\n\r\n" % (BLOB, framing)
+
+
+def _chunked(body: bytes, sizes: list[int]) -> bytes:
+    """`body` in chunks of these sizes, then the terminating chunk."""
+    parts, at = [], 0
+    for n in sizes:
+        parts.append(b"%x\r\n%s\r\n" % (n, body[at : at + n]))
+        at += n
+    assert at == len(body)
+    return b"".join(parts) + b"0\r\n\r\n"
+
+
+def _blob_fake(fake_ollama, behaviour=None):
+    """The fake in sink mode, answering a stored blob as Ollama does (201)."""
+    fake_ollama.sink = True
+    fake_ollama.script("POST", BLOB.decode(), behaviour or status(201))
+    return fake_ollama
+
+
+def _upload(fake_ollama):
+    """The one upload the fake has seen, once it has arrived."""
+    wait_for(lambda: len(fake_ollama.requests) == 1)
+    return fake_ollama.requests[0]
+
+
+class _OneReceiver:
+    """Wraps the app's `receive` for each HTTP request (E14). `overlaps` counts every call
+    entered while another call for the same request was still pending; `messages` keeps the
+    type of each message the proxy got; `entered` is set at the first call."""
+
+    def __init__(self) -> None:
+        self.overlaps = 0
+        self.messages: list[str] = []
+        self.entered = threading.Event()
+
+    def guard(self, receive):
+        pending = 0
+
+        async def guarded():
+            nonlocal pending
+            if pending:
+                self.overlaps += 1
+            pending += 1
+            self.entered.set()
+            try:
+                msg = await receive()
+            finally:
+                pending -= 1
+            self.messages.append(msg["type"])
+            return msg
+
+        return guarded
+
+    def wrap(self, app):
+        async def guarded_app(scope, receive, send):
+            if scope["type"] != "http":
+                return await app(scope, receive, send)
+            return await app(scope, self.guard(receive), send)
+
+        return guarded_app
+
+
+def test_the_receive_guard_sees_an_overlap():
+    """The guard E14 relies on is not vacuous: two pending calls are one overlap."""
+    one = _OneReceiver()
+
+    async def slow_receive():
+        await anyio.sleep(0.05)
+        return {"type": "http.disconnect"}
+
+    async def main():
+        guarded = one.guard(slow_receive)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(guarded)
+            tg.start_soon(guarded)
+        await guarded()  # after both: no overlap
+
+    anyio.run(main)
+    assert (one.overlaps, one.messages) == (1, ["http.disconnect"] * 3)
+
+
+def test_streamed():
+    assert proxy_module.streamed("POST", BLOB)
+    assert not proxy_module.streamed("HEAD", BLOB)  # bodyless, and buffered like the rest
+    assert not proxy_module.streamed("POST", BLOB + b"/")
+    assert not proxy_module.streamed("POST", b"/api/blobs/sha256:" + b"A" * 64)
+    assert not proxy_module.streamed("POST", b"/api/chat")
+
+
+def test_upstream_headers_for_a_streamed_body():
+    """A streamed body keeps the client's validated `Content-Length`, or has none (§4)."""
+    rid = (b"x-request-id", b"rid")
+    sized = [(b"content-length", b"7"), (b"x-a", b"1")]
+    assert proxy_module.upstream_headers(sized, body_len=None, request_id="rid") == [
+        (b"x-a", b"1"),
+        (b"content-length", b"7"),
+        rid,
+    ]
+    chunked = [(b"transfer-encoding", b"chunked"), (b"x-a", b"1")]
+    assert proxy_module.upstream_headers(chunked, body_len=None, request_id="rid") == [
+        (b"x-a", b"1"),
+        rid,
+    ]
+    assert proxy_module.upstream_headers(sized, body_len=3, request_id="rid") == [
+        (b"x-a", b"1"),
+        (b"content-length", b"3"),
+        rid,
+    ]
+
+
+def _part(body: bytes, more: bool = True) -> dict:
+    return {"type": "http.request", "body": body, "more_body": more}
+
+
+def _feed(messages: list, *, every_s: float = 0):
+    """A `receive` that returns these messages (each after `every_s`), then waits."""
+
+    async def receive():
+        if messages:
+            await anyio.sleep(every_s)
+            return messages.pop(0)
+        await anyio.sleep(30)
+
+    return receive
+
+
+def test_first_chunk():
+    async def first(messages, timeout_s=WAIT_S):
+        return await proxy_module.first_chunk(_feed(messages), timeout_s=timeout_s)
+
+    assert anyio.run(first, [_part(b""), _part(b"ab"), _part(b"c")]) == (b"ab", True)
+    assert anyio.run(first, [_part(b"ab", False)]) == (b"ab", False)
+    assert anyio.run(first, [_part(b""), _part(b"", False)]) == (b"", False)  # an empty body
+    with pytest.raises(proxy_module.ClientGone):
+        anyio.run(first, [_part(b""), {"type": "http.disconnect"}])
+    started = time.perf_counter()
+    with pytest.raises(proxy_module.BodyTimeout):
+        anyio.run(first, [_part(b"")], 0.2)  # empty chunks are not the first chunk
+    assert 0.2 * 0.9 <= time.perf_counter() - started < 0.2 + TIMING_BOUND_S
+
+
+def _stream(messages, first=b"f", more=True, *, timeout_s=WAIT_S, every_s=0.0):
+    """Run `body_stream` to its end; return the events seen, in order, and the error."""
+    events: list = []
+
+    async def main():
+        stream = proxy_module.body_stream(
+            _feed(messages, every_s=every_s),
+            first,
+            more,
+            timeout_s=timeout_s,
+            on_end=lambda: events.append("end"),
+        )
+        try:
+            async for chunk in stream:
+                events.append(chunk)
+        except proxy_module.UploadInterrupted as exc:
+            return exc
+        return None
+
+    return events, anyio.run(main)
+
+
+def test_body_stream_forwards_each_chunk_and_ends_once():
+    events, error = _stream([_part(b"a"), _part(b""), _part(b"b", False), _part(b"never")])
+    assert (events, error) == ([b"f", b"a", "end", b"b"], None)  # `end` before the last chunk
+    assert _stream([], b"f", False) == (["end", b"f"], None)  # all of it in the first message
+    assert _stream([], b"", False) == (["end"], None)  # an empty body yields nothing
+    assert _stream([_part(b"", False)]) == ([b"f", "end"], None)
+
+
+def test_body_stream_interruptions():
+    events, error = _stream([_part(b"a"), {"type": "http.disconnect"}])
+    assert events == [b"f", b"a"] and error.gone and str(error) == "the client left"
+    started = time.perf_counter()
+    events, error = _stream([_part(b"a")], timeout_s=0.2)
+    assert 0.2 * 0.9 <= time.perf_counter() - started < 0.2 + TIMING_BOUND_S
+    assert events == [b"f", b"a"] and not error.gone and str(error) == "the upload stalled"
+
+
+def test_body_stream_timeout_is_idle_not_total():
+    """Four chunks 0.15 s apart take 0.6 s, past the 0.3 s timeout, and still arrive."""
+    parts = [_part(b"a"), _part(b"b"), _part(b"c"), _part(b"d", False)]
+    events, error = _stream(parts, timeout_s=0.3, every_s=0.15)
+    assert (events, error) == ([b"f", b"a", b"b", b"c", "end", b"d"], None)
+
+
+class _AnswersEarly(httpx.AsyncBaseTransport):
+    """Answers before reading any of the request body, as a server may."""
+
+    async def handle_async_request(self, request):
+        return httpx.Response(400, stream=_Stream([b"{"], then="stall"))
+
+
+def test_an_early_answer_closes_and_the_watcher_takes_receive(capsys):
+    """Ollama answers before the upload has been read: the reply closes the connection (the
+    client's body is still unread, S1-8), and the watcher takes `receive()` over, so a
+    disconnect is still seen (§3.3 step 2)."""
+    settings = make_settings("http://127.0.0.1:1")
+    gate, _ = ready_gate()
+    shared = httpx.AsyncClient(transport=_AnswersEarly(), base_url="http://127.0.0.1:1")
+    proxy = Proxy(settings, gate, shared, RequestLog("INFO", "node-a"), ErrorFactory("node-a"))
+    one = _OneReceiver()
+    receive = one.guard(_feed([_part(b"ab"), {"type": "http.disconnect"}]))
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    headers = [(b"content-length", b"4")]
+    scope = {"method": "POST", "raw_path": BLOB, "query_string": b"", "headers": headers}
+    anyio.run(proxy, scope, receive, send, classify("POST", BLOB), "rid")
+    assert [m["type"] for m in sent] == ["http.response.start", "http.response.body"]
+    assert (sent[0]["status"], dict(sent[0]["headers"])[b"connection"]) == (400, b"close")
+    assert (one.messages, one.overlaps) == (["http.request", "http.disconnect"], 0)
+    line = _one_line(capsys)
+    assert (line["outcome"], line["status"], line["slot_end"]) == ("client_disconnect", 400, "none")
+
+
+@pytest.mark.td("H10")
+def test_h10_a_100_mib_upload_streams_past_the_size_limit(fake_ollama, sidecar, capsys):
+    _blob_fake(fake_ollama)
+    car = sidecar(fake_ollama.url, max_body_bytes=MIB)
+    total = 100 * MIB
+    # The limit is in force: a buffered route refuses the same length before admission.
+    show = b"POST /api/show HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % total
+    assert _send_and_read(car, show).status == 413
+    block = random.Random(10).randbytes(MIB)  # allocated before tracing starts
+    expected = hashlib.sha256()
+    for _ in range(100):
+        expected.update(block)
+    view = memoryview(block)
+    tracemalloc.start()
+    try:
+        with raw_connect(car.port, timeout=60) as sock:
+            sock.sendall(_blob_head(total))
+            for _ in range(100):
+                sock.sendall(view)
+            resp = read_response(sock)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert resp.status == 201
+    rec = _upload(fake_ollama)
+    assert (rec.length, rec.sha256, rec.complete) == (total, expected.hexdigest(), True)
+    assert [v for k, v in rec.headers if k == b"content-length"] == [str(total).encode()]
+    assert peak < 16 * MIB, f"traced peak {peak / MIB:.1f} MiB: the upload was buffered"
+    lines = _wait_log_lines(capsys, 2)
+    assert (lines[0]["outcome"], lines[0]["status"]) == ("rejected", 413)
+    assert (lines[1]["kind"], lines[1]["outcome"], lines[1]["status"], lines[1]["slot_end"]) == (
+        "ungated",
+        "ok",
+        201,
+        "none",
+    )
+
+
+def _replay_safe(resp: RawResponse) -> bool:
+    return json.loads(resp.body)["replay_safe"]
+
+
+@pytest.mark.td("E6")
+def test_e6_a_stall_after_bytes_were_forwarded_is_upload_interrupted(
+    fake_ollama, sidecar, envelope_validator, capsys
+):
+    _blob_fake(fake_ollama)
+    car = sidecar(fake_ollama.url, body_timeout_s=0.5)
+    with raw_connect(car.port) as sock:
+        started = time.perf_counter()
+        sock.sendall(_blob_head(2 * MIB) + bytes(MIB))  # half the body, then a stall
+        rec = _upload(fake_ollama)
+        wait_for(lambda: rec.length == MIB)  # 1 MiB has been forwarded
+        forwarded = time.perf_counter()
+        resp = read_response(sock)
+        done = time.perf_counter()
+    _refused(resp, 408, ErrorCode.UPLOAD_INTERRUPTED, INTERRUPTED, "ungated", envelope_validator)
+    assert _replay_safe(resp) is False
+    assert done - started >= 0.5 * 0.9  # the idle timeout, after the last byte
+    assert done - forwarded < 0.5 + TIMING_BOUND_S
+    wait_for(lambda: not rec.complete)  # the upstream connection is closed
+    assert rec.sha256 is None
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"], line["slot_end"]) == (
+        "upload_interrupted",
+        408,
+        "none",
+    )
+
+
+@pytest.mark.td("E6")
+def test_e6_a_stall_before_the_first_chunk_is_replay_safe(
+    fake_ollama, sidecar, envelope_validator, capsys
+):
+    _blob_fake(fake_ollama)
+    car = sidecar(fake_ollama.url, body_timeout_s=0.5)
+    started = time.perf_counter()
+    resp = _send_and_read(car, _blob_head(MIB))  # the headers only
+    elapsed = time.perf_counter() - started
+    _refused(resp, 408, ErrorCode.REQUEST_BODY_TIMEOUT, TOO_SLOW, "ungated", envelope_validator)
+    assert _replay_safe(resp) is True
+    assert 0.5 * 0.9 <= elapsed < 0.5 + TIMING_BOUND_S
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"], line["slot_end"]) == ("rejected", 408, "none")
+    assert fake_ollama.requests == []  # Ollama was never contacted
+
+
+@pytest.mark.td("E12")
+def test_e12_the_uploader_leaves_before_the_first_chunk(fake_ollama, sidecar, capsys):
+    _blob_fake(fake_ollama)
+    one = _OneReceiver()
+    car = sidecar(fake_ollama.url, wrap=one.wrap)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_blob_head(MIB))
+        assert one.entered.wait(WAIT_S)  # the proxy is waiting for the first chunk
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"], line["slot_end"]) == (
+        "client_disconnect",
+        None,
+        "none",
+    )
+    assert one.messages == ["http.disconnect"]
+    assert fake_ollama.requests == []  # nothing reached Ollama
+
+
+@pytest.mark.td("E12")
+def test_e12_the_uploader_leaves_after_the_first_chunk(fake_ollama, sidecar, capsys):
+    _blob_fake(fake_ollama)
+    car = sidecar(fake_ollama.url)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_blob_head(MIB) + bytes(64 * 1024))
+        rec = _upload(fake_ollama)
+        wait_for(lambda: rec.length > 0)  # the first chunk was forwarded
+    wait_for(lambda: not rec.complete)  # the fake sees the upstream connection close
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"], line["slot_end"]) == (
+        "upload_interrupted",
+        None,  # nobody to answer
+        "none",
+    )
+
+
+@pytest.mark.td("E13")
+def test_e13_a_chunked_upload_in_uneven_chunks(fake_ollama, sidecar, capsys):
+    _blob_fake(fake_ollama)
+    car = sidecar(fake_ollama.url, max_body_bytes=LIMIT)  # no limit applies to a blob
+    rng = random.Random(13)
+    body = rng.randbytes(3 * MIB)
+    sizes: list[int] = []
+    while (left := len(body) - sum(sizes)) > 0:
+        sizes.append(min(left, rng.choice([1, 7, 4096, 65537, 300_001])))
+    resp = _send_and_read(car, _blob_head(None) + _chunked(body, sizes))
+    assert resp.status == 201
+    rec = _upload(fake_ollama)
+    assert (rec.length, rec.sha256) == (len(body), hashlib.sha256(body).hexdigest())
+    names = _names(rec.headers)
+    assert b"content-length" not in names and b"transfer-encoding" in names  # sent chunked
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"]) == ("ok", 201)
+
+
+@pytest.mark.td("E13")
+def test_e13_an_empty_chunked_upload(fake_ollama, sidecar):
+    mismatch = b'{"error":"digest mismatch"}'
+    _blob_fake(fake_ollama, status(400, mismatch, [(b"content-type", b"application/json")]))
+    car = sidecar(fake_ollama.url)
+    resp = _send_and_read(car, _blob_head(None) + b"0\r\n\r\n")
+    assert (resp.status, resp.body) == (400, mismatch)  # Ollama's status, passed through
+    assert resp.header("connection") == []  # the body was read: keep-alive is safe
+    rec = _upload(fake_ollama)
+    assert (rec.length, rec.sha256, rec.complete) == (0, hashlib.sha256().hexdigest(), True)
+
+
+@pytest.mark.td("E14")
+@pytest.mark.parametrize("when", ["before", "during", "after"])
+def test_e14_one_owner_of_receive_in_a_blob_upload(when, fake_ollama, sidecar, capsys):
+    hold = Hold()
+    _blob_fake(fake_ollama, hold)
+    one = _OneReceiver()
+    car = sidecar(fake_ollama.url, wrap=one.wrap)
+    body = bytes(64 * 1024)
+    with raw_connect(car.port) as sock:
+        if when == "before":
+            sock.sendall(_blob_head(len(body)))
+            assert one.entered.wait(WAIT_S)
+        elif when == "during":
+            sock.sendall(_blob_head(2 * len(body)) + body)
+            wait_for(lambda: fake_ollama.requests and fake_ollama.requests[0].length > 0)
+        else:
+            sock.sendall(_blob_head(len(body)) + body)
+            hold.wait_entered()  # the body has ended; the watcher owns receive
+    (line,) = _wait_log_lines(capsys, 1)
+    expected = {"before": "client_disconnect", "during": "upload_interrupted"}
+    assert line["outcome"] == expected.get(when, "client_disconnect")
+    if when == "after":
+        hold.wait_disconnected()
+    assert one.overlaps == 0
+    assert one.messages[-1] == "http.disconnect"  # the proxy saw the disconnect itself
+
+
+@pytest.mark.td("E14")
+def test_e14_one_owner_of_receive_while_waiting_for_headers(fake_ollama, sidecar, capsys):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    one = _OneReceiver()
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, wrap=one.wrap)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_raw_chat())
+        hold.wait_entered()
+    hold.wait_disconnected()
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["slot_end"]) == ("client_disconnect", "draining")
+    assert one.overlaps == 0
+    *body, last = one.messages  # the body read, then the watcher's disconnect
+    assert body and set(body) == {"http.request"} and last == "http.disconnect"

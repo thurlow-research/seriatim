@@ -10,8 +10,9 @@ adds the request limits: the size limit and the total timeout in `read_body`, an
 an abort after the headers (`record_framing`, `stream_error_record`). S1-10 makes the
 shielded `finally` survive a second cancellation (`_uninterrupted`), bounds every upstream
 close by `close_timeout_s` (the body is read from `resp.stream`, so no close happens inside
-the exchange) and logs a failed final write. Still to come:
-- S1-11: streamed blob uploads (`body_stream`).
+the exchange) and logs a failed final write. S1-11 streams blob uploads (`first_chunk`,
+`body_stream`): no size limit, an idle timeout between chunks, and 408 `UPLOAD_INTERRUPTED`
+once bytes may have reached Ollama.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import traceback
-from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, MutableMapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -28,7 +29,7 @@ import httpx
 
 from seriatim_node.app import ErrorCode, ErrorFactory, RequestLog, new_client
 from seriatim_node.config import Settings
-from seriatim_node.gate import Busy, Gate, Kind, Lease, Route, Starting
+from seriatim_node.gate import BLOB_RE, Busy, Gate, Kind, Lease, Route, Starting
 
 Scope = MutableMapping[str, Any]
 Receive = Callable[[], Awaitable[MutableMapping[str, Any]]]
@@ -123,12 +124,16 @@ def _strip(headers: Headers, drop: frozenset[bytes], prefixes: tuple[bytes, ...]
     ]
 
 
-def upstream_headers(client_headers: Headers, *, body_len: int, request_id: str) -> Headers:
-    """The client's headers for Ollama (TD §4): the strip list removed, then the framing set
-    from the buffered body, and the sidecar's sanitised request id in place of the client's."""
+def upstream_headers(client_headers: Headers, *, body_len: int | None, request_id: str) -> Headers:
+    """The client's headers for Ollama (TD §4): the strip list removed, then the framing, and
+    the sidecar's sanitised request id in place of the client's. The framing is the buffered
+    body's length; for a streamed body (`body_len` None) it is the client's own
+    `Content-Length`, which h11 has validated, or none, and httpx then sends it chunked."""
+    length = body_len if body_len is not None else declared_length(client_headers)
+    framing = [] if length is None else [(b"content-length", str(length).encode())]
     return [
         *_strip(client_headers, _UPSTREAM_DROP, _UPSTREAM_DROP_PREFIXES),
-        (b"content-length", str(body_len).encode()),
+        *framing,
         (b"x-request-id", request_id.encode()),
     ]
 
@@ -239,6 +244,21 @@ class BodyTimeout(Exception):
     """The request body had not fully arrived within `body_timeout_s` (408)."""
 
 
+class UploadInterrupted(Exception):
+    """A streamed upload stalled, or its client left, after Ollama was contacted: bytes may
+    have reached Ollama, so a retry is not replay-safe (408 `UPLOAD_INTERRUPTED`, §5)."""
+
+    def __init__(self, *, gone: bool) -> None:
+        super().__init__("the client left" if gone else "the upload stalled")
+        self.gone = gone  # the client left: nobody to answer
+
+
+def streamed(method: str, raw_path: bytes) -> bool:
+    """Whether the request body is streamed rather than buffered: only a blob upload,
+    `POST /api/blobs/sha256:<hex>`, which can be gigabytes (§3.3 step 1)."""
+    return method == "POST" and BLOB_RE.fullmatch(raw_path) is not None
+
+
 def declared_length(headers: Headers) -> int | None:
     """The request's `Content-Length`, or None when it has none (a chunked body). h11 has
     already refused a malformed or conflicting value (H28), so the first one is the value."""
@@ -278,6 +298,56 @@ async def read_body(receive: Receive, *, limit: int, timeout_s: float) -> bytes:
             if not msg.get("more_body", False):
                 return b"".join(chunks)
     raise BodyTimeout  # the loop leaves only by return, raise or the deadline
+
+
+async def first_chunk(receive: Receive, *, timeout_s: float) -> tuple[bytes, bool]:
+    """The first bytes of a streamed body and whether more follow, read **before** Ollama is
+    contacted (§3.3 step 1). Raises `BodyTimeout` if no byte (nor the end of the body) has
+    arrived within `timeout_s`, and `ClientGone` on a disconnect: both are replay-safe,
+    because nothing was sent."""
+    with anyio.move_on_after(timeout_s):
+        while True:
+            msg = await receive()
+            if msg["type"] == "http.disconnect":
+                raise ClientGone
+            chunk = msg.get("body", b"")
+            more = msg.get("more_body", False)
+            if chunk or not more:
+                return chunk, more
+    raise BodyTimeout  # the loop leaves only by return, raise or the deadline
+
+
+async def body_stream(
+    receive: Receive,
+    first: bytes,
+    more: bool,
+    *,
+    timeout_s: float,
+    on_end: Callable[[], None],
+) -> AsyncIterator[bytes]:
+    """The whole streamed body, `first` included, forwarded as it arrives and never collected
+    (§3.3 step 1). It is the only caller of `receive()` until the body ends, and calls
+    `on_end()` as soon as it has, before the last chunk is yielded, so the watcher can take
+    over. Each wait for a chunk has an idle timeout of `timeout_s`. A stall or a disconnect
+    raises `UploadInterrupted`, because Ollama has been contacted by now."""
+    if not more:
+        on_end()
+    if first:
+        yield first
+    while more:
+        msg = None
+        with anyio.move_on_after(timeout_s):
+            msg = await receive()
+        if msg is None:
+            raise UploadInterrupted(gone=False)
+        if msg["type"] == "http.disconnect":
+            raise UploadInterrupted(gone=True)
+        chunk = msg.get("body", b"")
+        more = msg.get("more_body", False)
+        if not more:
+            on_end()
+        if chunk:
+            yield chunk
 
 
 @dataclass
@@ -385,7 +455,8 @@ class Proxy:
         lease: Lease | None = None
         req_client: httpx.AsyncClient | None = None
         length = declared_length(scope["headers"])
-        if length is not None and length > self.settings.max_body_bytes:  # before admission (B7)
+        too_large = length is not None and length > self.settings.max_body_bytes
+        if too_large and not streamed(scope["method"], scope["raw_path"]):  # before admission
             status = await self._reply(
                 send,
                 ErrorCode.BODY_TOO_LARGE,
@@ -523,21 +594,48 @@ class Proxy:
     ) -> None:
         """Read the body, send it upstream and relay the response. Records every failure in
         `outcome` instead of raising, so the task group only ever sees cancellations."""
-        try:
-            body = await read_body(
-                receive,
-                limit=self.settings.max_body_bytes,
-                timeout_s=self.settings.body_timeout_s,
-            )
+        watching = False
+
+        def watch() -> None:
+            """Start the watcher, once: from then on it is the only caller of `receive()`."""
+            nonlocal watching
+            if not watching:
+                watching = True
+                tg.start_soon(watch_disconnect, receive, outcome, tg.cancel_scope)
+
+        def body_ended() -> None:
             outcome.body_pending = False
-            tg.start_soon(watch_disconnect, receive, outcome, tg.cancel_scope)
+            watch()
+
+        try:
+            content: bytes | AsyncIterator[bytes]
+            body_len: int | None = None
+            if streamed(scope["method"], scope["raw_path"]):
+                # A blob upload: the first chunk before Ollama is contacted, then the rest as
+                # it arrives; the watcher starts when the body ends (§3.3 steps 1 and 2).
+                first, more = await first_chunk(receive, timeout_s=self.settings.body_timeout_s)
+                content = body_stream(
+                    receive,
+                    first,
+                    more,
+                    timeout_s=self.settings.body_timeout_s,
+                    on_end=body_ended,
+                )
+            else:
+                content = await read_body(
+                    receive,
+                    limit=self.settings.max_body_bytes,
+                    timeout_s=self.settings.body_timeout_s,
+                )
+                body_len = len(content)
+                body_ended()
             client = req_client if req_client is not None else self.client
             query = scope["query_string"]
             url = client.base_url.copy_with(
                 raw_path=scope["raw_path"] + (b"?" + query if query else b"")
             )
-            headers = upstream_headers(scope["headers"], body_len=len(body), request_id=rid)
-            req = client.build_request(scope["method"], url, headers=headers, content=body)
+            headers = upstream_headers(scope["headers"], body_len=body_len, request_id=rid)
+            req = client.build_request(scope["method"], url, headers=headers, content=content)
             prune_httpx_defaults(req, headers)
             outcome.sent_upstream = True
             try:
@@ -546,17 +644,19 @@ class Proxy:
                 outcome.sent_upstream = False
                 raise
             outcome.resp = resp
+            # Ollama may answer before it has read the whole upload. Nothing reads `receive()`
+            # then, so the watcher takes it over (and discards the rest of the body).
+            watch()
+            relayed = downstream_headers(
+                resp.headers,
+                gate_value="acquired" if lease is not None else "ungated",
+                node_id=self.settings.id,
+                request_id=rid,
+            )
+            if outcome.body_pending:  # the client's body is still unread: close (S1-8)
+                relayed.append((b"connection", b"close"))
             await send(
-                {
-                    "type": "http.response.start",
-                    "status": resp.status_code,
-                    "headers": downstream_headers(
-                        resp.headers,
-                        gate_value="acquired" if lease is not None else "ungated",
-                        node_id=self.settings.id,
-                        request_id=rid,
-                    ),
-                }
+                {"type": "http.response.start", "status": resp.status_code, "headers": relayed}
             )
             outcome.started = True
             outcome.status = resp.status_code
@@ -597,6 +697,8 @@ class Proxy:
                 record = stream_error_record(framing, failure[0].value, failure[1])
                 await send({"type": "http.response.body", "body": record, "more_body": True})
             return
+        if isinstance(outcome.error, UploadInterrupted) and outcome.error.gone:
+            return  # the uploader left: nobody to answer
         gate_value = "acquired" if lease is not None else "ungated"
         reply = _error_reply(outcome)
         if reply is None:
@@ -618,6 +720,8 @@ def _error_reply(outcome: Outcome) -> tuple[ErrorCode, str, dict[str, Any]] | No
         return ErrorCode.BODY_TOO_LARGE, "the request body is too large", {}
     if isinstance(err, BodyTimeout):
         return ErrorCode.REQUEST_BODY_TIMEOUT, "the request body did not arrive in time", {}
+    if isinstance(err, UploadInterrupted):
+        return ErrorCode.UPLOAD_INTERRUPTED, "the upload was interrupted", {}
     if isinstance(err, (httpx.ConnectError, httpx.ConnectTimeout)):
         return ErrorCode.UPSTREAM_UNAVAILABLE, "Ollama is not reachable", {}
     if isinstance(err, httpx.PoolTimeout):
@@ -638,6 +742,8 @@ def _log_outcome(outcome: Outcome) -> tuple[str, str]:
         return "hold_exceeded", "CRITICAL"
     if isinstance(err, (BodyTooLarge, BodyTimeout)):
         return "rejected", "INFO"
+    if isinstance(err, UploadInterrupted):
+        return "upload_interrupted", "INFO"
     if isinstance(err, (httpx.ConnectError, httpx.ConnectTimeout)):
         return "upstream_unavailable", "INFO"
     if isinstance(err, httpx.PoolTimeout):
