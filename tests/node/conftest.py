@@ -18,8 +18,12 @@ from harness import (
     start_sidecar,
 )
 
-import seriatim_node.app as app_module
 import seriatim_node.proxy as proxy_module
+
+# `from … import`, not `import seriatim_node.app as …`: the latter reads the package's `app`
+# attribute, which test_package.py's runpy test rebinds to a fresh module. mutmut runs pytest
+# twice in one process, so the second run would patch a module the harness doesn't use.
+from seriatim_node.app import ErrorFactory, _Dispatcher
 
 
 @pytest.fixture(scope="session")
@@ -34,9 +38,9 @@ def contract_bodies(monkeypatch, contract_schemas) -> Iterator[ContractBodies]:
     body the sidecar makes during a test, in process (the servers run in threads), and check
     each against the contract at teardown. A body that doesn't validate fails the test."""
     bodies = ContractBodies()
-    response = app_module.ErrorFactory.response
+    response = ErrorFactory.response
     record = proxy_module.stream_error_record
-    health = app_module._Dispatcher._health
+    health = _Dispatcher._health
 
     def collect_response(self, *args, **kwargs):
         result = response(self, *args, **kwargs)
@@ -53,9 +57,9 @@ def contract_bodies(monkeypatch, contract_schemas) -> Iterator[ContractBodies]:
         bodies.health.append(result.body)
         return result
 
-    monkeypatch.setattr(app_module.ErrorFactory, "response", collect_response)
+    monkeypatch.setattr(ErrorFactory, "response", collect_response)
     monkeypatch.setattr(proxy_module, "stream_error_record", collect_record)
-    monkeypatch.setattr(app_module._Dispatcher, "_health", collect_health)
+    monkeypatch.setattr(_Dispatcher, "_health", collect_health)
     yield bodies
     check_contract_bodies(bodies, contract_schemas)
 

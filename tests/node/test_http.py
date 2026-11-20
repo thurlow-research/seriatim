@@ -67,7 +67,6 @@ from harness import (
 )
 from openapi_spec_validator import OpenAPIV31SpecValidator, validate
 
-import seriatim_node.app as app_module
 import seriatim_node.proxy as proxy_module
 from seriatim_node.app import (
     ERROR_TABLE,
@@ -76,6 +75,7 @@ from seriatim_node.app import (
     ErrorSpec,
     NoCookies,
     RequestLog,
+    _Dispatcher,
     create_app,
     new_health_client,
     request_id_from,
@@ -4532,7 +4532,7 @@ def test_hl8_health_under_load_while_ollama_stalls(
 ):
     _room_for_sockets(HEALTH_LOAD)
     handled: list[float] = []
-    inner = app_module._Dispatcher._health
+    inner = _Dispatcher._health
 
     async def timed(self, request):
         started = time.perf_counter()
@@ -4541,7 +4541,7 @@ def test_hl8_health_under_load_while_ollama_stalls(
         finally:
             handled.append(time.perf_counter() - started)
 
-    monkeypatch.setattr(app_module._Dispatcher, "_health", timed)
+    monkeypatch.setattr(_Dispatcher, "_health", timed)
     fake_ollama.script("GET", "/api/version", stall_headers())
     fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
     car = sidecar(fake_ollama.url, gate=ready_gate()[0], health_probe_timeout_s=HL8_PROBE_S)
