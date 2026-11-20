@@ -454,6 +454,7 @@ def test_main_runs_uvicorn_with_one_h11_worker(node_env, monkeypatch, tmp_path):
         "workers": 1,
         "lifespan": "on",
         "log_config": None,
+        "access_log": False,
         "server_header": False,
         "date_header": True,
     }
