@@ -527,6 +527,53 @@ cases of §3.3 and §5 and tests the ungated pool and its timeouts over the wire
   end (answered) and a read timeout mid-stream (aborted). Its disconnect case uses a read
   timeout far beyond the disconnect, so the order is fixed.
 
+**Details fixed by the code (S1-11).** S1-11 streams blob uploads (§3.3 steps 1 and 2, §5).
+- **What is streamed.** `streamed(method, raw_path)` is true for `POST` on `BLOB_RE` only. A
+  `HEAD` on a blob path has no body and takes the buffered path. The size check before
+  admission and `read_body`'s limit skip a streamed body, so H10's 100 MiB upload passes
+  with `max_body_bytes` at 1 MiB, while the same `Content-Length` on `/api/show` gets 413.
+- **The signatures.** The §2.3 sketch's `body_stream(receive)` is two functions:
+  - `first_chunk(receive, *, timeout_s) -> (bytes, more_body)` reads the first chunk
+    **before** Ollama is contacted. It skips empty messages that are not the last, and one
+    `move_on_after(body_timeout_s)` bounds the whole wait, as in `read_body`. A stall gives
+    `BodyTimeout` (408 `REQUEST_BODY_TIMEOUT`, `replay_safe: true`, `outcome: rejected`); a
+    disconnect gives `ClientGone` (nothing sent, `client_disconnect`). Either way Ollama
+    never sees a connection (E6, E12).
+  - `body_stream(receive, first, more, *, timeout_s, on_end)` is the async iterator httpx
+    sends. Each `receive()` has its own `move_on_after(body_timeout_s)`, so the timeout is an
+    idle timeout between chunks and the total time is unbounded; an ungated request has no
+    hold limit. Empty chunks are not yielded.
+- **`UploadInterrupted(gone=…)`** is raised by `body_stream` for a stall (`gone=False`) or a
+  disconnect (`gone=True`). It leaves `client.send()` unmapped (httpx maps only httpcore's
+  own errors), and httpcore closes the half-written connection itself rather than return it
+  to the pool, so no response exists and step (a) has nothing more to close. E6 and E12
+  check that the fake sees the close.
+  - A stall gets 408 `UPLOAD_INTERRUPTED`, "the upload was interrupted", with
+    `replay_safe: false` and `Connection: close`, because the rest of the body is unread.
+  - A client that left gets nothing, as when a client leaves during a buffered body: there
+    is nobody to answer. Its line has `status: null`. §5's row says 408 for both cases, so
+    this departs from it, and the row now says so (asked on #62).
+  - Both log `outcome: upload_interrupted` at `INFO`, with `slot_end: none`.
+- **The framing.** `upstream_headers(body_len=None)` keeps the client's `Content-Length`,
+  which h11 has validated (H10), or sends none, and httpx then chunks the body (E13). An
+  empty chunked upload goes as a chunked body with only the terminating chunk, and Ollama's
+  status comes back unchanged.
+- **The watcher.** `on_end()` starts it as soon as `body_stream` sees the last message,
+  before that chunk is yielded; `body_stream` calls `receive()` no more after that. If Ollama
+  answers before it has read the whole upload, `send()` returns while the body is still
+  unread. The watcher then takes `receive()` over, so a disconnect is still seen, and it
+  discards the rest of the body, because it ignores `http.request` messages. The relayed
+  response carries `Connection: close`, by S1-8's rule for a body still unread.
+- **The harness.** `FakeOllama.sink = True` records each request at once and hashes its body
+  as it arrives: `length` grows while the body streams in, `sha256` is set at its end, and
+  `complete` turns false if the sidecar closes first. `start_sidecar(wrap=…)` runs a wrapped
+  app, which E14 uses to guard `receive()`. A unit test shows that the guard does count two
+  pending calls as an overlap, so E14 can't pass vacuously.
+- **H10's memory bound.** `tracemalloc` traces the whole test process: the client, the
+  sidecar's thread and the fake's. The client's 1 MiB block is allocated before tracing
+  starts and is sent 100 times from a `memoryview`, so the peak (about 3 MiB locally) is the
+  servers' buffers. A buffered upload would put the peak above 100 MiB.
+
 ### 2.4 `app.py`
 
 ```python
@@ -980,7 +1027,7 @@ column shows the lease result for a gated request.
 | Body grows past the limit while being read | 413 `BODY_TOO_LARGE` (`Connection: close`) | — | freed | `rejected` |
 | Body stalls (`BodyTimeout`) | 408 `REQUEST_BODY_TIMEOUT` (`Connection: close`) | — | freed | `rejected` |
 | Client gone while sending the body | nothing sent | — | freed | `client_disconnect` |
-| Blob upload stalls or the client leaves after bytes were forwarded | 408 `UPLOAD_INTERRUPTED` (not replay-safe) | — | no slot (ungated) | `upload_interrupted` |
+| Blob upload stalls or the client leaves after bytes were forwarded | 408 `UPLOAD_INTERRUPTED` (not replay-safe; `Connection: close`) for a stall; nothing sent to a client that left (S1-11) | — | no slot (ungated) | `upload_interrupted` |
 | `ConnectError`, `ConnectTimeout` | 502 `UPSTREAM_UNAVAILABLE` (replay-safe) | — | freed | `upstream_unavailable` |
 | `PoolTimeout` (ungated pool full; gated requests have their own connection) | 503 `NODE_SATURATED` + `Retry-After` (replay-safe) | — | no slot | `saturated` |
 | `WriteError`, `ReadError`, `RemoteProtocolError`, other `httpx.TransportError` | 502 `UPSTREAM_PROTOCOL_ERROR` | record `UPSTREAM_STREAM_BROKEN` if framing allows, then abort | drains | `upstream_error` |

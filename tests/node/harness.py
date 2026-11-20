@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import socket
@@ -128,6 +129,12 @@ class Recorded:
     query: bytes
     headers: list[tuple[bytes, bytes]]
     body: bytes
+    # `sink` mode (TD §7, for H10): the body is hashed as it arrives, never stored. `length`
+    # grows while the body streams in; `sha256` is set once it has ended, and `complete` turns
+    # false if the sidecar closed the connection first.
+    length: int = 0
+    sha256: str | None = None
+    complete: bool = True
 
 
 async def _stall(fake: FakeOllama) -> None:
@@ -353,6 +360,7 @@ class FakeOllama:
     requests: list[Recorded] = field(default_factory=list)
     release: threading.Event = field(default_factory=threading.Event)
     server: ThreadServer | None = None
+    sink: bool = False  # hash request bodies as they arrive instead of storing them
 
     def script(self, method: str, path: str, behaviour: Behaviour) -> None:
         self.routes[(method, path)] = behaviour
@@ -362,8 +370,32 @@ class FakeOllama:
         assert self.server is not None
         return f"http://{LOOPBACK}:{self.server.port}"
 
+    async def _sink(self, scope, receive, send) -> None:
+        """Record the request at once, then hash its body chunk by chunk."""
+        rec = Recorded(
+            scope["method"], scope["raw_path"], scope["query_string"], list(scope["headers"]), b""
+        )
+        self.requests.append(rec)
+        digest = hashlib.sha256()
+        while True:
+            msg = await receive()
+            if msg["type"] == "http.disconnect":
+                rec.complete = False
+                return
+            chunk = msg.get("body", b"")
+            digest.update(chunk)
+            rec.length += len(chunk)
+            if not msg.get("more_body"):
+                break
+        rec.sha256 = digest.hexdigest()
+        behaviour = self.routes.get((scope["method"], scope["path"]), status(404))
+        await behaviour(send, self, receive)
+
     async def __call__(self, scope, receive, send) -> None:
         assert scope["type"] == "http"
+        if self.sink:
+            await self._sink(scope, receive, send)
+            return
         body = b""
         while True:
             msg = await receive()
@@ -549,10 +581,17 @@ class Sidecar:
         return self.app.gate
 
 
-def start_sidecar(ollama_url: str, *, gate: Any = None, **overrides: object) -> Sidecar:
+def start_sidecar(
+    ollama_url: str,
+    *,
+    gate: Any = None,
+    wrap: Callable[[Any], Any] | None = None,
+    **overrides: object,
+) -> Sidecar:
+    """`wrap(app)`, if given, is the ASGI app the server runs (E14 wraps `receive`)."""
     settings = make_settings(ollama_url, **overrides)
     app = create_app(settings, gate=gate)
-    server = ThreadServer(app, reserve_socket(), lifespan="on").start()
+    server = ThreadServer(wrap(app) if wrap else app, reserve_socket(), lifespan="on").start()
     return Sidecar(settings, app, server)
 
 
