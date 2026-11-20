@@ -16,8 +16,17 @@ It reads everything from the environment:
 Pull requests: everything the pull request introduces across its whole commit range: every
 added or modified blob (merges compared with each parent), every path, and every commit's
 raw object (message, author and committer). Pushes to main: the whole tree, every path, and
-the pushed commits' raw objects. Matching ignores ASCII case and is a plain substring match
-on bytes.
+the pushed commits' raw objects. Matching ignores ASCII case and works on bytes.
+
+Each non-blank line of PRIVATE_TERMS is one rule (SPEC REQ-63):
+
+    myhost                       a plain substring
+    =myhost                      a whole word: no ASCII letter or digit on either side
+    myhost !! MyProduct myhost   an occurrence inside a listed phrase is suppressed
+    =myhost !! a !! b            the two combine; any number of phrases
+
+A malformed line (an empty term or phrase, or a phrase that can never cover the term) fails
+the scan, like any other scan error.
 
 Publicly it prints one fixed line, pass or fail, and nothing else. The match locations go
 into a report padded to exactly 64 KiB and encrypted to the maintainer's age recipient. That
@@ -32,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterable
+from typing import NamedTuple
 
 GENERIC_FAIL = "Private-terms check failed. The maintainer can decrypt the report artifact."
 PASS = "Private-terms check passed."
@@ -42,6 +52,8 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 AGE_RECIPIENT_RE = re.compile(r"^age1[02-9ac-hj-np-z]{58}$")
 ZERO = "0" * 40
 GITLINK = b"160000"
+SEPARATOR = "!!"
+MAX_OFFSETS = 5  # byte offsets listed per report line
 
 
 class ScanError(Exception):
@@ -177,24 +189,104 @@ def collect(gitdir: str, commits: list[str], tree_of: str | None) -> list[tuple[
     return items
 
 
-def parse_terms(raw: str) -> list[bytes]:
-    terms = [t.strip().encode("utf-8").lower() for t in raw.splitlines()]
-    return sorted({t for t in terms if t})
+class Rule(NamedTuple):
+    """One line of the term list, lower-cased."""
+
+    term: bytes
+    whole_word: bool
+    phrases: tuple[bytes, ...]
+
+    def __str__(self) -> str:
+        return ("=" if self.whole_word else "") + self.term.decode("utf-8", errors="replace")
 
 
-def matches(items: Iterable[tuple[str, bytes]], terms: list[bytes]) -> list[str]:
-    found = []
-    for label, data in items:
-        low = data.lower()
-        for t in terms:
-            if t in low:
-                found.append(f"{label}: matches {t.decode('utf-8', errors='replace')!r}")
+def is_word_byte(b: int) -> bool:
+    return 48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122  # an ASCII digit or letter
+
+
+def occurrences(low: bytes, rule: Rule) -> list[int]:
+    """Every start offset of rule.term in low (overlapping), whole words only if required."""
+    found, n, i = [], len(rule.term), low.find(rule.term)
+    while i >= 0:
+        if not rule.whole_word or (
+            (i == 0 or not is_word_byte(low[i - 1]))
+            and (i + n == len(low) or not is_word_byte(low[i + n]))
+        ):
+            found.append(i)
+        i = low.find(rule.term, i + 1)
     return found
 
 
-def build_report(found: list[str], context: str) -> bytes:
-    """The plaintext report, padded (or cut short, with a note) to exactly REPORT_SIZE."""
-    lines = [f"private-terms report: {context}", f"{len(found)} match(es)", *found, ""]
+def parse_terms(raw: str) -> list[Rule]:
+    """The rules, deduplicated and sorted. A malformed line raises ScanError (line number only)."""
+    rules = set()
+    for number, line in enumerate(raw.splitlines(), 1):
+        if not line.strip():
+            continue
+        head, *rest = (part.strip().encode("utf-8").lower() for part in line.split(SEPARATOR))
+        whole_word = head.startswith(b"=")
+        term = head[1:].strip() if whole_word else head
+        if not term:
+            raise ScanError(f"term list line {number}: empty term")
+        if term.startswith(b"="):  # a doubled prefix would silently weaken the rule
+            raise ScanError(f"term list line {number}: a term starts with '='")
+        rule = Rule(term, whole_word, tuple(sorted(set(rest))))
+        for phrase in rest:
+            if not phrase:
+                raise ScanError(f"term list line {number}: empty phrase")
+            if phrase.startswith(b"="):
+                raise ScanError(f"term list line {number}: a phrase starts with '='")
+            if not occurrences(phrase, rule):
+                raise ScanError(f"term list line {number}: a phrase does not contain the term")
+        rules.add(rule)
+    return sorted(rules)
+
+
+def covered(low: bytes, start: int, rule: Rule) -> bytes | None:
+    """The phrase whose occurrence in low contains the term occurrence at start, if any."""
+    for phrase in rule.phrases:
+        for k in occurrences(phrase, rule):  # where the term sits inside the phrase
+            if k <= start and low[start - k : start - k + len(phrase)] == phrase:
+                return phrase
+    return None
+
+
+def offsets(at: list[int]) -> str:
+    more = f" and {len(at) - MAX_OFFSETS} more" if len(at) > MAX_OFFSETS else ""
+    return ", ".join(map(str, at[:MAX_OFFSETS])) + more
+
+
+def matches(items: Iterable[tuple[str, bytes]], rules: list[Rule]) -> tuple[list[str], list[str]]:
+    """(matches, suppressed occurrences): one report line per item and rule (and phrase)."""
+    found, suppressed = [], []
+    for label, data in items:
+        low = data.lower()
+        for rule in rules:
+            hits: list[int] = []
+            by_phrase: dict[bytes, list[int]] = {}
+            for i in occurrences(low, rule):
+                phrase = covered(low, i, rule)
+                if phrase is None:
+                    hits.append(i)
+                else:
+                    by_phrase.setdefault(phrase, []).append(i)
+            if hits:
+                found.append(f"{label}: matches {str(rule)!r} at byte {offsets(hits)}")
+            for phrase, at in by_phrase.items():
+                inside = phrase.decode("utf-8", errors="replace")
+                line = f"{label}: {str(rule)!r} at byte {offsets(at)}, inside {inside!r}"
+                suppressed.append(line)
+    return found, suppressed
+
+
+def build_report(found: list[str], context: str, suppressed: list[str] | None = None) -> bytes:
+    """The plaintext report, padded (or cut short, with a note) to exactly REPORT_SIZE.
+
+    Suppressed occurrences are listed separately, so the maintainer can check the exceptions.
+    """
+    suppressed = suppressed or []
+    lines = [f"private-terms report: {context}", f"{len(found)} match(es)", *found]
+    lines += [f"{len(suppressed)} suppressed by an exception", *suppressed, ""]
     text = "\n".join(lines).encode("utf-8")
     if len(text) > REPORT_SIZE:
         text = text[: REPORT_SIZE - len(TRUNCATED)] + TRUNCATED
@@ -215,8 +307,8 @@ def encrypt(age_bin: str, recipient: str, plaintext: bytes) -> bytes:
     return r.stdout
 
 
-def scan(env: dict[str, str], gitdir: str) -> tuple[list[str], str]:
-    """Fetch and scan; return (matches, report context). Raises ScanError."""
+def scan(env: dict[str, str], gitdir: str) -> tuple[list[str], list[str], str]:
+    """Fetch and scan; return (matches, suppressed, report context). Raises ScanError."""
     repo = env.get("REPO", "")
     if not REPO_RE.fullmatch(repo):
         raise ScanError("bad repository")
@@ -239,7 +331,8 @@ def scan(env: dict[str, str], gitdir: str) -> tuple[list[str], str]:
     terms = parse_terms(env.get("PRIVATE_TERMS", ""))
     if not terms:
         raise ScanError("the term list is unavailable")
-    return matches(collect(gitdir, commits, tree_of), terms), context
+    found, suppressed = matches(collect(gitdir, commits, tree_of), terms)
+    return found, suppressed, context
 
 
 def main() -> int:
@@ -248,11 +341,11 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory() as tmp:
             try:
-                found, context = scan(env, os.path.join(tmp, "repo.git"))
+                found, suppressed, context = scan(env, os.path.join(tmp, "repo.git"))
                 passed = not found
             except ScanError as e:
-                found, context = [f"the scan did not complete: {e}"], "error"
-            report = build_report(found, context)
+                found, suppressed, context = [f"the scan did not complete: {e}"], [], "error"
+            report = build_report(found, context, suppressed)
             ciphertext = encrypt(
                 env.get("AGE_BIN", ""), env.get("PRIVATE_TERMS_AGE_RECIPIENT", ""), report
             )
