@@ -3439,6 +3439,9 @@ def test_first_chunk():
     assert anyio.run(first, [_part(b""), _part(b"ab"), _part(b"c")]) == (b"ab", True)
     assert anyio.run(first, [_part(b"ab", False)]) == (b"ab", False)
     assert anyio.run(first, [_part(b""), _part(b"", False)]) == (b"", False)  # an empty body
+    # ASGI's defaults: a message with no `body` has none, and one with no `more_body` is last.
+    assert anyio.run(first, [{"type": "http.request"}]) == (b"", False)
+    assert anyio.run(first, [{"type": "http.request", "body": b"a"}]) == (b"a", False)
     with pytest.raises(proxy_module.ClientGone):
         anyio.run(first, [_part(b""), {"type": "http.disconnect"}])
     started = time.perf_counter()
@@ -3475,6 +3478,9 @@ def test_body_stream_forwards_each_chunk_and_ends_once():
     assert _stream([], b"f", False) == (["end", b"f"], None)  # all of it in the first message
     assert _stream([], b"", False) == (["end"], None)  # an empty body yields nothing
     assert _stream([_part(b"", False)]) == ([b"f", "end"], None)
+    # ASGI's defaults, as in `first_chunk`
+    assert _stream([{"type": "http.request"}]) == ([b"f", "end"], None)
+    assert _stream([{"type": "http.request", "body": b"a"}]) == ([b"f", "end", b"a"], None)
 
 
 def test_body_stream_interruptions():
@@ -3721,3 +3727,20 @@ def test_e14_one_owner_of_receive_while_waiting_for_headers(fake_ollama, sidecar
     assert one.overlaps == 0
     *body, last = one.messages  # the body read, then the watcher's disconnect
     assert body and set(body) == {"http.request"} and last == "http.disconnect"
+
+
+@pytest.mark.td("E14")
+@pytest.mark.parametrize("path", [BLOB, b"/api/chat"], ids=["blob", "gated"])
+def test_e14_one_watcher_on_a_clean_end(path, fake_ollama, sidecar, capsys):
+    """With no disconnect at all, the watcher is started once: at the end of the body, and
+    not again when Ollama's answer arrives."""
+    fake_ollama.script("POST", path.decode(), status(201))
+    one = _OneReceiver()
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate, wrap=one.wrap)
+    head = b"POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % (path, len(CHAT))
+    assert _send_and_read(car, head + CHAT).status == 201
+    (line,) = _wait_log_lines(capsys, 1)
+    assert (line["outcome"], line["status"]) == ("ok", 201)
+    assert one.overlaps == 0
+    assert "http.request" in one.messages
