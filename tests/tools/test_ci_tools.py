@@ -408,12 +408,140 @@ TERMS = private_terms.parse_terms("  CanaryHost-7f3a \n\nalice example\n")
 def scan_range(repo: Path, base: str, head: str):
     gitdir = str(repo / ".git")
     commits = private_terms.commit_range(gitdir, head, base)
-    return private_terms.matches(private_terms.collect(gitdir, commits, None), TERMS)
+    found, _ = private_terms.matches(private_terms.collect(gitdir, commits, None), TERMS)
+    return found
 
 
 def test_parse_terms():
-    assert TERMS == [b"alice example", b"canaryhost-7f3a"]
+    assert [(r.term, r.whole_word, r.phrases) for r in TERMS] == [
+        (b"alice example", False, ()),
+        (b"canaryhost-7f3a", False, ()),
+    ]
     assert private_terms.parse_terms("\n \n") == []
+
+
+def test_parse_terms_with_whole_word_and_exceptions():
+    rules = private_terms.parse_terms(
+        " = MyHost !!  MyProduct MYHOST  !! myhost-docs \nexample-term\nexample-term\n"
+    )
+    assert [(r.term, r.whole_word, r.phrases) for r in rules] == [
+        (b"example-term", False, ()),
+        (b"myhost", True, (b"myhost-docs", b"myproduct myhost")),
+    ]
+    assert [str(r) for r in rules] == ["example-term", "=myhost"]
+
+
+@pytest.mark.parametrize(
+    "line, why",
+    [
+        ("=", "empty term"),
+        ("  =   ", "empty term"),
+        (" !! MyProduct myhost", "empty term"),
+        ("= !! MyProduct myhost", "empty term"),
+        ("myhost !!", "empty phrase"),
+        ("myhost !! MyProduct myhost !!  ", "empty phrase"),
+        ("myhost !!  !! MyProduct myhost", "empty phrase"),
+        ("==myhost", "a term starts with '='"),
+        ("= =myhost", "a term starts with '='"),
+        ("myhost !! =MyProduct myhost", "a phrase starts with '='"),
+        ("=myhost !!  = myhost-docs", "a phrase starts with '='"),
+        ("myhost !! MyProduct", "a phrase does not contain the term"),
+        ("=myhost !! MyProduct myhosts", "a phrase does not contain"),  # never a whole word
+    ],
+)
+def test_malformed_term_lines_fail_closed(line, why):
+    with pytest.raises(private_terms.ScanError, match=f"line 2: {why}"):
+        private_terms.parse_terms("example-term\n" + line + "\n")
+
+
+def term_matches(rules: str, text: str) -> tuple[list[str], list[str]]:
+    return private_terms.matches([("blob x", text.encode())], private_terms.parse_terms(rules))
+
+
+def test_substring_and_whole_word_matching():
+    text = "myhosts, xmyhost, my-host"
+    assert term_matches("myhost", text) == (["blob x: matches 'myhost' at byte 0, 10"], [])
+    assert term_matches("=myhost", text) == ([], [])
+    for edge in ("myhost", "(myhost)", "a.myhost-b", "x_myhost", "\u00e9myhost"):
+        assert term_matches("=myhost", edge)[0], edge  # any non-[A-Za-z0-9] byte is a boundary
+    assert term_matches("=myhost", "myhost2 2myhost")[0] == []
+
+
+def test_an_exception_covers_the_occurrence():
+    assert term_matches("myhost !! MyProduct myhost", "Built with MyProduct myhost.") == (
+        [],
+        ["blob x: 'myhost' at byte 21, inside 'myproduct myhost'"],
+    )
+
+
+def test_an_occurrence_next_to_an_exception_still_matches():
+    rules = "=myhost !! MyProduct myhost"
+    found, suppressed = term_matches(rules, "MyProduct myhost myhost")
+    assert found == ["blob x: matches '=myhost' at byte 17"]
+    assert suppressed == ["blob x: '=myhost' at byte 10, inside 'myproduct myhost'"]
+    # the phrase must contain the occurrence, not merely sit beside it
+    assert term_matches(rules, "MyProduct  myhost")[0] == ["blob x: matches '=myhost' at byte 11"]
+    assert term_matches(rules, "myhost MyProduct")[0] == ["blob x: matches '=myhost' at byte 0"]
+
+
+def test_several_occurrences_in_one_blob_only_some_covered():
+    rules = "myhost !! MyProduct myhost !! myhost-docs"
+    text = "myhost-docs, ssh myhost, MyProduct myhost, the myhost box, myhost-docs"
+    found, suppressed = term_matches(rules, text)
+    assert found == ["blob x: matches 'myhost' at byte 17, 47"]
+    assert sorted(suppressed) == [
+        "blob x: 'myhost' at byte 0, 59, inside 'myhost-docs'",
+        "blob x: 'myhost' at byte 35, inside 'myproduct myhost'",
+    ]
+
+
+def test_case_is_ignored_on_both_the_term_and_the_phrase_side():
+    found, suppressed = term_matches("MYHOST !! myproduct MyHost", "MyPRODUCT myHOST; MyHoSt")
+    assert found == ["blob x: matches 'myhost' at byte 18"]
+    assert suppressed == ["blob x: 'myhost' at byte 10, inside 'myproduct myhost'"]
+
+
+def test_rules_are_independent_and_offsets_are_capped():
+    found, suppressed = term_matches("myhost\nmyhost !! MyProduct myhost", "MyProduct myhost")
+    assert found == ["blob x: matches 'myhost' at byte 10"]  # the plain rule has no exception
+    assert len(suppressed) == 1
+    found, _ = term_matches("example-term", "example-term " * 7)
+    assert found == ["blob x: matches 'example-term' at byte 0, 13, 26, 39, 52 and 2 more"]
+
+
+@needs_git
+@posix_only
+def test_exceptions_apply_in_a_scanned_range(repo):
+    base = run_git(repo, "rev-parse", "HEAD")
+    commit(repo, {"a.md": "MyProduct myhost\n", "b.md": "ssh myhost\n"})
+    head = run_git(repo, "rev-parse", "HEAD")
+    gitdir = str(repo / ".git")
+    items = private_terms.collect(gitdir, private_terms.commit_range(gitdir, head, base), None)
+    found, suppressed = private_terms.matches(
+        items, private_terms.parse_terms("=myhost !! myproduct myhost")
+    )
+    assert len(found) == 1 and "b.md" in found[0]
+    assert len(suppressed) == 1 and "a.md" in suppressed[0]
+
+
+@needs_git
+@posix_only
+def test_scan_applies_the_rules_and_fails_closed_on_a_malformed_list(repo, monkeypatch):
+    monkeypatch.setattr(private_terms, "fetch", lambda *a: None)  # the local repo stands in
+    gitdir = str(repo / ".git")
+    base = run_git(repo, "rev-parse", "HEAD")
+    head = commit(repo, {"a.md": "MyProduct myhost\n"})
+    env = {"REPO": "o/r", "PRIVATE_TERMS": "myhost !! myproduct myhost\n"}
+    pr = {**env, "EVENT": "pull_request_target", "BASE_SHA": base, "HEAD_SHA": head}
+    found, suppressed, context = private_terms.scan(pr, gitdir)
+    assert (found, len(suppressed), context) == ([], 1, f"{base}..{head}")
+    push = {**env, "EVENT": "push", "PUSH_SHA": head, "BEFORE": "0" * 40}
+    found, suppressed, context = private_terms.scan(push, gitdir)
+    assert (found, len(suppressed), context) == ([], 1, f"tree {head}")
+    with pytest.raises(private_terms.ScanError, match="line 1: empty phrase"):
+        private_terms.scan({**pr, "PRIVATE_TERMS": "myhost !!\n"}, gitdir)
+    with pytest.raises(private_terms.ScanError, match="unavailable"):
+        private_terms.scan({**pr, "PRIVATE_TERMS": " \n"}, gitdir)
 
 
 @needs_git
@@ -483,6 +611,9 @@ def test_scan_errors(repo):
 def test_report_is_padded_or_truncated_to_exactly_64_kib():
     small = private_terms.build_report(["x"], "ctx")
     assert len(small) == private_terms.REPORT_SIZE
+    assert b"1 match(es)\nx\n0 suppressed by an exception\n" in small
+    both = private_terms.build_report(["x"], "ctx", ["y", "z"])
+    assert b"1 match(es)\nx\n2 suppressed by an exception\ny\nz\n" in both
     big = private_terms.build_report(["y" * 1000] * 100, "ctx")
     assert len(big) == private_terms.REPORT_SIZE
     assert private_terms.TRUNCATED in big

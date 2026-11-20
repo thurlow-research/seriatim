@@ -2333,8 +2333,23 @@ command output, and never just says "tests pass".
       case.
     - **It also runs on every push to `main`,** scanning the whole tree at the pushed
       commit, and every pushed commit's metadata (the commits after the previous tip).
-    - **Matching.** Each non-blank line of the secret is a term. A term matches as a plain
-      substring of the bytes, ignoring ASCII case. An empty term list fails the check.
+    - **Matching.** Each non-blank line of the secret is one rule. Matching is on bytes and
+      ignores ASCII case, on both the term and the phrase side. An empty term list fails the
+      check. The examples here are made up:
+      - `myhost`: the term matches as a plain substring.
+      - `=myhost`: the term matches only as a whole word. A boundary is the start or end of
+        the text, or any byte other than an ASCII letter or digit.
+      - `myhost !! MyProduct myhost !! myhost-docs`: an occurrence of the term is
+        **suppressed** only when it lies inside an occurrence of one of the listed phrases
+        in the same text. Every other occurrence still matches. The prefix combines with
+        exceptions (`=myhost !! MyProduct myhost`). Space around `!!` and around the line is
+        ignored, so a term or phrase cannot contain `!!` or start with `=`.
+      - **Rules are independent.** If the same term is listed twice, once without
+        exceptions, the bare rule still catches every occurrence.
+      - **Fail closed.** A malformed line fails the check with the generic line, like any
+        other scan error: an empty term, an empty phrase, or a phrase that does not contain
+        the term as the rule matches it (for `=myhost`, as a whole word within the phrase).
+        The report names the line number only, never its text.
     - **Triggers.** `pull_request_target` on `opened`, `synchronize`, `reopened` and
       `edited`, and `push` to `main`.
     - **Injection rules.** It runs under `pull_request_target`, so it must never let the
@@ -2398,6 +2413,11 @@ command output, and never just says "tests pass".
       - **For the maintainer:** the match locations are encrypted to the maintainer's
         public key (an `age` recipient kept as a repository variable) and uploaded as an
         artifact that only the maintainer can decrypt.
+        - **What it lists.** Each match gives the item (blob and path, path, or commit), the
+          rule that matched and the byte offsets (the first five, then a count). Suppressed
+          occurrences are listed separately, with the phrase that covered each, so the
+          maintainer can check that an exception is not hiding a real leak. Suppressed
+          occurrences alone do not fail the check.
         - **No size signal.** The artifact is uploaded on every run, pass or fail, under a
           fixed name. Its plaintext is padded to a fixed 64 KiB before encryption; a
           longer report is cut short, with a note that says so.
