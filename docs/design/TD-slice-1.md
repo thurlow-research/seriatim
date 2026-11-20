@@ -577,7 +577,9 @@ cases of §3.3 and §5 and tests the ungated pool and its timeouts over the wire
 **Details fixed by the code (S1-13).** S1-13 completes the request log line (Appendix A). It
 also tests the log, Seriatim's own headers and the contract's bodies on every path built so
 far.
-- **The four new fields** (asked on #64, question 1, option A built). Every line has
+- **Ruled on #64** by the maintainer (https://github.com/thurlow-research/seriatim/issues/64#issuecomment-7053085830): question 1 is option A and question 2 is
+  option B, as built below.
+- **The four new fields** (asked on #64, question 1, option A). Every line has
   `wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`, after `slot_end` and before `node`, in
   Appendix A's order. That includes the dispatcher's refusals and health.
   - `wait_ms` is the time from the proxy's start to the gate's answer. It is set on every
@@ -599,7 +601,7 @@ far.
 - **Files.** The §9 row names `app.py` and `test_http.py`. The proxy writes its own lines, so
   `proxy.py` changes too. The K-OAS2 hook of §7 lives in `conftest.py`, with its check in
   `harness.py`. `test_config.py`'s C8 follows `main()`'s new argument.
-- **L3 and the libraries' own loggers** (asked on #64, question 2, option B built):
+- **L3 and the libraries' own loggers** (asked on #64, question 2, option B):
   - httpx logs every request's URL, query included, at `INFO`;
   - httpcore's `DEBUG` traces carry Ollama's response headers, `Set-Cookie` among them;
   - uvicorn's access line has the query.
