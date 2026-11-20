@@ -1086,25 +1086,19 @@ def test_s15_the_final_write_hangs_or_raises(final, monkeypatch, capsys):
         assert FINAL_CLOSE_S <= elapsed < FINAL_CLOSE_S + TIMING_BOUND_S  # abandoned on time
     else:
         assert elapsed < TIMING_BOUND_S
-    debug, line = _log(capsys)
-    assert (debug["level"], debug["event"], debug["request_id"], debug["reason"]) == (
-        "DEBUG",
-        "client_write_failed",
-        "rid",
+    (line,) = _log(capsys)  # one line per request, even at DEBUG (L2; ruled on #60)
+    assert (line["level"], line["event"], line["request_id"]) == ("INFO", "request", "rid")
+    assert (line["outcome"], line["slot_end"]) == ("ok", "free")
+    assert (line["client_write_failed"], line["client_write_failed_reason"]) == (
+        True,
         "timeout" if final == "hang" else "OSError",
-    )
-    assert (line["level"], line["event"], line["outcome"], line["slot_end"]) == (
-        "INFO",
-        "request",
-        "ok",
-        "free",
     )
 
 
 @pytest.mark.td("S15")
-def test_s15_a_final_write_that_succeeds_logs_one_line(monkeypatch, capsys):
-    """The contrast: at DEBUG, a clean end whose final write succeeds logs no
-    `client_write_failed`, only the request's own line."""
+def test_s15_a_final_write_that_succeeds_logs_no_failure(monkeypatch, capsys):
+    """The contrast: at DEBUG, a clean end whose final write succeeds logs its one line,
+    with no `client_write_failed` field."""
     gate, _ = ready_gate()
     gated = lambda _s: _mock_client(_clean)  # noqa: E731
     proxy = _proxy(gate, monkeypatch, gated, log_level="DEBUG")
@@ -1117,6 +1111,7 @@ def test_s15_a_final_write_that_succeeds_logs_one_line(monkeypatch, capsys):
     assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
     (line,) = _log(capsys)
     assert (line["event"], line["outcome"], line["slot_end"]) == ("request", "ok", "free")
+    assert "client_write_failed" not in line and "client_write_failed_reason" not in line
 
 
 S16_RUNS = 50

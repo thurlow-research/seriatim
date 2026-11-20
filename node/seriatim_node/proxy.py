@@ -489,10 +489,10 @@ class Proxy:
                 write_failed = type(exc).__name__
         if finishing.cancelled_caught:
             write_failed = "timeout"
-        if write_failed is not None:  # §3.3 line 40: the client is gone or stalled
-            self.log.emit(
-                level="DEBUG", event="client_write_failed", request_id=rid, reason=write_failed
-            )
+        if write_failed is not None:  # the client is gone or stalled: noted on the one line
+            # (L2 wins over §3.3's "log DEBUG" wording; ruled on #60)
+            where["client_write_failed"] = True
+            where["client_write_failed_reason"] = write_failed
         result, level = _log_outcome(outcome)
         if result == "internal_error" and outcome.error is not None:
             # §5: the traceback goes to the log only, never to the client (E5)

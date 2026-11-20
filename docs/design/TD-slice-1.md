@@ -479,12 +479,14 @@ cases of §3.3 and §5 and tests the ungated pool and its timeouts over the wire
   close at the end. For an ungated request, step (a)'s `resp.aclose()` is then the close on
   every path, a clean end included, and `close_timeout_s` bounds it. For a gated one,
   `req_client.aclose()` closes the connection, as before.
-- **`client_write_failed`** (§3.3 line 40, S15). When step (c) raises or passes
-  `close_timeout_s`, the proxy writes a separate line at `DEBUG`: `event:
-  client_write_failed`, the `request_id`, and a `reason` (`timeout`, or the exception's class
-  name). It comes before the request's own line, which is unchanged (`outcome: ok`,
-  `slot_end: free` after a clean end). At the default `INFO` it is not written, so a request
-  still has exactly one line.
+- **`client_write_failed`** (§3.3 line 40, S15). L2 wins over §3.3's "log DEBUG" wording,
+  per the maintainer's ruling on #60
+  (https://github.com/thurlow-research/seriatim/issues/60#issuecomment-7048425226). So a
+  failed write writes no line of its own. When step (c) raises or passes
+  `close_timeout_s`, the request's own line gets `client_write_failed: true`, at that
+  line's own level, and `client_write_failed_reason` (`timeout`, or the exception's class
+  name). Its other fields are unchanged (`outcome: ok`, `slot_end: free` after a clean
+  end), so a request has exactly one line at every log level.
 - **S11 to S13 run in process**, with the proxy as an asyncio task cancelled by
   `Task.cancel()`, as uvicorn does. S11 uses real fakes upstream, so the fake sees each
   close: the body read (nothing sent; freed), the upstream write (a raw fake that stops
@@ -738,7 +740,8 @@ exception type.
 37          # (c) only now talk to the client; bounded; failure never matters to the slot
 38          with anyio.move_on_after(close_timeout_s):
 39              try: await self._finish_response(send, outcome)   # final message, error reply,
-40              except Exception: log DEBUG client_write_failed   #   record or abort (§5)
+40              except Exception: note client_write_failed        #   record or abort (§5); a field
+                                                              #   on the line of 41 (S1-10, #60)
 41          log.emit(..., slot_end=slot_end)
 ```
 
@@ -995,7 +998,8 @@ slot and then ends in a "freed" 400, 408 or 413, or with the client gone while s
 body, counts once, as `rejected`, never also as `acquired`.
 
 If the client has already gone, writing an error reply fails. That failure is caught and
-logged at `DEBUG`, and it never changes the slot result.
+noted on the request's own log line (`client_write_failed: true`; S1-10, ruled on #60),
+and it never changes the slot result.
 
 **Building error responses.** Every 4xx and 5xx produced here comes from
 `ErrorFactory.response`, which fills in these fields:
@@ -1212,7 +1216,7 @@ also run on `windows-latest` and `macos-latest`.
 | S12 | A second cancellation arrives while step (a) waits for a slow `aclose()` (it returns after 0.5 s, below `close_timeout_s`) → `aclose()` still completes, and the slot is not freed before it returns; the lease has exactly one end | 11 |
 | S13 | While step (a) waits for a slow `aclose()` (0.5 s), another gated request → 429; once `aclose()` returns, the slot follows §3.3 (b) | 11, 2 |
 | S14 | A slow reader: the client reads nothing while upstream streams 32 MiB, `max_hold_s=1` → the fake's writes block (upstream reads pause); after about 1 s the upstream connection is closed and the slot drains; log `hold_exceeded` | 12, 10 |
-| S15 | Upstream ends cleanly; the final `send` (`more_body=False`) is wrapped to hang → the slot is already `FREE` when it is called, and stays `FREE`. After `close_timeout_s` the write is abandoned, `client_write_failed` is logged at `DEBUG`, and the log line has `outcome: ok` and `slot_end: free`. The same when the final `send` raises | 10 |
+| S15 | Upstream ends cleanly; the final `send` (`more_body=False`) is wrapped to hang → the slot is already `FREE` when it is called, and stays `FREE`. After `close_timeout_s` the write is abandoned, and the request's one log line has `client_write_failed: true` (ruled on #60; see S1-10's details in §2.3), `outcome: ok` and `slot_end: free`. The same when the final `send` raises | 10 |
 | S16 | A disconnect scheduled at the moment upstream completes (the fake's last chunk and the client's close together), 50 runs → in each run the lease has exactly one effective end (`finish` or `stuck` returns `True` once), and there is one log line | 10 |
 | S17 | A positive SSE record: `content-type: text/event-stream; charset=utf-8`; upstream sends two complete events, then resets → the client gets the two events, then exactly one `data: {"error":…,"error_code":"UPSTREAM_STREAM_BROKEN"}` event, then an abort | 24 |
 | S18 | Upstream sends the headers (NDJSON, chunked), then resets before any body → the client gets the headers, one record line, then an abort (an empty tail is a record boundary) | 24 |
