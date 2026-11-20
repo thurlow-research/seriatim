@@ -4,7 +4,8 @@ S1-1 adds the error table: `ErrorCode`, `ERROR_TABLE` and `ErrorFactory`. `contr
 is the source of truth, and K-OAS3 checks that this table equals its `x-seriatim-codes`.
 S1-5 adds `RequestLog`, `create_app` (the dispatcher and `/seriatim/health`) and the health
 client. S1-6 hands every other route to the proxy (`proxy.py`). S1-12 adds the singleton
-lock (`acquire_singleton`) and `main()`.
+lock (`acquire_singleton`) and `main()`. S1-13 completes the log line (TD Appendix A): each
+line has `wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import contextlib
 import errno
 import http.cookiejar
 import json
+import logging
 import os
 import re
 import sys
@@ -298,6 +300,8 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 _REQUEST_ID_RE = re.compile(rb"[A-Za-z0-9._-]{1,128}")  # used with fullmatch
 _RID_KEY = "seriatim.request_id"  # where the dispatcher leaves the request id in the scope
+# The log line's gate timing for a request no gate was asked about (TD Appendix A).
+_NO_GATE: Mapping[str, None] = MappingProxyType({"wait_ms": None, "hold_ms": None})
 
 
 def request_id_from(headers: list[tuple[bytes, bytes]]) -> str:
@@ -367,7 +371,8 @@ class _Dispatcher:
         extra_headers: list[tuple[bytes, bytes]] | None = None,
         **log_fields: object,
     ) -> None:
-        """Send an ungated error response and log it (`slot_end` is `none`: no slot)."""
+        """Send an ungated error response and log it (`slot_end` is `none`: no slot). The
+        dispatcher never reads the body, and no gate was asked."""
         status, headers, body = self.errors.response(
             code, message, gate_value="ungated", request_id=request_id
         )
@@ -380,6 +385,9 @@ class _Dispatcher:
             outcome=outcome,
             status=status,
             slot_end="none",
+            **_NO_GATE,
+            bytes_in=0,
+            bytes_out=len(body),
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -498,6 +506,7 @@ class _Dispatcher:
         if reasons:
             doc = {"status": "degraded", "reasons": reasons}
             status = 503
+        body = json.dumps(doc, separators=(",", ":")).encode()
         self.log.emit(
             level="DEBUG",  # a load balancer polls this (REQ-22; HL9)
             request_id=rid,
@@ -509,9 +518,12 @@ class _Dispatcher:
             outcome="ok" if status == 200 else "degraded",
             status=status,
             slot_end="none",
+            **_NO_GATE,
+            bytes_in=0,
+            bytes_out=len(body),
         )
         return Response(
-            json.dumps(doc, separators=(",", ":")).encode(),
+            body,
             status_code=status,
             media_type="application/json",
             headers={
@@ -526,8 +538,19 @@ def create_app(
     settings: Settings, *, client: httpx.AsyncClient | None = None, gate: Gate | None = None
 ) -> ASGIApp:
     """The sidecar's ASGI app (TD §2.4). Tests may inject the shared ungated `client` and the
-    `gate`; otherwise the lifespan creates them (a new gate starts in its startup quarantine)."""
+    `gate`; otherwise the lifespan creates them (a new gate starts in its startup quarantine).
+
+    It also quiets the HTTP client's own loggers (L3): httpx logs each request's URL, query
+    included, at INFO, and httpcore's DEBUG traces carry Ollama's response headers. Nothing
+    configures `logging` in the sidecar, so neither is written as shipped; this keeps it so
+    if a handler is ever added."""
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
     return _Dispatcher(settings, gate, client)
+
+
+# Libraries whose own log records can carry a secret (a query string, a `Set-Cookie`).
+_QUIET_LOGGERS = ("httpx", "httpcore")
 
 
 class SingletonError(Exception):
@@ -614,6 +637,7 @@ def main() -> int:
         workers=1,  # REQ-21: the gate is in-process state
         lifespan="on",
         log_config=None,
+        access_log=False,  # its line has the query string; the request log never does (L3)
         server_header=False,
         date_header=True,
     )

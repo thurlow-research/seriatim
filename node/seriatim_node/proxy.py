@@ -12,13 +12,15 @@ shielded `finally` survive a second cancellation (`_uninterrupted`), bounds ever
 close by `close_timeout_s` (the body is read from `resp.stream`, so no close happens inside
 the exchange) and logs a failed final write. S1-11 streams blob uploads (`first_chunk`,
 `body_stream`): no size limit, an idle timeout between chunks, and 408 `UPLOAD_INTERRUPTED`
-once bytes may have reached Ollama.
+once bytes may have reached Ollama. S1-13 completes the request's log line (TD Appendix A):
+`wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`, on every path.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, MutableMapping
 from dataclasses import dataclass
@@ -364,6 +366,33 @@ class Outcome:
     status: int | None = None
     tail: bytes = b""
     body_pending: bool = False  # a declared body not yet fully read: a reply must close
+    # The log line's measures (TD Appendix A): body bytes received from the client and body
+    # bytes the client was sent, counted by `_counted`; and the gate's timing.
+    bytes_in: int = 0
+    bytes_out: int = 0
+    wait_ms: float | None = None  # from the request's arrival to the gate's answer
+    admitted_at: float | None = None  # perf_counter() when the slot was taken
+
+
+def _ms(seconds: float) -> float:
+    """Milliseconds, to two decimal places, as the log line gives them."""
+    return round(seconds * 1000, 2)
+
+
+def _counted(receive: Receive, send: Send, outcome: Outcome) -> tuple[Receive, Send]:
+    """`receive` and `send`, counting the body bytes each one carries into `outcome`. A body
+    message counts once `send()` has returned, so a failed write adds nothing."""
+
+    async def counted_receive() -> MutableMapping[str, Any]:
+        msg = await receive()
+        outcome.bytes_in += len(msg.get("body", b""))
+        return msg
+
+    async def counted_send(message: MutableMapping[str, Any]) -> None:
+        await send(message)
+        outcome.bytes_out += len(message.get("body", b""))
+
+    return counted_receive, counted_send
 
 
 async def watch_disconnect(receive: Receive, outcome: Outcome, scope: anyio.CancelScope) -> None:
@@ -442,6 +471,7 @@ class Proxy:
     async def __call__(
         self, scope: Scope, receive: Receive, send: Send, route: Route, request_id: str
     ) -> None:
+        arrived = time.perf_counter()
         rid = request_id
         where = {
             "request_id": rid,
@@ -452,6 +482,7 @@ class Proxy:
             "known": route.known,
         }
         outcome = Outcome(body_pending=has_body(scope["headers"]))
+        receive, send = _counted(receive, send, outcome)
         lease: Lease | None = None
         req_client: httpx.AsyncClient | None = None
         length = declared_length(scope["headers"])
@@ -465,10 +496,12 @@ class Proxy:
                 rid=rid,
                 close=True,
             )
-            self.log.emit(**where, outcome="rejected", status=status, slot_end="none")
+            self._emit(where, outcome, "rejected", "INFO", status, "none", None)
             return
         if route.kind is Kind.GATED:
             r = self.gate.try_acquire(where["path"], rid)
+            answered = time.perf_counter()
+            outcome.wait_ms = _ms(answered - arrived)
             if isinstance(r, Busy):  # the body is never read (B3)
                 status = await self._reply(
                     send,
@@ -480,7 +513,7 @@ class Proxy:
                     retry_after=r.retry_after_s,
                     busy_for_s=round(r.busy_for_s, 1),
                 )
-                self.log.emit(**where, outcome="busy", status=status, slot_end="none")
+                self._emit(where, outcome, "busy", "INFO", status, "none", None)
                 return
             if isinstance(r, Starting):
                 status = await self._reply(
@@ -492,9 +525,10 @@ class Proxy:
                     close=outcome.body_pending,
                     retry_after=r.retry_after_s,
                 )
-                self.log.emit(**where, outcome="starting", status=status, slot_end="none")
+                self._emit(where, outcome, "starting", "INFO", status, "none", None)
                 return
             lease = r
+            outcome.admitted_at = answered
         try:
             if lease is not None:
                 req_client = new_gated_client(self.settings)  # inside the try (E16)
@@ -541,6 +575,7 @@ class Proxy:
             close_failed = close_failed or ungated_close.cancelled_caught
         # (b) end the lease: synchronous, so nothing can block or skip it
         slot_end = "none"
+        hold_ms: float | None = None
         if lease is not None:
             if not closed:
                 lease.stuck()
@@ -551,6 +586,8 @@ class Proxy:
             else:
                 lease.finish(clean=False)
                 slot_end = "draining"
+            assert outcome.admitted_at is not None  # set when the lease was taken
+            hold_ms = _ms(time.perf_counter() - outcome.admitted_at)  # until the lease ended
         # (c) only now talk to the client; a failure here never matters to the slot
         write_failed: str | None = None
         with anyio.move_on_after(self.settings.close_timeout_s) as finishing:
@@ -573,8 +610,29 @@ class Proxy:
             # alone decides.
             where["upstream_close_failed"] = True
             level = "CRITICAL" if lease is not None else "ERROR"
+        self._emit(where, outcome, result, level, outcome.status, slot_end, hold_ms)
+
+    def _emit(
+        self,
+        where: dict[str, Any],
+        outcome: Outcome,
+        result: str,
+        level: str,
+        status: int | None,
+        slot_end: str,
+        hold_ms: float | None,
+    ) -> None:
+        """The request's one log line, with the fields of TD Appendix A in its order."""
         self.log.emit(
-            level=level, **where, outcome=result, status=outcome.status, slot_end=slot_end
+            level=level,
+            **where,
+            outcome=result,
+            status=status,
+            slot_end=slot_end,
+            wait_ms=outcome.wait_ms,
+            hold_ms=hold_ms,
+            bytes_in=outcome.bytes_in,
+            bytes_out=outcome.bytes_out,
         )
 
     def _hold_remaining(self, lease: Lease | None) -> float | None:

@@ -574,6 +574,79 @@ cases of §3.3 and §5 and tests the ungated pool and its timeouts over the wire
   starts and is sent 100 times from a `memoryview`, so the peak (about 3 MiB locally) is the
   servers' buffers. A buffered upload would put the peak above 100 MiB.
 
+**Details fixed by the code (S1-13).** S1-13 completes the request log line (Appendix A). It
+also tests the log, Seriatim's own headers and the contract's bodies on every path built so
+far.
+- **Ruled on #64** by the maintainer (https://github.com/thurlow-research/seriatim/issues/64#issuecomment-7053085830): question 1 is option A and question 2 is
+  option B, as built below.
+- **The four new fields** (asked on #64, question 1, option A). Every line has
+  `wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`, after `slot_end` and before `node`, in
+  Appendix A's order. That includes the dispatcher's refusals and health.
+  - `wait_ms` is the time from the proxy's start to the gate's answer. It is set on every
+    gated request the gate answered: admitted, 429 or 503 `NODE_STARTING`. It is `null` when
+    no gate was asked: an ungated route, a 413 before admission, a dispatcher refusal, health.
+  - `hold_ms` is the time from admission to the lease's end in step (b), or to `STUCK` for an
+    unproven close. It is `null` when no slot was taken.
+  - Both come from `time.perf_counter()`, not the gate's clock (the tests run the gate on a
+    fake clock), in milliseconds rounded to 2 decimal places.
+  - `bytes_in` is the request body bytes the sidecar received, counted by a wrapped
+    `receive`:
+    - 0 when the body was never read (the dispatcher, a 413 before admission, 429, 503);
+    - what had arrived, for a client that left mid-body;
+    - for a blob upload, every byte received, including any the watcher discards after an
+      early answer.
+  - `bytes_out` is the response body bytes whose `send()` returned, counted by a wrapped
+    `send`: Ollama's relayed bytes, Seriatim's error body, or Ollama's bytes plus an in-stream
+    record. Headers don't count, and a write that failed adds nothing.
+- **Files.** The §9 row names `app.py` and `test_http.py`. The proxy writes its own lines, so
+  `proxy.py` changes too. The K-OAS2 hook of §7 lives in `conftest.py`, with its check in
+  `harness.py`. `test_config.py`'s C8 follows `main()`'s new argument.
+- **L3 and the libraries' own loggers** (asked on #64, question 2, option B):
+  - httpx logs every request's URL, query included, at `INFO`;
+  - httpcore's `DEBUG` traces carry Ollama's response headers, `Set-Cookie` among them;
+  - uvicorn's access line has the query.
+
+  So `create_app` sets the `httpx` and `httpcore` loggers to `WARNING`, and `main()` passes
+  `access_log=False` (§2.4). Nothing in the sidecar configures `logging`, so none of these
+  lines was written as shipped; this keeps it that way if a handler is ever added. L3 checks
+  stdout, stderr and every `logging` record at `DEBUG`. A contrast test turns httpx's logger
+  back to `INFO` and finds the marker, so that check can't pass vacuously.
+- **The traceback keeps exception messages** (E5 checks one). L3 passes because only an
+  internal error's line has a traceback, and the proxy never builds an exception message from
+  the body, the query or a header. The errors that may carry the URL (httpx's own) are mapped
+  outcomes, and their lines have no traceback.
+- **K-OAS2's hook.** An autouse fixture in `conftest.py`, for every test in `tests/node`,
+  wraps `ErrorFactory.response`, `proxy.stream_error_record` and the health handler.
+  - It collects each body made in process (the servers run in threads), and at teardown
+    validates each against `ErrorEnvelope`, `StreamErrorRecord` or `Health`.
+  - An NDJSON record must be one line, and an SSE record one `data:` event.
+  - A body that fails fails its test.
+  - A unit test shows that each schema refuses a broken body, so the hook isn't vacuous.
+  - Bodies from the subprocess sidecar (`test_process.py`) aren't collected.
+- **One table for L2, H19 and K-OAS2.** `test_every_path_…` drives 25 paths, each with one
+  request carrying `X-Request-Id: s1-13`, on a sidecar logging at `DEBUG`. For each it checks:
+  - exactly one line (a sentinel request's line is awaited after it) and its values;
+  - Seriatim's three headers, once each;
+  - that the hook collected exactly the body the client got.
+
+  S11's shutdown runs in process, with `Task.cancel()`. F4 uses the pool close that raises.
+- **HL8.**
+  - **Connections.** The 200 connections are opened one at a time before the burst (macOS's
+    listen backlog is 128), then each sends its request at once. The test raises
+    `RLIMIT_NOFILE` on POSIX.
+  - **Stalled.** `health_probe_timeout_s` is 1 s. "Within the timeout plus the bound" is timed
+    in the sidecar, from the health handler's start to its response. From the client, the
+    event loop's queue for 200 requests at once comes on top: about 0.1 s locally, and more on
+    a slow runner. That isn't the probe's time, so the client-side check is looser: every
+    answer within twice the timeout plus the bound. No probe waits for another's budget.
+  - **Answering.** The 200 probes queue for the health client's one connection, and each
+    probe's budget includes that wait (§3.4). So the case sets `health_probe_timeout_s=20`
+    to show that load alone never causes an error. With a slow Ollama and the default 2 s, a
+    queue longer than the budget gives `ollama_unreachable`, by design.
+  - **The gated chat** is sent once the fake has seen a probe. In the stalled case it is
+    answered before any probe gives up; in the answering case it is sent before the last
+    health answer.
+
 ### 2.4 `app.py`
 
 ```python
@@ -671,7 +744,9 @@ Gated requests have `read=None` and `write=None`. Their only bound is the hold l
 1. `load_settings()`. On `ConfigError`, print the message to stderr and exit 2.
 2. `acquire_singleton(settings)`. On `SingletonError`, print the message and exit 3.
 3. `uvicorn.run(create_app(settings), host=…, port=…, http="h11", workers=1,
-   lifespan="on", log_config=None, server_header=False, date_header=True)`.
+   lifespan="on", log_config=None, access_log=False, server_header=False,
+   date_header=True)`. `access_log=False` came with S1-13: uvicorn's access line has the
+   query string (L3).
 
 **Holding the lock.** The locked file descriptor is kept in the module-level
 `_SINGLETON_FD`, so garbage collection can never release it. It is never unlocked, closed or
@@ -1377,7 +1452,7 @@ cancellation and closing, and blob streaming.
 | S1-10 | Cancellation, the close proof and the ungated pool | `proxy.py` (cancellation and close edge cases, `PoolTimeout`, ungated timeouts), `test_streaming.py`, `test_http.py` | S11–S16, F2, F4, E16, H14, H26, H27 | 6 |
 | S1-11 | Blob uploads | `proxy.py` (`body_stream`), `test_http.py` | H10, E6, E12–E14 | 6 |
 | S1-12 | Process and singleton | `app.py` (`main`, `acquire_singleton`), `test_config.py`, `test_process.py` | C8, R1–R9 | 6 |
-| S1-13 | Request log, Seriatim's headers on every response, health under load | `app.py` (the log fields on every path), `test_http.py` | L1–L3, K-OAS2, H19, HL8 | 8, 9, 10, 11 |
+| S1-13 | Request log, Seriatim's headers on every response, health under load | `app.py` (the log fields on every path), `test_http.py`; also `proxy.py`, `conftest.py` and `harness.py` (the K-OAS2 hook) and `test_config.py` (C8) | L1–L3, K-OAS2, H19, HL8 | 8, 9, 10, 11 |
 | S1-14 | The PPE sidecar and enforcement | `ppe/compose.yaml` (`node-a`), `tests/behaviour/test_sidecar.py`; `Enforced: yes` | P1–P7 | 1–13 (all) |
 
 "needs" lists the PRs that must merge first; dependencies through them count too (S1-6
@@ -1427,6 +1502,9 @@ A log line, one per request:
 
 - `slot_end` is one of `free`, `draining`, `stuck` or `none`.
 - `path` is the raw path, which `check_raw_path` has already checked.
+- `wait_ms`, `hold_ms`, `bytes_in` and `bytes_out` are on every line; `wait_ms` and
+  `hold_ms` are `null` when no gate was asked or no slot was taken (see "Details fixed by the
+  code (S1-13)").
 - The fields `client` and `model` are added in S2 and S3.
 
 ## Appendix B — What slice 1 needs from S0 (S0a and S0b)

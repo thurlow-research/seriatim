@@ -7,13 +7,61 @@ from pathlib import Path
 
 import pytest
 from harness import (
+    ContractBodies,
     FakeOllama,
     RawUpstream,
     Sidecar,
     SidecarProcess,
+    check_contract_bodies,
+    contract_validators,
     start_process,
     start_sidecar,
 )
+
+import seriatim_node.proxy as proxy_module
+
+# `from … import`, not `import seriatim_node.app as …`: the latter reads the package's `app`
+# attribute, which test_package.py's runpy test rebinds to a fresh module. mutmut runs pytest
+# twice in one process, so the second run would patch a module the harness doesn't use.
+from seriatim_node.app import ErrorFactory, _Dispatcher
+
+
+@pytest.fixture(scope="session")
+def contract_schemas():
+    """Validators for the contract's `ErrorEnvelope`, `StreamErrorRecord` and `Health`."""
+    return contract_validators()
+
+
+@pytest.fixture(autouse=True)
+def contract_bodies(monkeypatch, contract_schemas) -> Iterator[ContractBodies]:
+    """K-OAS2 (TD §7 "Error bodies"): collect every error body, in-stream record and health
+    body the sidecar makes during a test, in process (the servers run in threads), and check
+    each against the contract at teardown. A body that doesn't validate fails the test."""
+    bodies = ContractBodies()
+    response = ErrorFactory.response
+    record = proxy_module.stream_error_record
+    health = _Dispatcher._health
+
+    def collect_response(self, *args, **kwargs):
+        result = response(self, *args, **kwargs)
+        bodies.errors.append(result[2])
+        return result
+
+    def collect_record(*args, **kwargs):
+        result = record(*args, **kwargs)
+        bodies.records.append(result)
+        return result
+
+    async def collect_health(self, request):
+        result = await health(self, request)
+        bodies.health.append(result.body)
+        return result
+
+    monkeypatch.setattr(ErrorFactory, "response", collect_response)
+    monkeypatch.setattr(proxy_module, "stream_error_record", collect_record)
+    monkeypatch.setattr(_Dispatcher, "_health", collect_health)
+    yield bodies
+    check_contract_bodies(bodies, contract_schemas)
 
 
 @pytest.fixture

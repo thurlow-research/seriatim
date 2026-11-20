@@ -7,21 +7,30 @@ H4-H8, H25, B1-B5, E1). S1-7: the header rules (H3, H9, H11, H15-H18, H20, H21, 
 S1-8: the request limits (E3, E4, E7-E11, B6, B7, H28, H29). S1-9: the framing rule, the
 in-stream record and internal errors (H13, E5, E15). S1-10: client construction after
 admission, the full ungated pool and the ungated stalls and closes (E16, H14, H26, H27).
-S1-11: streamed blob uploads (H10, E6, E12-E14).
+S1-11: streamed blob uploads (H10, E6, E12-E14). S1-13: the request log's fields on every
+path, Seriatim's headers on every response class, the contract's body schemas, secrets kept
+out of the log, and health under load (L1-L3, H19, K-OAS2, HL8).
 """
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import hashlib
 import json
+import logging
 import random
 import re
 import socket
+import sys
 import threading
 import time
 import tracemalloc
+import types
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import anyio
 import httpx
@@ -31,12 +40,15 @@ import yaml
 from harness import (
     TIMING_BOUND_S,
     WAIT_S,
+    ContractBodies,
+    FakeClock,
     FakeOllama,
     Hold,
     RawResponse,
     ThreadServer,
     abort_body,
     all_free,
+    check_contract_bodies,
     closed_port,
     drip_body,
     exchange,
@@ -64,11 +76,12 @@ from seriatim_node.app import (
     ErrorSpec,
     NoCookies,
     RequestLog,
+    _Dispatcher,
     create_app,
     new_health_client,
     request_id_from,
 )
-from seriatim_node.gate import BLOB_RE, Kind, Route, Scope, classify
+from seriatim_node.gate import BLOB_RE, Gate, Kind, Route, Scope, classify
 from seriatim_node.proxy import Proxy
 
 # Resolved from this file, so the same path works when mutmut copies tests/ and contract/
@@ -568,9 +581,13 @@ def test_dispatcher_refusals_exactly(
         "outcome": outcome,
         "status": status_,
         "slot_end": "none",
+        "wait_ms": None,  # no gate was asked
+        "hold_ms": None,
+        "bytes_in": 0,  # the dispatcher never reads the body
+        "bytes_out": len(body),
         "node": "node-a",
     }
-    assert list(line)[-4:] == ["outcome", "status", "slot_end", "node"]
+    assert list(line)[-8:] == [*APPENDIX_A_TAIL, "node"]
     assert all_free(gate)
 
 
@@ -613,6 +630,12 @@ def test_the_sidecar_echoes_the_request_id(fake_ollama, sidecar):
 
 
 # --- S1-5: the request log (REQ-22) ---------------------------------------------------------
+
+
+# The last fields of every request line, in TD Appendix A's order (`node` follows them).
+APPENDIX_A_TAIL = [
+    "outcome", "status", "slot_end", "wait_ms", "hold_ms", "bytes_in", "bytes_out"
+]  # fmt: skip
 
 
 def _log_lines(text: str) -> list[dict]:
@@ -896,10 +919,10 @@ def test_hl9_health_is_logged_at_debug(level, lines, fake_ollama, sidecar, capsy
     assert len(logged) == lines
     for i, d in enumerate(logged):
         del d["ts"]
-        assert d == _health_line(f"h{i}", "ok", 200)
+        assert d == _health_line(f"h{i}", "ok", 200, b'{"status":"ok"}')
 
 
-def _health_line(rid: str, outcome: str, status_: int) -> dict:
+def _health_line(rid: str, outcome: str, status_: int, body: bytes) -> dict:
     return {
         "level": "DEBUG",
         "event": "request",
@@ -912,6 +935,10 @@ def _health_line(rid: str, outcome: str, status_: int) -> dict:
         "outcome": outcome,
         "status": status_,
         "slot_end": "none",
+        "wait_ms": None,
+        "hold_ms": None,
+        "bytes_in": 0,
+        "bytes_out": len(body),
         "node": "node-a",
     }
 
@@ -926,7 +953,8 @@ def test_hl9_a_degraded_health_line(sidecar, capsys):
         httpx.get(car.url + "/seriatim/health", headers={"x-request-id": "d1"}, timeout=30)
         (line,) = _log_lines(capsys.readouterr().out)
         del line["ts"]
-        assert line == _health_line("d1", "degraded", 503)
+        degraded = b'{"status":"degraded","reasons":["ollama_unreachable"]}'
+        assert line == _health_line("d1", "degraded", 503, degraded)
     finally:
         closed.close()
 
@@ -3063,9 +3091,10 @@ class _Parked:
         await send({"type": "http.response.body", "body": b"{}"})
 
 
-def _saturated(fake_ollama, sidecar):
-    """Fill the shared pool with 16 parked `/api/show` requests and send a 17th. Returns the
-    sidecar, the 17th response, the time it took, the hold and the held requests."""
+def _saturated(fake_ollama, sidecar, rid: str | None = None):
+    """Fill the shared pool with 16 parked `/api/show` requests and send a 17th, with `rid` as
+    its `X-Request-Id` if given. Returns the sidecar, the 17th response, the time it took,
+    the hold and the held requests."""
     hold = _Parked()
     fake_ollama.script("POST", "/api/show", hold)
     fake_ollama.script("POST", "/api/chat", status(200, b"{}"))
@@ -3083,7 +3112,12 @@ def _saturated(fake_ollama, sidecar):
             raise AssertionError(f"request {i + 1} never reached the fake; ended: {early}") from exc
     started = time.perf_counter()
     try:
-        resp = show()
+        resp = httpx.post(
+            car.url + "/api/show",
+            content=b"{}",
+            headers={"x-request-id": rid} if rid else None,
+            timeout=WAIT_S,
+        )
     except httpx.TimeoutException as exc:  # say where the 17th went
         pool = _pool(car.app.client)
         raise AssertionError(
@@ -3744,3 +3778,831 @@ def test_e14_one_watcher_on_a_clean_end(path, fake_ollama, sidecar, capsys):
     assert (line["outcome"], line["status"]) == ("ok", 201)
     assert one.overlaps == 0
     assert "http.request" in one.messages
+
+
+# --- S1-13: the request log, Seriatim's headers and the contract's bodies, on every path ----
+# One table of paths, each a function that drives one request and says what its log line, its
+# headers and its body must be. One test runs each path against L2 (the line), H19 (the
+# headers) and K-OAS2 (the body, as `conftest.py`'s hook collected it).
+
+RID = "s1-13"  # every path's request carries this X-Request-Id, so its line can be found
+LINE_A = b'{"message":{"content":"Hel"},"done":false}\n'
+NDJSON_TYPE = [(b"content-type", b"application/x-ndjson")]
+HOLD_RECORD = b'{"error":"the request exceeded the hold limit","error_code":"LOCK_HOLD_EXCEEDED"}\n'
+
+
+@dataclass
+class _Env:
+    fake: FakeOllama
+    sidecar: Any
+    raw_upstream: Any
+    monkeypatch: Any
+
+    def car(self, url: str | None = None, *, gate: Any = None, **settings: object):
+        """A sidecar on a ready gate, logging at DEBUG, so even health's line is seen."""
+        gate = gate if gate is not None else ready_gate()[0]
+        return self.sidecar(url or self.fake.url, gate=gate, log_level="DEBUG", **settings)
+
+
+@dataclass
+class _Path:
+    car: Any  # the sidecar, or None when the proxy was called in process
+    resp: Any  # what the client got (RawResponse or httpx.Response), or None
+    gate: str | None  # its X-Seriatim-Gate
+    line: dict[str, Any]  # the log line's values; a callable value is a predicate
+    wait: bool  # wait_ms is a number: the gate answered
+    hold: bool  # hold_ms is a number: a slot was taken
+    body: str | None = None  # where Seriatim's own body was collected (K-OAS2)
+
+
+def _expect(
+    status_: int | None, outcome: str, slot_end: str, bytes_in, bytes_out, level: str = "INFO"
+) -> dict[str, Any]:
+    return {
+        "level": level,
+        "status": status_,
+        "outcome": outcome,
+        "slot_end": slot_end,
+        "bytes_in": bytes_in,
+        "bytes_out": bytes_out,
+    }
+
+
+def _rq(
+    path: bytes = b"/api/chat",
+    body: bytes = CHAT,
+    *,
+    method: bytes = b"POST",
+    head: bytes = b"",
+    version: bytes = b"1.1",
+    length: bool = True,
+) -> bytes:
+    """A request carrying `RID`, with an honest `Content-Length` unless `length` is false."""
+    framing = (
+        b"Content-Length: %d\r\n" % len(body) if length and (body or method == b"POST") else b""
+    )
+    return b"%s %s HTTP/%s\r\nHost: x\r\nX-Request-Id: %s\r\n%s%s\r\n%s" % (
+        method,
+        path,
+        version,
+        RID.encode(),
+        head,
+        framing,
+        body,
+    )
+
+
+def _values(resp, name: str) -> list[str]:
+    if isinstance(resp, httpx.Response):
+        return resp.headers.get_list(name)
+    return resp.header(name)
+
+
+def _content(resp) -> bytes:
+    return resp.content if isinstance(resp, httpx.Response) else resp.body
+
+
+def _path_ok_gated(env):
+    env.fake.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    car = env.car()
+    resp = _send_and_read(car, _rq())
+    return _Path(car, resp, "acquired", _expect(200, "ok", "free", len(CHAT), 13), True, True)
+
+
+def _path_ok_ungated(env):
+    env.fake.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    car = env.car()
+    resp = _send_and_read(car, _rq(b"/api/tags", b"", method=b"GET"))
+    return _Path(car, resp, "ungated", _expect(200, "ok", "none", 0, 13), False, False)
+
+
+def _path_health_ok(env):
+    env.fake.script("GET", "/api/version", VERSION_OK)
+    car = env.car()
+    resp = _send_and_read(car, _rq(b"/seriatim/health", b"", method=b"GET"))
+    line = _expect(200, "ok", "none", 0, len(resp.body), "DEBUG")
+    return _Path(car, resp, "ungated", line, False, False, "health")
+
+
+def _path_health_degraded(env):
+    car = env.car(f"http://127.0.0.1:{closed_port()}")
+    resp = _send_and_read(car, _rq(b"/seriatim/health", b"", method=b"GET"))
+    line = _expect(503, "degraded", "none", 0, len(resp.body), "DEBUG")
+    return _Path(car, resp, "ungated", line, False, False, "health")
+
+
+def _refusal(env, request: bytes, status_: int, *, outcome="rejected", level="INFO", **settings):
+    """A refusal sent before the body is read and before any gate is asked."""
+    car = env.car(**settings)
+    resp = _send_and_read(car, request)
+    assert resp.status == status_
+    line = _expect(status_, outcome, "none", 0, len(resp.body), level)
+    return _Path(car, resp, "ungated", line, False, False, "errors")
+
+
+def _path_bad_path(env):
+    return _refusal(env, _rq(b"/a//b", b"", method=b"GET"), 400)
+
+
+def _path_te_with_length(env):
+    return _refusal(env, _rq(body=b"0\r\n\r\n", head=b"Transfer-Encoding: chunked\r\n"), 400)
+
+
+def _path_not_found(env):
+    return _refusal(env, _rq(b"/seriatim/nope", b"", method=b"GET"), 404)
+
+
+def _path_method_not_allowed(env):
+    return _refusal(env, _rq(b"/seriatim/health"), 405)
+
+
+def _path_too_large_before_admission(env):
+    return _refusal(env, _rq(body=b"x" * 4096), 413, max_body_bytes=LIMIT)
+
+
+def _path_http_1_0(env):
+    return _refusal(env, _rq(b"/api/tags", b"", method=b"GET", version=b"1.0"), 505)
+
+
+def _path_busy(env):
+    hold = Hold()
+    env.fake.script("POST", "/api/chat", hold)
+    car = env.car()
+    held = _in_background(_chat, car)
+    hold.wait_entered()
+    resp = _send_and_read(car, _rq())
+    hold.release()
+    assert held.result(WAIT_S).status_code == 200
+    line = _expect(429, "busy", "none", 0, len(resp.body))  # the body is never read (B3)
+    return _Path(car, resp, "busy", line, True, False, "errors")
+
+
+def _path_starting(env):
+    gate = Gate(1, 15, 10, 1800, clock=FakeClock(), wall=lambda: 1.7e9)  # in its quarantine
+    car = env.car(gate=gate)
+    resp = _send_and_read(car, _rq())
+    line = _expect(503, "starting", "none", 0, len(resp.body))
+    return _Path(car, resp, "refused", line, True, False, "errors")
+
+
+def _path_too_large_after_admission(env):
+    body = b"x" * 4096
+    chunks = b"".join(b"%x\r\n%s\r\n" % (1000, body[i : i + 1000]) for i in range(0, 4000, 1000))
+    request = _rq(body=chunks, head=b"Transfer-Encoding: chunked\r\n", length=False)
+    car = env.car(max_body_bytes=LIMIT)
+    resp = _send_and_read(car, request)
+    assert resp.status == 413
+    over = lambda n: LIMIT < n <= 4000  # noqa: E731  (read until past the limit, never the rest)
+    line = _expect(413, "rejected", "free", over, len(resp.body))
+    return _Path(car, resp, "acquired", line, True, True, "errors")
+
+
+def _path_body_timeout(env):
+    car = env.car(body_timeout_s=0.5)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_rq(body=b"x" * 100)[:-50])  # half the body, then a stall
+        resp = read_response(sock)
+    assert resp.status == 408
+    line = _expect(408, "rejected", "free", 50, len(resp.body))
+    return _Path(car, resp, "acquired", line, True, True, "errors")
+
+
+def _path_upstream_unavailable(env):
+    car = env.car(f"http://127.0.0.1:{closed_port()}")
+    resp = _send_and_read(car, _rq())
+    assert resp.status == 502
+    line = _expect(502, "upstream_unavailable", "free", len(CHAT), len(resp.body))
+    return _Path(car, resp, "acquired", line, True, True, "errors")
+
+
+def _path_upstream_error(env):
+    car = env.car(env.raw_upstream(lambda fake, conn: None).url)  # closes at once (F1)
+    resp = _send_and_read(car, _rq())
+    assert resp.status == 502
+    line = _expect(502, "upstream_error", "draining", len(CHAT), len(resp.body))
+    return _Path(car, resp, "acquired", line, True, True, "errors")
+
+
+def _path_hold_limit_before_the_headers(env):
+    env.fake.script("POST", "/api/chat", Hold())
+    car = env.car(gate=ready_gate(max_hold_s=1)[0])
+    resp = _send_and_read(car, _rq())
+    assert resp.status == 504
+    line = _expect(504, "hold_exceeded", "draining", len(CHAT), len(resp.body), "CRITICAL")
+    return _Path(car, resp, "acquired", line, True, True, "errors")
+
+
+def _raises(*args, **kwargs):
+    raise RuntimeError("bug")
+
+
+def _path_internal_gated(env):
+    env.monkeypatch.setattr(proxy_module, "upstream_headers", _raises)
+    car = env.car()
+    resp = _send_and_read(car, _rq())
+    assert resp.status == 500
+    line = _expect(500, "internal_error", "free", len(CHAT), len(resp.body), "ERROR")
+    return _Path(car, resp, "acquired", line, True, True, "errors")
+
+
+def _path_internal_ungated(env):
+    env.monkeypatch.setattr(proxy_module, "upstream_headers", _raises)
+    car = env.car()
+    resp = _send_and_read(car, _rq(b"/api/tags", b"", method=b"GET"))
+    assert resp.status == 500
+    line = _expect(500, "internal_error", "none", 0, len(resp.body), "ERROR")
+    return _Path(car, resp, "ungated", line, False, False, "errors")
+
+
+def _path_saturated(env):
+    car, resp, _, hold, held = _saturated(env.fake, env.sidecar, rid=RID)
+    hold.release_all()
+    for f in held:
+        assert f.result(WAIT_S).status_code == 200
+    assert resp.status_code == 503
+    line = _expect(503, "saturated", "none", 2, len(resp.content))
+    return _Path(car, resp, "ungated", line, False, False, "errors")
+
+
+def _path_client_gone_during_the_body(env):
+    gate, _ = ready_gate()
+    acquires = _count_acquires(gate)
+    car = env.car(gate=gate)
+    with raw_connect(car.port) as sock:
+        sock.sendall(_rq(body=b"x" * 100)[:-50])
+        wait_for(lambda: len(acquires) == 1)  # admitted, and reading the body
+    line = _expect(None, "client_disconnect", "free", 50, 0)  # E7: nobody to answer
+    return _Path(car, None, None, line, True, True)
+
+
+def _path_upload_interrupted(env):
+    _blob_fake(env.fake)
+    car = env.car()
+    with raw_connect(car.port) as sock:
+        head = _rq(BLOB, b"", head=b"Content-Length: %d\r\n" % MIB, length=False)
+        sock.sendall(head + bytes(64 * 1024))
+        rec = _upload(env.fake)
+        wait_for(lambda: rec.length > 0)  # the first chunk was forwarded
+    wait_for(lambda: not rec.complete)
+    some = lambda n: rec.length <= n <= 64 * 1024  # noqa: E731
+    line = _expect(None, "upload_interrupted", "none", some, 0)  # E12, ruled on #62
+    return _Path(car, None, None, line, False, False)
+
+
+def _path_hold_limit_mid_stream(env):
+    env.fake.script("POST", "/api/chat", Hold(headers=NDJSON_TYPE, first=LINE_A))
+    car = env.car(gate=ready_gate(max_hold_s=1)[0])
+    resp = raw_exchange(car.port, _rq())  # read until uvicorn closes the aborted response
+    assert resp.status == 200 and LINE_A in resp.body and HOLD_RECORD in resp.body
+    out = len(LINE_A) + len(HOLD_RECORD)  # S7: Ollama's line, then the record
+    line = _expect(200, "hold_exceeded", "draining", len(CHAT), out, "CRITICAL")
+    return _Path(car, resp, "acquired", line, True, True, "records")
+
+
+def _path_stuck_close(env):
+    real = proxy_module.new_gated_client
+
+    def gated(settings):
+        client = real(settings)
+
+        async def aclose():
+            raise OSError("the pool would not close")
+
+        client._transport._pool.aclose = aclose  # F4: the fault is beneath httpx's aclose
+        return client
+
+    env.monkeypatch.setattr(proxy_module, "new_gated_client", gated)
+    env.fake.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    car = env.car()
+    resp = _send_and_read(car, _rq())
+    line = _expect(200, "ok", "stuck", len(CHAT), 13, "CRITICAL")
+    line["upstream_close_failed"] = True
+    return _Path(car, resp, "acquired", line, True, True)
+
+
+def _path_shutdown(env):
+    """S11: the server shutting down cancels the request's task while Ollama holds it."""
+    hold = Hold()
+    env.fake.script("POST", "/api/chat", hold)
+    settings = make_settings(env.fake.url, log_level="DEBUG")
+    gate, _ = ready_gate()
+    shared = proxy_module.new_ungated_client(settings)
+    proxy = Proxy(settings, gate, shared, RequestLog("DEBUG", "node-a"), ErrorFactory("node-a"))
+    scope = {
+        "method": "POST",
+        "raw_path": b"/api/chat",
+        "query_string": b"",
+        "headers": [(b"content-length", str(len(CHAT)).encode())],
+    }
+    body = [{"type": "http.request", "body": CHAT, "more_body": False}]
+    sent: list[dict] = []
+
+    async def receive():
+        if body:
+            return body.pop()
+        await anyio.sleep_forever()
+
+    async def send(message):
+        sent.append(message)
+
+    async def main() -> None:
+        task = asyncio.ensure_future(
+            proxy(scope, receive, send, classify("POST", b"/api/chat"), RID)
+        )
+        deadline = time.monotonic() + WAIT_S
+        while hold.entered < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await shared.aclose()
+
+    asyncio.run(main())
+    assert sent == []
+    line = _expect(None, "cancelled", "draining", len(CHAT), 0)
+    return _Path(None, None, None, line, True, True)
+
+
+PATHS = [
+    _path_ok_gated,
+    _path_ok_ungated,
+    _path_health_ok,
+    _path_health_degraded,
+    _path_bad_path,
+    _path_te_with_length,
+    _path_not_found,
+    _path_method_not_allowed,
+    _path_too_large_before_admission,
+    _path_http_1_0,
+    _path_busy,
+    _path_starting,
+    _path_too_large_after_admission,
+    _path_body_timeout,
+    _path_upstream_unavailable,
+    _path_upstream_error,
+    _path_hold_limit_before_the_headers,
+    _path_internal_gated,
+    _path_internal_ungated,
+    _path_saturated,
+    _path_client_gone_during_the_body,
+    _path_upload_interrupted,
+    _path_hold_limit_mid_stream,
+    _path_stuck_close,
+    _path_shutdown,
+]
+
+
+def _the_line(path: _Path, capsys) -> dict:
+    """The one line `RID`'s request wrote. Over the wire, a sentinel request's line is waited
+    for after it, so a second line for `RID` would have been seen too."""
+    seen: list[dict] = []
+
+    def read(rid: str) -> bool:
+        seen.extend(_log_lines(capsys.readouterr().out))
+        return any(d["request_id"] == rid for d in seen)
+
+    if path.car is None:  # in process: the proxy has returned, so its line is written
+        read(RID)
+    else:
+        wait_for(lambda: read(RID))
+        httpx.get(path.car.url + "/seriatim/nope", headers={"x-request-id": "end"}, timeout=WAIT_S)
+        wait_for(lambda: read("end"))
+    mine = [d for d in seen if d["request_id"] == RID]
+    assert len(mine) == 1, mine
+    return mine[0]
+
+
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+
+
+@pytest.mark.td("L2", "H19", "K-OAS2")
+@pytest.mark.parametrize("drive", PATHS, ids=[f.__name__[len("_path_") :] for f in PATHS])
+def test_every_path_one_line_seriatims_headers_and_a_valid_body(
+    drive,
+    fake_ollama,
+    sidecar,
+    raw_upstream,
+    monkeypatch,
+    capsys,
+    contract_bodies,
+    contract_schemas,
+):
+    path = drive(_Env(fake_ollama, sidecar, raw_upstream, monkeypatch))
+    bodies = ContractBodies(  # what this path made, before the sentinel adds its own 404
+        [*contract_bodies.errors], [*contract_bodies.records], [*contract_bodies.health]
+    )
+    # L2: exactly one line, with the fields of §5 and TD Appendix A, at the line's own level
+    line = _the_line(path, capsys)
+    for key, want in path.line.items():
+        assert want(line[key]) if callable(want) else line[key] == want, (key, line)
+    assert list(line)[-8:] == [*APPENDIX_A_TAIL, "node"]
+    assert _number(line["wait_ms"]) if path.wait else line["wait_ms"] is None
+    assert _number(line["hold_ms"]) if path.hold else line["hold_ms"] is None
+    if path.resp is not None:
+        # H19: Seriatim's own headers, each exactly once
+        assert _values(path.resp, "x-seriatim-node") == ["node-a"]
+        assert _values(path.resp, "x-request-id") == [RID]
+        assert _values(path.resp, "x-seriatim-gate") == [path.gate]
+    # K-OAS2: Seriatim's body was collected by the hook, and every collected body is valid
+    if path.body == "errors":
+        assert _content(path.resp) in bodies.errors
+    elif path.body == "health":
+        assert bodies.health == [_content(path.resp)]
+    elif path.body == "records":
+        assert bodies.records == [HOLD_RECORD]
+    if path.body != "errors":  # a passthrough, a health body or no answer: no error body
+        assert bodies.errors == []
+    if path.body != "records":
+        assert bodies.records == []
+    check_contract_bodies(contract_bodies, contract_schemas)
+
+
+def test_ms_rounds_to_two_decimal_places():
+    assert proxy_module._ms(1.234567) == 1234.57
+    assert proxy_module._ms(0.0000404) == 0.04  # Appendix A's wait_ms
+    assert proxy_module._ms(0) == 0
+
+
+def test_the_hold_is_timed_from_admission_to_the_lease_end(monkeypatch, capsys):
+    """hold_ms and wait_ms come from perf_counter(): the gate's answer, then step (b)."""
+    ticks = iter([100.0, 100.5, 103.0])  # arrival, the gate's answer, the lease's end
+    clock = types.SimpleNamespace(perf_counter=lambda: next(ticks))  # proxy.py's own `time`
+    monkeypatch.setattr(proxy_module, "time", clock)
+    _run_proxy(_ok, monkeypatch=monkeypatch)
+    line = _one_line(capsys)
+    assert (line["wait_ms"], line["hold_ms"]) == (500.0, 2500.0)
+
+
+# --- S1-13: K-OAS2, the hook itself -------------------------------------------------------
+
+
+@pytest.mark.td("K-OAS2")
+def test_k_oas2_an_sse_record_is_collected_and_valid(
+    monkeypatch, contract_bodies, contract_schemas
+):
+    def handler(request):
+        headers = {"content-type": "text/event-stream"}
+        return httpx.Response(
+            200, headers=headers, stream=_Stream([b"data: a\n\n"], then=httpx.ReadError("x"))
+        )
+
+    sent, _, _ = _run_proxy(handler, monkeypatch=monkeypatch)
+    record = (
+        b'data: {"error":"Ollama\'s response stream broke",'
+        b'"error_code":"UPSTREAM_STREAM_BROKEN"}\n\n'
+    )
+    assert sent[-1] == {"type": "http.response.body", "body": record, "more_body": True}
+    assert contract_bodies.records == [record]
+    check_contract_bodies(contract_bodies, contract_schemas)
+
+
+@pytest.mark.td("K-OAS2")
+@pytest.mark.parametrize(
+    ("bodies", "error"),
+    [
+        (ContractBodies(errors=[b'{"error":"x","error_code":"GPU_BUSY"}']), "required"),
+        (ContractBodies(errors=[b'{"error":"x","error_code":"NOPE","retryable":true,'
+                                b'"replay_safe":true,"source":"sidecar"}']), "is not one of"),
+        (ContractBodies(records=[b'{"error":"x","error_code":"GPU_BUSY"}\n']), "is not one of"),
+        (ContractBodies(records=[b'{"error":"x","error_code":"LOCK_HOLD_EXCEEDED","n":1}\n']),
+         "Additional properties"),
+        (ContractBodies(records=[b'data: {"error":"x"}\n\n']), "required"),
+        (ContractBodies(health=[b'{"status":"degraded","reasons":["busy"]}']), "is not one of"),
+        (ContractBodies(health=[b'{"status":"ok","version":"1"}']), "Additional properties"),
+    ],
+    ids=["envelope-fields", "envelope-code", "record-code", "record-extra", "sse-record",
+         "health-reason", "health-extra"],
+)  # fmt: skip
+def test_k_oas2_the_check_rejects_an_invalid_body(bodies, error, contract_schemas):
+    """The hook's check is not vacuous: each schema refuses a body that breaks it."""
+    with pytest.raises(jsonschema.ValidationError, match=error):
+        check_contract_bodies(bodies, contract_schemas)
+
+
+def test_k_oas2_a_record_must_be_one_line_or_one_event(contract_schemas):
+    for bad in [b'{"error":"x","error_code":"LOCK_HOLD_EXCEEDED"}', b"data: {}\n", b"{}\n{}\n"]:
+        with pytest.raises(AssertionError):
+            check_contract_bodies(ContractBodies(records=[bad]), contract_schemas)
+
+
+# --- S1-13: L1, one line each with Appendix A's fields, and no secret ------------------------
+
+APPENDIX_A_KEYS = [
+    "ts", "level", "event", "request_id", "method", "path", "kind", "scope", "known",
+    *APPENDIX_A_TAIL, "node",
+]  # fmt: skip
+BODY_MARK = "l1-body-mark-7f3a"
+AUTH_MARK = "l1-auth-mark-91c2"
+KEY_MARK = "l1-key-mark-5d0e"
+SECRET_BODY = json.dumps({"model": "m", "messages": [{"role": "user", "content": BODY_MARK}]})
+
+
+def _captured(capsys, prefix: str, n: int) -> tuple[list[dict], str]:
+    """Wait for `n` request lines whose request id starts with `prefix` (so a line from
+    another test's server is never counted). Returns them and everything written meanwhile,
+    to stdout and stderr."""
+    text: list[str] = []
+
+    def mine() -> list[dict]:
+        return [d for d in _log_lines("".join(text)) if d["request_id"].startswith(prefix)]
+
+    def enough() -> bool:
+        out, err = capsys.readouterr()
+        text.append(out + err)
+        return len(mine()) >= n
+
+    wait_for(enough)
+    return mine(), "".join(text)
+
+
+def _secret_chat(car, rid: str) -> httpx.Response:
+    headers = {"authorization": f"Bearer {AUTH_MARK}", "x-api-key": KEY_MARK, "x-request-id": rid}
+    return httpx.post(car.url + "/api/chat", content=SECRET_BODY, headers=headers, timeout=WAIT_S)
+
+
+def _l1_h1(fake_ollama, sidecar):
+    fake_ollama.script("POST", "/api/chat", replay("chat.nostream"))
+    car = sidecar(fake_ollama.url, gate=ready_gate()[0])
+    resp = _secret_chat(car, "l1-1")
+    assert resp.status_code == 200
+    return [("l1-1", "ok", 200, "free", len(SECRET_BODY), len(resp.content))]
+
+
+def _l1_b1(fake_ollama, sidecar):
+    hold = Hold()
+    fake_ollama.script("POST", "/api/chat", hold)
+    car = sidecar(fake_ollama.url, gate=ready_gate()[0])
+    held = _in_background(_secret_chat, car, "l1-1")
+    hold.wait_entered()
+    busy = _secret_chat(car, "l1-2")
+    assert busy.status_code == 429
+    hold.release()
+    first = held.result(WAIT_S)
+    return [
+        ("l1-2", "busy", 429, "none", 0, len(busy.content)),  # the body is never read (B3)
+        ("l1-1", "ok", 200, "free", len(SECRET_BODY), len(first.content)),
+    ]
+
+
+def _l1_e1(fake_ollama, sidecar):
+    car = sidecar(f"http://127.0.0.1:{closed_port()}", gate=ready_gate()[0])
+    resp = _secret_chat(car, "l1-1")
+    assert resp.status_code == 502
+    return [("l1-1", "upstream_unavailable", 502, "free", len(SECRET_BODY), len(resp.content))]
+
+
+def _l1_s4(fake_ollama, sidecar):
+    hold = Hold(headers=NDJSON_TYPE, first=LINE_A)
+    fake_ollama.script("POST", "/api/chat", hold)
+    car = sidecar(fake_ollama.url, gate=ready_gate()[0])
+    body = SECRET_BODY.encode()
+    request = (
+        b"POST /api/chat HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nX-API-Key: %s\r\n"
+        b"X-Request-Id: l1-1\r\nContent-Length: %d\r\n\r\n%s"
+        % (AUTH_MARK.encode(), KEY_MARK.encode(), len(body), body)
+    )
+    with raw_connect(car.port) as sock:
+        sock.sendall(request)
+        received = b""
+        while LINE_A not in received:
+            received += sock.recv(65536)
+    hold.wait_disconnected()
+    return [("l1-1", "client_disconnect", 200, "draining", len(body), len(LINE_A))]
+
+
+@pytest.mark.td("L1")
+@pytest.mark.parametrize("scenario", [_l1_h1, _l1_b1, _l1_e1, _l1_s4], ids=["H1", "B1", "E1", "S4"])
+def test_l1_one_line_each_with_appendix_a_fields_and_no_secret(
+    scenario, fake_ollama, sidecar, capsys
+):
+    started = time.perf_counter()
+    expected = scenario(fake_ollama, sidecar)
+    lines, text = _captured(capsys, "l1-", len(expected))
+    elapsed = time.perf_counter() - started
+    assert [
+        (d["request_id"], d["outcome"], d["status"], d["slot_end"], d["bytes_in"], d["bytes_out"])
+        for d in lines
+    ] == expected  # one line per request, in the order they ended
+    for d in lines:
+        assert list(d) == APPENDIX_A_KEYS  # exactly Appendix A's fields, in its order
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", d["ts"])
+        assert (d["level"], d["event"], d["node"]) == ("INFO", "request", "node-a")
+        assert (d["method"], d["path"], d["kind"], d["scope"], d["known"]) == (
+            "POST", "/api/chat", "gated", "infer", True,
+        )  # fmt: skip
+        assert _number(d["wait_ms"]) and d["wait_ms"] < WAIT_S * 1000  # each asked the gate
+        if d["slot_end"] == "none":
+            assert d["hold_ms"] is None
+        else:  # held from admission to the lease's end, within the test's own time
+            assert _number(d["hold_ms"]) and d["hold_ms"] < elapsed * 1000
+    assert BODY_MARK in SECRET_BODY and text  # the markers were sent, and lines were read
+    for mark in (BODY_MARK, AUTH_MARK, KEY_MARK):
+        assert mark not in text
+
+
+# --- S1-13: L3, nothing secret reaches any log ---------------------------------------------
+
+MARK = "l3-secret-mark-c41b"
+QUERY = f"?key={MARK}&token={MARK}"
+
+
+def _l3_cookies_and_query(fake_ollama, sidecar):
+    cookie = [(b"set-cookie", f"s={MARK}".encode()), (b"content-type", b"application/json")]
+    fake_ollama.script("POST", "/api/chat", status(200, b"{}", cookie))
+    fake_ollama.script("GET", "/api/tags", status(200, b"{}", cookie))
+    car = sidecar(fake_ollama.url, gate=ready_gate()[0], log_level="DEBUG")
+    gated = httpx.post(
+        car.url + "/api/chat" + QUERY,
+        content=b"{}",
+        headers={"cookie": f"c={MARK}", "x-request-id": "l3-gated"},
+    )
+    ungated = httpx.get(
+        car.url + "/api/tags" + QUERY, headers={"cookie": f"c={MARK}", "x-request-id": "l3-tags"}
+    )
+    assert (gated.status_code, ungated.status_code) == (200, 200)
+    assert gated.headers.get_list("set-cookie") == []  # H11: never relayed
+    assert [r.query for r in fake_ollama.requests] == [
+        QUERY[1:].encode()
+    ] * 2  # it did reach Ollama
+    return {"/api/chat": "ok", "/api/tags": "ok"}
+
+
+def _l3_internal_error(fake_ollama, sidecar):
+    car = sidecar(fake_ollama.url, gate=ready_gate()[0], log_level="DEBUG")
+    body = json.dumps({"model": "m", "prompt": MARK})  # E15: raised after the body was read
+    headers = {"cookie": f"c={MARK}", "x-request-id": "l3-e15"}
+    resp = httpx.post(car.url + "/api/chat" + QUERY, content=body, headers=headers)
+    assert resp.status_code == 500
+    return {"/api/chat": "internal_error"}
+
+
+def _l3_upstream_error(fake_ollama, sidecar):
+    car = sidecar(f"http://127.0.0.1:{closed_port()}", gate=ready_gate()[0], log_level="DEBUG")
+    resp = httpx.post(
+        car.url + "/api/chat" + QUERY,
+        content=f'{{"p":"{MARK}"}}',
+        headers={"x-request-id": "l3-e1"},
+    )
+    assert resp.status_code == 502  # E1's closed port: an exception message may carry the URL
+    return {"/api/chat": "upstream_unavailable"}
+
+
+@pytest.mark.td("L3")
+@pytest.mark.parametrize(
+    "scenario",
+    [_l3_cookies_and_query, _l3_internal_error, _l3_upstream_error],
+    ids=["cookies-and-query", "internal-error", "upstream-error"],
+)
+def test_l3_no_secret_reaches_the_log(scenario, fake_ollama, sidecar, monkeypatch, capsys, caplog):
+    if scenario is _l3_internal_error:
+        monkeypatch.setattr(proxy_module, "upstream_headers", _raises)
+    caplog.set_level(logging.DEBUG)  # every library's own records too, at every level
+    outcomes = scenario(fake_ollama, sidecar)
+    lines, text = _captured(capsys, "l3-", len(outcomes))
+    assert {d["path"]: d["outcome"] for d in lines} == outcomes  # the path only, never the query
+    if scenario is _l3_internal_error:
+        (line,) = lines
+        assert "RuntimeError: bug" in line["traceback"]  # the traceback is logged, and clean
+    for logged in (text, caplog.text, *(r.getMessage() for r in caplog.records)):
+        assert MARK not in logged
+
+
+def test_l3_httpx_would_log_the_query(fake_ollama, sidecar, caplog, monkeypatch):
+    """The contrast that keeps L3's `caplog` check from passing vacuously: with httpx's logger
+    at INFO again, its own line for the same request carries the query."""
+    fake_ollama.script("GET", "/api/tags", status(200, b"{}"))
+    for name in ("httpx", "httpcore"):  # as before any sidecar was made in this process
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+    root = logging.getLogger().level
+    car = sidecar(fake_ollama.url, gate=ready_gate()[0])
+    assert logging.getLogger().level == root  # only the two libraries' loggers are set
+    assert logging.getLogger("httpx").level == logging.WARNING  # set by create_app
+    assert logging.getLogger("httpcore").level == logging.WARNING
+    caplog.set_level(logging.INFO, logger="httpx")
+    assert httpx.get(car.url + "/api/tags" + QUERY).status_code == 200
+    assert MARK in caplog.text
+
+
+# --- S1-13: HL8, health under load ---------------------------------------------------------
+
+HEALTH_LOAD = 200  # concurrent health requests (TD §8.3 HL8)
+HL8_PROBE_S = 1.0  # health_probe_timeout_s while Ollama stalls
+# While Ollama answers, every probe queues for the health client's one connection, and its
+# budget includes that wait (§3.4). A slow runner takes far longer per probe than a local
+# loopback, so the budget is set well beyond the queue: the case shows that load alone never
+# turns a probe into an error.
+HL8_ANSWERING_PROBE_S = 20.0
+HEALTH_REQUEST = b"GET /seriatim/health HTTP/1.1\r\nHost: x\r\n\r\n"
+
+
+def _room_for_sockets(n: int) -> None:
+    """Raise the soft open-file limit on POSIX for `n` more sockets on each side (macOS starts
+    at 256). Windows has no such limit for sockets."""
+    if sys.platform == "win32":
+        return
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = 2 * n + 256
+    if soft != resource.RLIM_INFINITY and soft < want:
+        top = want if hard == resource.RLIM_INFINITY else min(want, hard)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (top, hard))
+
+
+async def _read_one(reader: asyncio.StreamReader) -> tuple[int, bytes]:
+    head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
+    lines = head.split("\r\n")
+    fields = dict(ln.lower().split(":", 1) for ln in lines[1:] if ":" in ln)
+    return int(lines[0].split()[1]), await reader.readexactly(int(fields["content-length"]))
+
+
+async def _health_load(car, chat_when) -> tuple[list[tuple[int, bytes, float, float]], dict]:
+    """Open `HEALTH_LOAD` connections one at a time (so no listen backlog overflows), then
+    send one health request on each at once and time each from its own write. A gated chat
+    is sent once `chat_when()` holds, while the health requests are outstanding. Returns
+    (status, body, elapsed, end) per health request, and the chat's status and times."""
+    conns = [await asyncio.open_connection("127.0.0.1", car.port) for _ in range(HEALTH_LOAD)]
+
+    async def one(reader, writer):
+        started = time.perf_counter()
+        writer.write(HEALTH_REQUEST)
+        code, body = await asyncio.wait_for(_read_one(reader), 30)
+        ended = time.perf_counter()
+        return code, body, ended - started, ended
+
+    async def chat():
+        deadline = time.monotonic() + WAIT_S
+        while not chat_when() and time.monotonic() < deadline:
+            await asyncio.sleep(0.002)
+        async with httpx.AsyncClient(timeout=WAIT_S) as client:
+            sent = time.perf_counter()
+            resp = await client.post(car.url + "/api/chat", content=CHAT)
+        return {"status": resp.status_code, "sent": sent, "done": time.perf_counter()}
+
+    try:
+        *health, chat_result = await asyncio.gather(*(one(r, w) for r, w in conns), chat())
+    finally:
+        for _, writer in conns:
+            writer.close()
+    return health, chat_result
+
+
+def _probing(fake_ollama) -> Callable[[], bool]:
+    return lambda: any(r.raw_path == b"/api/version" for r in fake_ollama.requests)
+
+
+@pytest.mark.td("HL8")
+def test_hl8_health_under_load_while_ollama_stalls(
+    fake_ollama, sidecar, health_validator, monkeypatch
+):
+    _room_for_sockets(HEALTH_LOAD)
+    handled: list[float] = []
+    inner = _Dispatcher._health
+
+    async def timed(self, request):
+        started = time.perf_counter()
+        try:
+            return await inner(self, request)
+        finally:
+            handled.append(time.perf_counter() - started)
+
+    monkeypatch.setattr(_Dispatcher, "_health", timed)
+    fake_ollama.script("GET", "/api/version", stall_headers())
+    fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    car = sidecar(fake_ollama.url, gate=ready_gate()[0], health_probe_timeout_s=HL8_PROBE_S)
+    health, chat = asyncio.run(_health_load(car, _probing(fake_ollama)))
+    assert len(health) == HEALTH_LOAD
+    for code, body, _, _ in health:
+        assert code == 503  # none is 200, and none is 500
+        doc = json.loads(body)
+        health_validator.validate(doc)
+        assert doc == {"status": "degraded", "reasons": ["ollama_unreachable"]}
+    # Each one is answered within the probe's budget plus the bound, timed in the sidecar
+    # from the handler's start (see TD "Details fixed by the code (S1-13)").
+    assert len(handled) == HEALTH_LOAD
+    assert max(handled) < HL8_PROBE_S + TIMING_BOUND_S, max(handled)
+    # From the client, the event loop's queue for 200 requests at once comes on top, but no
+    # probe ever waits for another's budget: that would take 200 of them.
+    assert max(elapsed for _, _, elapsed, _ in health) < 2 * HL8_PROBE_S + TIMING_BOUND_S
+    assert chat["status"] == 200  # a gated request is served meanwhile,
+    assert chat["done"] < min(end for *_, end in health)  # before any stalled probe gave up
+
+
+@pytest.mark.td("HL8")
+def test_hl8_health_under_load_while_ollama_answers(fake_ollama, sidecar, health_validator):
+    _room_for_sockets(HEALTH_LOAD)
+    fake_ollama.script("GET", "/api/version", VERSION_OK)
+    fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
+    car = sidecar(
+        fake_ollama.url, gate=ready_gate()[0], health_probe_timeout_s=HL8_ANSWERING_PROBE_S
+    )
+    health, chat = asyncio.run(_health_load(car, _probing(fake_ollama)))
+    assert len(health) == HEALTH_LOAD
+    for code, body, _, _ in health:
+        assert code == 200
+        doc = json.loads(body)
+        health_validator.validate(doc)
+        assert doc == {"status": "ok"}
+    assert chat["status"] == 200  # a gated request is served meanwhile,
+    assert chat["sent"] < max(end for *_, end in health)  # while health requests were open

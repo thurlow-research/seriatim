@@ -7,6 +7,8 @@
 - `start_sidecar`: runs `create_app(settings)` under a real uvicorn server (h11) on
   127.0.0.1, with `ollama_url` pointing at the fake (or at a port nothing listens on).
 - `start_process`: runs `python -m seriatim_node` as a subprocess (`test_process.py`).
+- `ContractBodies` and `check_contract_bodies`: every error body, in-stream record and health
+  body the sidecar makes in a test, checked against the contract (K-OAS2; `conftest.py`).
 
 Servers run in their own thread and event loop, so tests stay synchronous and work the same
 on Linux, macOS and Windows. Every socket is bound by the harness to an ephemeral port before
@@ -31,7 +33,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
+import jsonschema
 import uvicorn
+import yaml
 
 from seriatim_node.app import create_app
 from seriatim_node.config import Settings, load_settings
@@ -43,6 +47,9 @@ TIMING_BOUND_S = 0.5 if os.environ.get("CI") == "true" else 0.1
 STALL_LIMIT_S = 30.0  # a stalled fake gives up after this, so teardown can never hang
 WAIT_S = 5.0  # TD §7: tests wait on events for at most this long, so a hang fails the test
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "ollama-0.40.16.json"
+# Resolved from this file, so the same path works when mutmut copies tests/ and contract/ into
+# node/ (tools/ci/mutation.py).
+CONTRACT_PATH = Path(__file__).resolve().parents[2] / "contract" / "openapi.yaml"
 
 
 def wait_for(predicate: Callable[[], object], timeout: float = WAIT_S) -> None:
@@ -113,6 +120,54 @@ class ThreadServer:
         self.server.should_exit = True
         self.thread.join(10)
         self.sock.close()
+
+
+# --- the contract's body schemas (K-OAS2; TD §7 "Error bodies") ----------------------------
+
+
+@dataclass
+class ContractBodies:
+    """The bodies the sidecar made during one test, as `conftest.py`'s hook collects them:
+    `ErrorFactory.response` bodies, `stream_error_record` records and health bodies."""
+
+    errors: list[bytes] = field(default_factory=list)
+    records: list[bytes] = field(default_factory=list)
+    health: list[bytes] = field(default_factory=list)
+
+
+def contract_validators() -> dict[str, jsonschema.Draft202012Validator]:
+    """Validators for `ErrorEnvelope`, `StreamErrorRecord` and `Health`, whose local `$ref`s
+    resolve within the contract."""
+    contract = yaml.safe_load(CONTRACT_PATH.read_text(encoding="utf-8"))
+    components = contract["components"]
+    return {
+        name: jsonschema.Draft202012Validator(
+            {**components["schemas"][name], "components": components}
+        )
+        for name in ("ErrorEnvelope", "StreamErrorRecord", "Health")
+    }
+
+
+def record_doc(record: bytes) -> object:
+    """The JSON one in-stream record carries: an NDJSON line, or one SSE `data:` event."""
+    if record.startswith(b"data: "):
+        assert record.endswith(b"\n\n") and record.count(b"\n") == 2, record
+        return json.loads(record[len(b"data: ") : -2])
+    assert record.endswith(b"\n") and record.count(b"\n") == 1, record
+    return json.loads(record)
+
+
+def check_contract_bodies(
+    bodies: ContractBodies, validators: dict[str, jsonschema.Draft202012Validator]
+) -> None:
+    """Raise `jsonschema.ValidationError` (or `AssertionError` for a malformed record) on the
+    first body that does not match its schema."""
+    for body in bodies.errors:
+        validators["ErrorEnvelope"].validate(json.loads(body))
+    for record in bodies.records:
+        validators["StreamErrorRecord"].validate(record_doc(record))
+    for body in bodies.health:
+        validators["Health"].validate(json.loads(body))
 
 
 # --- fake_ollama ---------------------------------------------------------------------------
