@@ -77,6 +77,7 @@ from seriatim_node.app import (
     ErrorSpec,
     NoCookies,
     RequestLog,
+    SentBytes,
     _Dispatcher,
     create_app,
     new_health_client,
@@ -4352,6 +4353,18 @@ def test_l2_a_refusal_whose_write_fails_still_logs_one_line(path, fail_on, capsy
         assert line["bytes_out"] == 0
         assert len(sent) == (0 if fail_on == "start" else 1)
     assert list(line)[-8:] == [*APPENDIX_A_TAIL, "node"]
+
+
+def test_sent_bytes_adds_every_body_message_that_was_sent():
+    sent, send = _send_failing_on(None)
+    counted = SentBytes(send)
+    for message in [
+        {"type": "http.response.start", "status": 200, "headers": []},
+        {"type": "http.response.body", "body": b"abc", "more_body": True},
+        {"type": "http.response.body", "body": b"de", "more_body": False},
+    ]:
+        anyio.run(counted, message)
+    assert (counted.count, counted.failed, len(sent)) == (5, None, 3)
 
 
 def test_a_health_check_that_breaks_still_logs_its_line_and_raises(monkeypatch, capsys):
