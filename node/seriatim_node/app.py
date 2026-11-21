@@ -300,6 +300,8 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 _REQUEST_ID_RE = re.compile(rb"[A-Za-z0-9._-]{1,128}")  # used with fullmatch
 _RID_KEY = "seriatim.request_id"  # where the dispatcher leaves the request id in the scope
+_HEALTH_KEY = "seriatim.health_status"  # where `_health` leaves its status for the log line
+_HEALTH_OUTCOMES: Mapping[int | None, str] = MappingProxyType({200: "ok", 503: "degraded"})
 # The log line's gate timing for a request no gate was asked about (TD Appendix A).
 _NO_GATE: Mapping[str, None] = MappingProxyType({"wait_ms": None, "hold_ms": None})
 
@@ -311,6 +313,32 @@ def request_id_from(headers: list[tuple[bytes, bytes]]) -> str:
     if len(values) == 1 and _REQUEST_ID_RE.fullmatch(values[0]):
         return values[0].decode()
     return uuid.uuid4().hex
+
+
+class SentBytes:
+    """A `send` that counts the body bytes of each message once `send()` has returned, so a
+    write that failed adds nothing (the log's `bytes_out`, TD Appendix A). `failed` names the
+    exception a write raised, so the caller can tell the client going from its own error."""
+
+    def __init__(self, send: Send) -> None:
+        self._send = send
+        self.count = 0
+        self.failed: str | None = None
+
+    async def __call__(self, message: MutableMapping[str, Any]) -> None:
+        try:
+            await self._send(message)
+        except Exception as exc:
+            self.failed = type(exc).__name__
+            raise
+        self.count += len(message.get("body", b""))
+
+
+def note_write_failed(fields: dict[str, object], reason: str) -> None:
+    """A failed write to the client goes on the request's own line, never a line of its own
+    (L2 wins over §3.3's "log DEBUG" wording; ruled on #60)."""
+    fields["client_write_failed"] = True
+    fields["client_write_failed_reason"] = reason
 
 
 async def _send_response(
@@ -372,23 +400,63 @@ class _Dispatcher:
         **log_fields: object,
     ) -> None:
         """Send an ungated error response and log it (`slot_end` is `none`: no slot). The
-        dispatcher never reads the body, and no gate was asked."""
+        dispatcher never reads the body, and no gate was asked. The line is written whatever
+        the write does, with the body bytes actually sent (L2)."""
         status, headers, body = self.errors.response(
             code, message, gate_value="ungated", request_id=request_id
         )
-        await _send_response(send, status, headers + (extra_headers or []), body)
-        self.log.emit(
-            level=log_level,
-            request_id=request_id,
-            method=method,
-            **log_fields,
-            outcome=outcome,
-            status=status,
-            slot_end="none",
-            **_NO_GATE,
-            bytes_in=0,
-            bytes_out=len(body),
-        )
+        sent = SentBytes(send)
+        try:
+            await _send_response(sent, status, headers + (extra_headers or []), body)
+        except Exception as exc:  # only a write can raise: the client is gone (S1-10)
+            note_write_failed(log_fields, type(exc).__name__)
+        finally:
+            self.log.emit(
+                level=log_level,
+                request_id=request_id,
+                method=method,
+                **log_fields,
+                outcome=outcome,
+                status=status,
+                slot_end="none",
+                **_NO_GATE,
+                bytes_in=0,
+                bytes_out=sent.count,
+            )
+
+    async def _health_route(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """`GET /seriatim/health` through Starlette, then its one line, at `DEBUG`, once the
+        response has been sent (or its write has failed): `_health` leaves the status in
+        the scope, and `bytes_out` counts what `send()` took. Only a failed write is
+        swallowed; any other error still propagates, after the line."""
+        sent = SentBytes(send)
+        fields: dict[str, object] = {}
+        try:
+            await self._router(scope, receive, sent)
+        except Exception:
+            if sent.failed is None:
+                raise
+            note_write_failed(fields, sent.failed)  # the client is gone (S1-10)
+        finally:
+            status = scope.get(_HEALTH_KEY)  # None if `_health` itself failed
+            result = _HEALTH_OUTCOMES.get(status, "internal_error")
+            self.log.emit(
+                # a load balancer polls this, so DEBUG (REQ-22; HL9), unless it broke
+                level="ERROR" if result == "internal_error" else "DEBUG",
+                request_id=scope[_RID_KEY],
+                method="GET",
+                path="/seriatim/health",
+                kind="seriatim",
+                scope="none",
+                known=True,
+                **fields,
+                outcome=result,
+                status=status,
+                slot_end="none",
+                **_NO_GATE,
+                bytes_in=0,
+                bytes_out=sent.count,
+            )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":  # lifespan (and anything else) goes to Starlette
@@ -463,7 +531,7 @@ class _Dispatcher:
             )
         else:
             scope[_RID_KEY] = rid
-            await self._router(scope, receive, send)
+            await self._health_route(scope, receive, send)
 
     async def _probe(self) -> str | None:
         """None if Ollama answers well; otherwise the health reason (TD §3.4)."""
@@ -506,24 +574,9 @@ class _Dispatcher:
         if reasons:
             doc = {"status": "degraded", "reasons": reasons}
             status = 503
-        body = json.dumps(doc, separators=(",", ":")).encode()
-        self.log.emit(
-            level="DEBUG",  # a load balancer polls this (REQ-22; HL9)
-            request_id=rid,
-            method="GET",
-            path="/seriatim/health",
-            kind="seriatim",
-            scope="none",
-            known=True,
-            outcome="ok" if status == 200 else "degraded",
-            status=status,
-            slot_end="none",
-            **_NO_GATE,
-            bytes_in=0,
-            bytes_out=len(body),
-        )
+        request.scope[_HEALTH_KEY] = status  # logged by `_health_route`, after the send
         return Response(
-            body,
+            json.dumps(doc, separators=(",", ":")).encode(),
             status_code=status,
             media_type="application/json",
             headers={

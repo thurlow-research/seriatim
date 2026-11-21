@@ -379,6 +379,14 @@ def _ms(seconds: float) -> float:
     return round(seconds * 1000, 2)
 
 
+async def _send_whole(
+    send: Send, status: int, headers: list[tuple[bytes, bytes]], body: bytes
+) -> None:
+    """A whole response: the start, then the body in one message."""
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
 def _counted(receive: Receive, send: Send, outcome: Outcome) -> tuple[Receive, Send]:
     """`receive` and `send`, counting the body bytes each one carries into `outcome`. A body
     message counts once `send()` has returned, so a failed write adds nothing."""
@@ -464,9 +472,36 @@ class Proxy:
         )
         if close:
             headers = [*headers, (b"connection", b"close")]
-        await send({"type": "http.response.start", "status": status, "headers": headers})
-        await send({"type": "http.response.body", "body": body, "more_body": False})
+        await _send_whole(send, status, headers, body)
         return status
+
+    async def _refuse(
+        self,
+        send: Send,
+        where: dict[str, Any],
+        outcome: Outcome,
+        result: str,
+        code: ErrorCode,
+        message: str,
+        *,
+        close: bool,
+        **kw: Any,
+    ) -> None:
+        """A refusal before any slot is held (413 before admission, 429, 503): the reply, then
+        its one line, written whatever the write does (L2), with the bytes `send()` took. A
+        failed write is noted on that line, as at the end of an exchange (S1-10)."""
+        status, headers, body = self.errors.response(
+            code, message, gate_value="ungated", request_id=where["request_id"], **kw
+        )
+        if close:
+            headers = [*headers, (b"connection", b"close")]
+        try:
+            await _send_whole(send, status, headers, body)
+        except Exception as exc:  # the client is gone
+            where["client_write_failed"] = True
+            where["client_write_failed_reason"] = type(exc).__name__
+        finally:
+            self._emit(where, outcome, result, "INFO", status, "none", None)
 
     async def __call__(
         self, scope: Scope, receive: Receive, send: Send, route: Route, request_id: str
@@ -488,44 +523,44 @@ class Proxy:
         length = declared_length(scope["headers"])
         too_large = length is not None and length > self.settings.max_body_bytes
         if too_large and not streamed(scope["method"], scope["raw_path"]):  # before admission
-            status = await self._reply(
+            await self._refuse(
                 send,
+                where,
+                outcome,
+                "rejected",
                 ErrorCode.BODY_TOO_LARGE,
                 "the request body is too large",
-                gate_value="ungated",
-                rid=rid,
                 close=True,
             )
-            self._emit(where, outcome, "rejected", "INFO", status, "none", None)
             return
         if route.kind is Kind.GATED:
             r = self.gate.try_acquire(where["path"], rid)
             answered = time.perf_counter()
             outcome.wait_ms = _ms(answered - arrived)
             if isinstance(r, Busy):  # the body is never read (B3)
-                status = await self._reply(
+                await self._refuse(
                     send,
+                    where,
+                    outcome,
+                    "busy",
                     ErrorCode.GPU_BUSY,
                     "GPU busy: another request is running on this node",
-                    gate_value="ungated",
-                    rid=rid,
                     close=outcome.body_pending,
                     retry_after=r.retry_after_s,
                     busy_for_s=round(r.busy_for_s, 1),
                 )
-                self._emit(where, outcome, "busy", "INFO", status, "none", None)
                 return
             if isinstance(r, Starting):
-                status = await self._reply(
+                await self._refuse(
                     send,
+                    where,
+                    outcome,
+                    "starting",
                     ErrorCode.NODE_STARTING,
                     "the node is starting",
-                    gate_value="ungated",
-                    rid=rid,
                     close=outcome.body_pending,
                     retry_after=r.retry_after_s,
                 )
-                self._emit(where, outcome, "starting", "INFO", status, "none", None)
                 return
             lease = r
             outcome.admitted_at = answered

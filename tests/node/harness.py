@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
+import httpx
 import jsonschema
 import uvicorn
 import yaml
@@ -50,6 +51,19 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "ollama-0.40.16.jso
 # Resolved from this file, so the same path works when mutmut copies tests/ and contract/ into
 # node/ (tools/ci/mutation.py).
 CONTRACT_PATH = Path(__file__).resolve().parents[2] / "contract" / "openapi.yaml"
+
+
+def refused_post(url: str, **kw: Any) -> httpx.Response:
+    """A `POST` the sidecar will refuse before admission (429 or 503), sent with no body.
+
+    A refusal sent before a declared body is read carries `Connection: close` (S1-8), and the
+    body is never read (B3). httpx writes the body after the headers, so its bytes can reach
+    the socket after uvicorn's last read; uvicorn then closes with them unread, and the OS
+    answers that close with a reset. Windows drops the received but unread response when the
+    reset arrives (`WinError 10053` on the next read), where Linux still delivers it first.
+    A test that needs only the refusal sends no body; the close itself is tested with raw
+    sockets, which write the whole request at once."""
+    return httpx.post(url, content=b"", timeout=WAIT_S, **kw)
 
 
 def wait_for(predicate: Callable[[], object], timeout: float = WAIT_S) -> None:

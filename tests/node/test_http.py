@@ -58,6 +58,7 @@ from harness import (
     raw_exchange,
     read_response,
     ready_gate,
+    refused_post,
     replay,
     reserve_socket,
     sequence,
@@ -1167,7 +1168,7 @@ def test_h8b_an_abnormal_end_drains(fake_ollama, sidecar):
     assert head.startswith(b"HTTP/1.1 200 ") and b"content-length: 100" in head.lower()
     assert body == b'{"do'  # cut short: 4 of the 100 bytes, then the connection closes
     wait_for(lambda: _slot_states(gate) == ["draining"])
-    assert _chat(car).status_code == 429
+    assert refused_post(car.url + "/api/chat").status_code == 429
     clock.advance(10)
     assert _chat(car).status_code == 200
 
@@ -1181,7 +1182,7 @@ def test_b1_second_request_gets_429_at_once(fake_ollama, sidecar, envelope_valid
     held = _in_background(_chat, car)
     hold.wait_entered()
     started = time.perf_counter()
-    resp = _chat(car)
+    resp = refused_post(car.url + "/api/chat")
     elapsed = time.perf_counter() - started
     assert resp.status_code == 429
     assert elapsed < TIMING_BOUND_S
@@ -1232,7 +1233,7 @@ def test_b4_two_slots(fake_ollama, sidecar):
     car = sidecar(fake_ollama.url, gate=gate)
     first, second = _in_background(_chat, car), _in_background(_chat, car)
     hold.wait_entered(2)
-    assert _chat(car).status_code == 429
+    assert refused_post(car.url + "/api/chat").status_code == 429
     hold.release(0)
     wait_for(lambda: _slot_states(gate) == ["free", "held"])
     fourth = _in_background(_chat, car)
@@ -4234,6 +4235,146 @@ def test_the_hold_is_timed_from_admission_to_the_lease_end(monkeypatch, capsys):
     assert (line["wait_ms"], line["hold_ms"]) == (500.0, 2500.0)
 
 
+# --- S1-13: L2 when the write to the client fails ------------------------------------------
+
+
+def _refusal_scope(method: str, raw_path: bytes, length: int = 2, version: str = "1.1") -> dict:
+    return {
+        "type": "http",
+        "http_version": version,
+        "method": method,
+        "scheme": "http",
+        "path": raw_path.decode(),
+        "raw_path": raw_path,
+        "query_string": b"",
+        "headers": [(b"content-length", str(length).encode()), (b"x-request-id", b"rid")],
+    }
+
+
+async def _never_received():
+    raise AssertionError("a refusal never reads the body (B3)")
+
+
+def _refusal_proxy(gate: Gate) -> Proxy:
+    settings = make_settings("http://127.0.0.1:1", max_body_bytes=1024)
+    log, errors = RequestLog(settings.log_level, settings.id), ErrorFactory(settings.id)
+    return Proxy(settings, gate, _Client(_ok), log, errors)
+
+
+def _proxy_refusal(gate: Gate, length: int = 2):
+    """A refusal sent by the proxy, before any slot is held."""
+    proxy = _refusal_proxy(gate)
+    route = classify("POST", b"/api/chat")
+    scope = _refusal_scope("POST", b"/api/chat", length)
+    return lambda send: proxy(scope, _never_received, send, route, "rid")
+
+
+def _too_large():
+    return _proxy_refusal(ready_gate()[0], length=2048), "rejected", 413
+
+
+def _busy():
+    gate, _ = ready_gate()
+    assert isinstance(gate.try_acquire("/api/chat", "first"), proxy_module.Lease)  # held
+    return _proxy_refusal(gate), "busy", 429
+
+
+def _starting():
+    gate = Gate(1, 15, 10, 1800, clock=FakeClock(), wall=lambda: 1.7e9)  # in its quarantine
+    return _proxy_refusal(gate), "starting", 503
+
+
+def _dispatcher_reply(version: str, raw_path: bytes, status_: int):
+    def make():
+        app = create_app(make_settings("http://127.0.0.1:1"), gate=ready_gate()[0])
+        scope = _refusal_scope("GET", raw_path, version=version)
+        return lambda send: app(scope, _never_received, send), "rejected", status_
+
+    return make
+
+
+def _health_ok():
+    version = httpx.Response(200, json={"version": "0.40.16"})
+    settings = make_settings("http://127.0.0.1:1", log_level="DEBUG")  # health logs at DEBUG
+    app = create_app(settings, gate=ready_gate()[0])
+    # Ollama answers the probe (the lifespan, not run here, would build this client)
+    mock = httpx.MockTransport(lambda _request: version)
+    app.health_client = httpx.AsyncClient(transport=mock, base_url="http://myhost:11434")
+    scope = _refusal_scope("GET", b"/seriatim/health", length=0)
+    return lambda send: app(scope, _never_received, send), "ok", 200
+
+
+SEND_FAILS = {
+    "413-before-admission": _too_large,
+    "429-busy": _busy,
+    "503-starting": _starting,
+    "dispatcher-505": _dispatcher_reply("1.0", b"/api/tags", 505),
+    "dispatcher-404": _dispatcher_reply("1.1", b"/seriatim/nope", 404),
+    "health": _health_ok,
+}
+
+
+def _send_failing_on(kind: str | None):
+    """A `send` that raises at the first message of `kind` (`start` or `body`), as a client
+    gone mid-reply makes uvicorn's send raise; with `kind` None, every write succeeds."""
+    sent: list[dict] = []
+
+    async def send(message):
+        if message["type"] == f"http.response.{kind}":
+            raise OSError("the client is gone")
+        sent.append(message)
+
+    return sent, send
+
+
+@pytest.mark.td("L2")
+@pytest.mark.parametrize("fail_on", ["start", "body", None])
+@pytest.mark.parametrize("path", list(SEND_FAILS))
+def test_l2_a_refusal_whose_write_fails_still_logs_one_line(path, fail_on, capsys):
+    """413 before admission, 429, 503 NODE_STARTING, a dispatcher refusal and health: the
+    line is written whatever `send()` does, and `bytes_out` counts only the body bytes whose
+    `send()` returned (TD Appendix A), so a failed write of the body counts 0."""
+    call, outcome, status_ = SEND_FAILS[path]()
+    capsys.readouterr()
+    sent, send = _send_failing_on(fail_on)
+    anyio.run(call, send)  # a failed write is noted on the line; it never escapes the app
+    (line,) = _log_lines(capsys.readouterr().out)
+    assert (line["request_id"], line["outcome"], line["status"]) == ("rid", outcome, status_)
+    assert (line["slot_end"], line["bytes_in"]) == ("none", 0)
+    if fail_on is None:
+        assert "client_write_failed" not in line and "client_write_failed_reason" not in line
+        assert line["bytes_out"] == len(sent[1]["body"]) > 0
+    else:
+        assert (line["client_write_failed"], line["client_write_failed_reason"]) == (
+            True,
+            "OSError",
+        )
+        assert line["bytes_out"] == 0
+        assert len(sent) == (0 if fail_on == "start" else 1)
+    assert list(line)[-8:] == [*APPENDIX_A_TAIL, "node"]
+
+
+def test_a_health_check_that_breaks_still_logs_its_line_and_raises(monkeypatch, capsys):
+    """Only a failed write is swallowed: an error in the handler itself still reaches the
+    server, after its one line (outcome `internal_error`, at ERROR, no status of its own)."""
+
+    async def broken(self):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(_Dispatcher, "_probe", broken)
+    app = create_app(make_settings("http://127.0.0.1:1"), gate=ready_gate()[0])
+    capsys.readouterr()
+    sent, send = _send_failing_on(None)
+    scope = _refusal_scope("GET", b"/seriatim/health", length=0)
+    with pytest.raises(RuntimeError, match="bug"):
+        anyio.run(app, scope, _never_received, send)
+    assert sent[0]["status"] == 500  # Starlette's own answer
+    (line,) = _log_lines(capsys.readouterr().out)
+    assert (line["level"], line["outcome"], line["status"]) == ("ERROR", "internal_error", None)
+    assert line["bytes_out"] == len(sent[1]["body"])
+    assert "client_write_failed" not in line
+
+
 # --- S1-13: K-OAS2, the hook itself -------------------------------------------------------
 
 
@@ -4316,9 +4457,14 @@ def _captured(capsys, prefix: str, n: int) -> tuple[list[dict], str]:
     return mine(), "".join(text)
 
 
+def _secret_headers(rid: str) -> dict[str, str]:
+    return {"authorization": f"Bearer {AUTH_MARK}", "x-api-key": KEY_MARK, "x-request-id": rid}
+
+
 def _secret_chat(car, rid: str) -> httpx.Response:
-    headers = {"authorization": f"Bearer {AUTH_MARK}", "x-api-key": KEY_MARK, "x-request-id": rid}
-    return httpx.post(car.url + "/api/chat", content=SECRET_BODY, headers=headers, timeout=WAIT_S)
+    return httpx.post(
+        car.url + "/api/chat", content=SECRET_BODY, headers=_secret_headers(rid), timeout=WAIT_S
+    )
 
 
 def _l1_h1(fake_ollama, sidecar):
@@ -4335,7 +4481,7 @@ def _l1_b1(fake_ollama, sidecar):
     car = sidecar(fake_ollama.url, gate=ready_gate()[0])
     held = _in_background(_secret_chat, car, "l1-1")
     hold.wait_entered()
-    busy = _secret_chat(car, "l1-2")
+    busy = refused_post(car.url + "/api/chat", headers=_secret_headers("l1-2"))
     assert busy.status_code == 429
     hold.release()
     first = held.result(WAIT_S)
