@@ -597,10 +597,39 @@ far.
       early answer.
   - `bytes_out` is the response body bytes whose `send()` returned, counted by a wrapped
     `send`: Ollama's relayed bytes, Seriatim's error body, or Ollama's bytes plus an in-stream
-    record. Headers don't count, and a write that failed adds nothing.
+    record. Headers don't count, and a write that failed adds nothing. The same holds on every
+    path (#91 review): the proxy wraps its `send` (`_counted`), and the dispatcher's replies
+    and health use `SentBytes`. Health's line is written by `_health_route` once Starlette
+    has sent the response, not by the handler; `_health` leaves its status in the scope.
+- **L2 when the write fails** (#91 review). The refusals sent before any slot is held (the
+  413 before admission, 429, 503 `NODE_STARTING`; `Proxy._refuse`), the dispatcher's
+  replies and health write their line in a `finally`. A write that raises is noted on that
+  line (`client_write_failed`, `client_write_failed_reason`), as at the end of an exchange
+  (S1-10), and isn't re-raised: the client is gone, and nothing is left to tell it. In
+  health, only a failed write is swallowed. Any other error in the handler still reaches
+  uvicorn after the line, which says `internal_error`, at `ERROR`, with `status: null`.
+  `test_l2_a_refusal_whose_write_fails_…` drives each of these paths three ways: `send`
+  raises at the start, raises at the body, or succeeds.
+- **A refusal test sends no body** (#91 review). On the first Windows run of #91,
+  `test_f4_an_unproven_close_marks_the_slot_stuck[hang]` failed on its 429 with
+  `httpx.ReadError: [WinError 10053]`. The cause:
+  1. httpx writes a request's body after its headers, so the 2-byte body can reach the
+     socket after uvicorn's last read.
+  2. The 429 carries `Connection: close` and the body is never read (S1-8, B3). uvicorn
+     closes with those bytes unread, and the OS answers that close with a reset.
+  3. Windows drops the received but unread response when the reset arrives. Linux still
+     delivers it first, so the race shows only on Windows.
+
+  A test that needs only the refusal now sends it with no body (`refused_post` in
+  `harness.py`), so no close follows. That covers F4, B1, B4, L1, and the drain tests in
+  `test_http.py` and `test_streaming.py`. The close itself is tested with raw sockets, which
+  write the whole request at once. A real client on Windows that sends a body to a busy node
+  can hit the same race. Avoiding it needs a lingering close (RFC 9112 §9.6), which uvicorn
+  doesn't do, so it is left for a later slice.
 - **Files.** The §9 row names `app.py` and `test_http.py`. The proxy writes its own lines, so
   `proxy.py` changes too. The K-OAS2 hook of §7 lives in `conftest.py`, with its check in
-  `harness.py`. `test_config.py`'s C8 follows `main()`'s new argument.
+  `harness.py`. `test_config.py`'s C8 follows `main()`'s new argument. `test_streaming.py`
+  sends its refusals with `refused_post`.
 - **L3 and the libraries' own loggers** (asked on #64, question 2, option B):
   - httpx logs every request's URL, query included, at `INFO`;
   - httpcore's `DEBUG` traces carry Ollama's response headers, `Set-Cookie` among them;
@@ -1452,7 +1481,7 @@ cancellation and closing, and blob streaming.
 | S1-10 | Cancellation, the close proof and the ungated pool | `proxy.py` (cancellation and close edge cases, `PoolTimeout`, ungated timeouts), `test_streaming.py`, `test_http.py` | S11–S16, F2, F4, E16, H14, H26, H27 | 6 |
 | S1-11 | Blob uploads | `proxy.py` (`body_stream`), `test_http.py` | H10, E6, E12–E14 | 6 |
 | S1-12 | Process and singleton | `app.py` (`main`, `acquire_singleton`), `test_config.py`, `test_process.py` | C8, R1–R9 | 6 |
-| S1-13 | Request log, Seriatim's headers on every response, health under load | `app.py` (the log fields on every path), `test_http.py`; also `proxy.py`, `conftest.py` and `harness.py` (the K-OAS2 hook) and `test_config.py` (C8) | L1–L3, K-OAS2, H19, HL8 | 8, 9, 10, 11 |
+| S1-13 | Request log, Seriatim's headers on every response, health under load | `app.py` (the log fields on every path), `test_http.py`; also `proxy.py`, `conftest.py` and `harness.py` (the K-OAS2 hook), `test_config.py` (C8) and `test_streaming.py` (`refused_post`) | L1–L3, K-OAS2, H19, HL8 | 8, 9, 10, 11 |
 | S1-14 | The PPE sidecar and enforcement | `ppe/compose.yaml` (`node-a`), `tests/behaviour/test_sidecar.py`; `Enforced: yes` | P1–P7 | 1–13 (all) |
 
 "needs" lists the PRs that must merge first; dependencies through them count too (S1-6
