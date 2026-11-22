@@ -1,13 +1,18 @@
-# The PPE: one Ollama node with real CPU-only micro-models (SPEC §8.3; TD-slice-1 App. B, S0b).
+# The PPE: one Ollama node with real CPU-only micro-models and the sidecar in front of it
+# (SPEC §8.3; TD-slice-1 §6, §8.6 and App. B, S0b).
 # Start it only through `ppe/ppe up`, which checks this file's effective configuration first.
 #
 # Images are pinned by digest (multi-arch index); Dependabot's docker-compose ecosystem proposes
 # digest bumps (.github/dependabot.yml, SPEC §7.9).
 #   ollama/ollama:0.40.16  https://hub.docker.com/r/ollama/ollama
 #   nicolaka/netshoot:v0.16 https://github.com/nicolaka/netshoot (ships tcpdump and socat)
+#   python:3.12.16-slim-trixie https://hub.docker.com/_/python (runs the sidecar, node-a)
 #
-# Limits: ollama-a 3 CPUs / 5 GiB, cap-a 0.5 / 512 MiB, dbg-a 0.25 / 128 MiB.
-# Sum: 3.75 CPUs, 5.625 GiB (the guard refuses more than 4 CPUs or 6 GiB).
+# Ports on the host, all on 127.0.0.1: 11434 is plain Ollama (the debug helper, dbg-a), 11436
+# is the sidecar (node-a). Inside ollama-a's namespace Ollama itself is on 127.0.0.1:11435.
+#
+# Limits: ollama-a 3 CPUs / 5 GiB, cap-a 0.25 / 256 MiB, dbg-a 0.25 / 128 MiB,
+# node-a 0.5 / 384 MiB. Sum: 4 CPUs, 5.75 GiB (the guard refuses more than 4 CPUs or 6 GiB).
 name: seriatim-ppe
 
 services:
@@ -23,10 +28,12 @@ services:
       - type: bind
         source: ./data/ollama
         target: /root/.ollama
-    # The debug helper (dbg-a) shares this namespace; its port is published here, on
-    # loopback only, for direct comparison with plain Ollama.
+    # The debug helper (dbg-a) and the sidecar (node-a) share this namespace, so their ports
+    # are published here, on the host's loopback only: 11434 for direct comparison with plain
+    # Ollama, 11436 for the sidecar.
     ports:
       - "127.0.0.1:11434:11434"
+      - "127.0.0.1:11436:11436"
     deploy:
       resources:
         limits:
@@ -47,8 +54,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
-          memory: 512M
+          cpus: "0.25"
+          memory: 256M
 
   # Loopback debug port: forwards 0.0.0.0:11434 in ollama-a's namespace to Ollama on
   # 127.0.0.1:11435. Published only on the host's 127.0.0.1 (see ollama-a's ports).
@@ -62,3 +69,38 @@ services:
         limits:
           cpus: "0.25"
           memory: 128M
+
+  # The sidecar (TD-slice-1 §6, S1-14), in ollama-a's network namespace, as on a node: it
+  # forwards to Ollama on 127.0.0.1:11435. It runs from ppe/data/node, which the ppe job fills
+  # before `ppe/ppe up` (the package and its hash-pinned dependencies from uv.lock; ci.yml,
+  # "Stage the sidecar"), mounted read-only. No image is built, so the guard's allowlist
+  # needs no `build` key. drain_s is 10, so P7's NODE_STARTING window is wide.
+  node-a:
+    image: python:3.12.16-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+    network_mode: "service:ollama-a"
+    cap_drop: [ALL]
+    command: ["python", "-m", "seriatim_node"]
+    environment:
+      PYTHONPATH: /opt/seriatim
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      # Not loopback inside the namespace, so test mode is needed (S1 to S3 have no auth).
+      SERIATIM_NODE_LISTEN_HOST: 0.0.0.0
+      SERIATIM_NODE_LISTEN_PORT: "11436"
+      SERIATIM_NODE_ALLOW_UNAUTHENTICATED: "true"
+      SERIATIM_NODE_OLLAMA_URL: http://127.0.0.1:11435
+      SERIATIM_NODE_ID: node-a
+      SERIATIM_NODE_DRAIN_S: "10"
+      SERIATIM_NODE_LOCK_DIR: /run/seriatim
+    volumes:
+      - type: bind
+        source: ./data/node
+        target: /opt/seriatim
+        read_only: true
+      - type: tmpfs
+        target: /run/seriatim
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M

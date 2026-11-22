@@ -72,7 +72,8 @@ jobs:
           retention-days: 7
 
   # The PPE (SPEC §8.3; #9): CPU-only micro-models in Docker Compose, started through the guard.
-  # S0b checks that Ollama answers and the models are real; S1 adds P1-P7 to tests/behaviour.
+  # S0b checks that Ollama answers and the models are real; S1-14 adds the sidecar (node-a) and
+  # P1-P7 (tests/behaviour/test_sidecar.py).
   ppe:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -94,11 +95,27 @@ jobs:
         with:
           path: ppe/data/ollama/models
           key: ppe-models-ollama-0.40.16-qwen2.5-0.5b-1.5b-all-minilm-22m-v1
+      # node-a runs the sidecar from ppe/data/node (gitignored), mounted read-only: this
+      # checkout's package and its runtime dependencies, installed only from uv.lock's hashes,
+      # as wheels for the container's Python (ppe/compose.yaml). No image is built.
+      - name: Stage the sidecar for node-a
+        run: |
+          set -euo pipefail
+          stage=ppe/data/node
+          mkdir -p ppe/data
+          rm -rf "$stage"
+          uv export --frozen --package seriatim-node --no-dev --no-emit-workspace --no-header \
+            -o "$RUNNER_TEMP/node-requirements.txt"
+          uv pip install --target "$stage" --python-version 3.12 \
+            --python-platform x86_64-manylinux_2_28 --only-binary :all: --require-hashes \
+            --no-deps -r "$RUNNER_TEMP/node-requirements.txt"
+          cp -R node/seriatim_node "$stage/"
       - name: Start the PPE through the guard
         run: ppe/ppe up --ci
-      - name: S0b checks (tests/behaviour)
+      - name: S0b checks and P1-P7 (tests/behaviour)
         env:
           SERIATIM_PPE_URL: http://127.0.0.1:11434
+          SERIATIM_BASE_URL: http://127.0.0.1:11436
           SERIATIM_PPE_CAPTURE_OUT: ${{ runner.temp }}/ollama-0.40.16.json
         run: >-
           uv run --frozen pytest -m behaviour tests/behaviour -rA
@@ -118,6 +135,7 @@ jobs:
         run: |
           docker compose -p seriatim-ppe -f ppe/compose.yaml ps
           docker compose -p seriatim-ppe -f ppe/compose.yaml logs --no-color --tail 50 ollama-a
+          docker compose -p seriatim-ppe -f ppe/compose.yaml logs --no-color --tail 100 node-a
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:

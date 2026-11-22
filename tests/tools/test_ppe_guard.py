@@ -676,7 +676,7 @@ def test_the_committed_compose_file_passes_the_guard():
         pytest.skip(f"docker compose is unavailable: {r.stderr.strip()[:200]}")
     config = g.resolve_binds(json.loads(r.stdout))
     assert g.refusals(config, ROOT / "ppe") == []
-    assert set(config["services"]) == {"ollama-a", "cap-a", "dbg-a"}
+    assert set(config["services"]) == {"ollama-a", "cap-a", "dbg-a", "node-a"}
     env = config["services"]["ollama-a"]["environment"]
     assert env == {
         "OLLAMA_HOST": "127.0.0.1:11435",
@@ -684,3 +684,23 @@ def test_the_committed_compose_file_passes_the_guard():
         "OLLAMA_CONTEXT_LENGTH": "2048",
     }
     assert "tcp dst port 11435" in config["services"]["cap-a"]["command"]
+    # The sidecar (TD-slice-1 §6, S1-14): in Ollama's namespace, with no capability, test
+    # mode, its lock directory on a tmpfs, its code mounted read-only from ppe/data/node.
+    node = config["services"]["node-a"]
+    assert node["network_mode"] == "service:ollama-a"
+    assert node["cap_drop"] == ["ALL"] and not node.get("cap_add")
+    node_env = node["environment"]
+    assert node_env["SERIATIM_NODE_LISTEN_HOST"] == "0.0.0.0"
+    assert node_env["SERIATIM_NODE_ALLOW_UNAUTHENTICATED"] == "true"
+    assert node_env["SERIATIM_NODE_OLLAMA_URL"] == "http://127.0.0.1:11435"
+    assert node_env["SERIATIM_NODE_LOCK_DIR"] == "/run/seriatim"
+    assert node_env["SERIATIM_NODE_DRAIN_S"] == "10"
+    mounts = {m["target"]: m for m in node["volumes"]}
+    assert mounts["/run/seriatim"]["type"] == "tmpfs"
+    assert mounts["/opt/seriatim"]["read_only"] is True
+    assert mounts["/opt/seriatim"]["source"] == os.path.realpath(ROOT / "ppe/data/node")
+    published = {
+        (p["host_ip"], int(p["published"]), p["target"])
+        for p in config["services"]["ollama-a"]["ports"]
+    }
+    assert published == {("127.0.0.1", 11434, 11434), ("127.0.0.1", 11436, 11436)}
