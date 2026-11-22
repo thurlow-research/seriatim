@@ -38,6 +38,7 @@ from harness import (
     make_settings,
     raw_connect,
     ready_gate,
+    refused_post,
     replay,
     reset_after,
     sequence,
@@ -138,7 +139,7 @@ def test_s4_client_closes_mid_stream(fake_ollama, sidecar, capsys):
     assert hold.wait_disconnected() - closed_at < DISCONNECT_BOUND_S
     wait_for(lambda: _slot_states(gate) == ["draining"])
     (view,) = gate.slots()
-    busy = httpx.post(car.url + "/api/chat", content=b"{}", timeout=WAIT_S)
+    busy = refused_post(car.url + "/api/chat")
     assert busy.status_code == 429
     assert int(busy.headers["retry-after"]) >= view.drain_remaining_s
     clock.advance(10)
@@ -1244,7 +1245,7 @@ def test_f4_an_unproven_close_marks_the_slot_stuck(how, fake_ollama, sidecar, mo
         assert F4_CLOSE_S <= stuck_after < F4_CLOSE_S + TIMING_BOUND_S
     else:
         assert stuck_after < TIMING_BOUND_S
-    busy = httpx.post(car.url + "/api/chat", content=b"{}", timeout=WAIT_S)
+    busy = refused_post(car.url + "/api/chat")
     assert busy.status_code == 429  # never two at once: a stuck slot is never admitted again
     assert len(fake_ollama.requests) == 1
     health = httpx.get(car.url + "/seriatim/health", timeout=WAIT_S)

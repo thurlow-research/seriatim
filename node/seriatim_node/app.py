@@ -4,7 +4,8 @@ S1-1 adds the error table: `ErrorCode`, `ERROR_TABLE` and `ErrorFactory`. `contr
 is the source of truth, and K-OAS3 checks that this table equals its `x-seriatim-codes`.
 S1-5 adds `RequestLog`, `create_app` (the dispatcher and `/seriatim/health`) and the health
 client. S1-6 hands every other route to the proxy (`proxy.py`). S1-12 adds the singleton
-lock (`acquire_singleton`) and `main()`.
+lock (`acquire_singleton`) and `main()`. S1-13 completes the log line (TD Appendix A): each
+line has `wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import contextlib
 import errno
 import http.cookiejar
 import json
+import logging
 import os
 import re
 import sys
@@ -298,6 +300,10 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 _REQUEST_ID_RE = re.compile(rb"[A-Za-z0-9._-]{1,128}")  # used with fullmatch
 _RID_KEY = "seriatim.request_id"  # where the dispatcher leaves the request id in the scope
+_HEALTH_KEY = "seriatim.health_status"  # where `_health` leaves its status for the log line
+_HEALTH_OUTCOMES: Mapping[int | None, str] = MappingProxyType({200: "ok", 503: "degraded"})
+# The log line's gate timing for a request no gate was asked about (TD Appendix A).
+_NO_GATE: Mapping[str, None] = MappingProxyType({"wait_ms": None, "hold_ms": None})
 
 
 def request_id_from(headers: list[tuple[bytes, bytes]]) -> str:
@@ -307,6 +313,32 @@ def request_id_from(headers: list[tuple[bytes, bytes]]) -> str:
     if len(values) == 1 and _REQUEST_ID_RE.fullmatch(values[0]):
         return values[0].decode()
     return uuid.uuid4().hex
+
+
+class SentBytes:
+    """A `send` that counts the body bytes of each message once `send()` has returned, so a
+    write that failed adds nothing (the log's `bytes_out`, TD Appendix A). `failed` names the
+    exception a write raised, so the caller can tell the client going from its own error."""
+
+    def __init__(self, send: Send) -> None:
+        self._send = send
+        self.count = 0
+        self.failed: str | None = None
+
+    async def __call__(self, message: MutableMapping[str, Any]) -> None:
+        try:
+            await self._send(message)
+        except Exception as exc:
+            self.failed = type(exc).__name__
+            raise
+        self.count += len(message.get("body", b""))
+
+
+def note_write_failed(fields: dict[str, object], reason: str) -> None:
+    """A failed write to the client goes on the request's own line, never a line of its own
+    (L2 wins over §3.3's "log DEBUG" wording; ruled on #60)."""
+    fields["client_write_failed"] = True
+    fields["client_write_failed_reason"] = reason
 
 
 async def _send_response(
@@ -367,20 +399,64 @@ class _Dispatcher:
         extra_headers: list[tuple[bytes, bytes]] | None = None,
         **log_fields: object,
     ) -> None:
-        """Send an ungated error response and log it (`slot_end` is `none`: no slot)."""
+        """Send an ungated error response and log it (`slot_end` is `none`: no slot). The
+        dispatcher never reads the body, and no gate was asked. The line is written whatever
+        the write does, with the body bytes actually sent (L2)."""
         status, headers, body = self.errors.response(
             code, message, gate_value="ungated", request_id=request_id
         )
-        await _send_response(send, status, headers + (extra_headers or []), body)
-        self.log.emit(
-            level=log_level,
-            request_id=request_id,
-            method=method,
-            **log_fields,
-            outcome=outcome,
-            status=status,
-            slot_end="none",
-        )
+        sent = SentBytes(send)
+        try:
+            await _send_response(sent, status, headers + (extra_headers or []), body)
+        except Exception as exc:  # only a write can raise: the client is gone (S1-10)
+            note_write_failed(log_fields, type(exc).__name__)
+        finally:
+            self.log.emit(
+                level=log_level,
+                request_id=request_id,
+                method=method,
+                **log_fields,
+                outcome=outcome,
+                status=status,
+                slot_end="none",
+                **_NO_GATE,
+                bytes_in=0,
+                bytes_out=sent.count,
+            )
+
+    async def _health_route(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """`GET /seriatim/health` through Starlette, then its one line, at `DEBUG`, once the
+        response has been sent (or its write has failed): `_health` leaves the status in
+        the scope, and `bytes_out` counts what `send()` took. Only a failed write is
+        swallowed; any other error still propagates, after the line."""
+        sent = SentBytes(send)
+        fields: dict[str, object] = {}
+        try:
+            await self._router(scope, receive, sent)
+        except Exception:
+            if sent.failed is None:
+                raise
+            note_write_failed(fields, sent.failed)  # the client is gone (S1-10)
+        finally:
+            status = scope.get(_HEALTH_KEY)  # None if `_health` itself failed
+            result = _HEALTH_OUTCOMES.get(status, "internal_error")
+            self.log.emit(
+                # a load balancer polls this, so DEBUG (REQ-22; HL9), unless it broke
+                level="ERROR" if result == "internal_error" else "DEBUG",
+                request_id=scope[_RID_KEY],
+                method="GET",
+                path="/seriatim/health",
+                kind="seriatim",
+                scope="none",
+                known=True,
+                **fields,
+                outcome=result,
+                status=status,
+                slot_end="none",
+                **_NO_GATE,
+                bytes_in=0,
+                bytes_out=sent.count,
+            )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":  # lifespan (and anything else) goes to Starlette
@@ -455,7 +531,7 @@ class _Dispatcher:
             )
         else:
             scope[_RID_KEY] = rid
-            await self._router(scope, receive, send)
+            await self._health_route(scope, receive, send)
 
     async def _probe(self) -> str | None:
         """None if Ollama answers well; otherwise the health reason (TD §3.4)."""
@@ -498,18 +574,7 @@ class _Dispatcher:
         if reasons:
             doc = {"status": "degraded", "reasons": reasons}
             status = 503
-        self.log.emit(
-            level="DEBUG",  # a load balancer polls this (REQ-22; HL9)
-            request_id=rid,
-            method="GET",
-            path="/seriatim/health",
-            kind="seriatim",
-            scope="none",
-            known=True,
-            outcome="ok" if status == 200 else "degraded",
-            status=status,
-            slot_end="none",
-        )
+        request.scope[_HEALTH_KEY] = status  # logged by `_health_route`, after the send
         return Response(
             json.dumps(doc, separators=(",", ":")).encode(),
             status_code=status,
@@ -526,8 +591,19 @@ def create_app(
     settings: Settings, *, client: httpx.AsyncClient | None = None, gate: Gate | None = None
 ) -> ASGIApp:
     """The sidecar's ASGI app (TD §2.4). Tests may inject the shared ungated `client` and the
-    `gate`; otherwise the lifespan creates them (a new gate starts in its startup quarantine)."""
+    `gate`; otherwise the lifespan creates them (a new gate starts in its startup quarantine).
+
+    It also quiets the HTTP client's own loggers (L3): httpx logs each request's URL, query
+    included, at INFO, and httpcore's DEBUG traces carry Ollama's response headers. Nothing
+    configures `logging` in the sidecar, so neither is written as shipped; this keeps it so
+    if a handler is ever added."""
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
     return _Dispatcher(settings, gate, client)
+
+
+# Libraries whose own log records can carry a secret (a query string, a `Set-Cookie`).
+_QUIET_LOGGERS = ("httpx", "httpcore")
 
 
 class SingletonError(Exception):
@@ -614,6 +690,7 @@ def main() -> int:
         workers=1,  # REQ-21: the gate is in-process state
         lifespan="on",
         log_config=None,
+        access_log=False,  # its line has the query string; the request log never does (L3)
         server_header=False,
         date_header=True,
     )
