@@ -16,7 +16,7 @@ delivered, as §9 lists them.)
 **Implements:** SPEC REQ-1 to REQ-7, REQ-10 to REQ-12b, REQ-15 (pre-auth form), REQ-18
 (S1 form), REQ-20 to REQ-26. **Architecture:** ADR-001 D1 to D4, D7, D8, D10 to D12.
 **Not in this slice:**
-- auth (S2);
+- auth (S2, [TD-slice-2](TD-slice-2.md));
 - the `num_ctx` policy (S3);
 - `/seriatim/status` and the exposure check (S4a), the capacity report (S4b), the durable admin switch (S4c) and node metrics (S4d);
 - deploy (S5, S6), releases (SPEC §7.6), the release follower (§7.7) and the interim deployment (§7.8);

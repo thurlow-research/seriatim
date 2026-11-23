@@ -5,6 +5,7 @@
 **Companion documents:**
 - [ADR-001](adr/ADR-001-architecture.md): architecture, contract, threat model, slice plan.
 - [TD-slice-1](design/TD-slice-1.md): the first code slice only.
+- [TD-slice-2](design/TD-slice-2.md): slice S2, sidecar authentication.
 - [EVALUATION](EVALUATION.md): the comparison that led here.
 
 Seriatim is a one-at-a-time GPU gate for [Ollama](https://ollama.com). It has two parts:
@@ -15,8 +16,8 @@ Seriatim is a one-at-a-time GPU gate for [Ollama](https://ollama.com). It has tw
   operator has made eligible for that model, and combines the read-only Ollama views across machines.
 
 The words MUST, MUST NOT, SHOULD and MAY follow RFC 2119. Each requirement has an ID (`REQ-n`)
-and the tests that prove it. The test IDs for slice 1 are defined in TD-slice-1 §8; the tests
-for later slices are named in ADR-001 §10.
+and the tests that prove it. The test IDs for slices 1 and 2 are defined in TD-slice-1 §8 and
+TD-slice-2 §8; the tests for later slices are named in ADR-001 §10.
 
 ---
 
@@ -205,8 +206,11 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     next one.
   - Only the headers listed in ADR-001 §5.3 are changed. Those are hop-by-hop headers, `Host`,
     credentials, `Accept-Encoding`, CORS headers and Seriatim's reserved headers.
+  - No `Access-Control-*` header appears on any sidecar response: not on Seriatim's own
+    responses (errors, refusals, health), and not on Ollama's, from which every such header is
+    removed. Seriatim serves no CORS (ruling S2-R7).
 
-  *Tests:* H1–H5, S1–S3, P1, P3, P5.
+  *Tests:* H1–H5, S1–S3, P1, P3, P5; TD-slice-2 §8: A14.
 - **REQ-7. Options unchanged.** Seriatim MUST NOT re-serialise a body, add or remove a field, or
   change any option. It MUST never lower `num_ctx`. A body is read only to apply REQ-8 and
   REQ-9 on the sidecar, and on the gateway to read `model` for routing (REQ-32).
@@ -306,8 +310,15 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
 
 - **REQ-13. Bearer keys.**
   - Every endpoint except `GET /seriatim/health` MUST require `Authorization: Bearer <key>`.
-  - Keys MUST NOT be accepted in query strings, cookies or any other header. `X-API-Key` is
-    not accepted; no existing client uses it (ruling Q7).
+  - **Health reads no credentials.** `GET /seriatim/health` never reads `Authorization`, so
+    a missing, wrong or ambiguous one never changes its answer (ruling S2-R5).
+  - **Credentials come from headers only.** A key is read only from the `Authorization`
+    header, never from the query string, cookies or any other header. `X-API-Key` is not
+    accepted; no existing client uses it (ruling Q7).
+  - **Residual risk: keys in URLs.** A client that puts a key in the query string leaks it to
+    whatever logs URLs: proxies, browser history, and Ollama itself, which receives the query
+    string unchanged (REQ-6). The sidecar does not accept it as a credential and never logs
+    query values (REQ-22) (ruling S2-R6).
   - **Ambiguous credentials** get 400 `AUTH_AMBIGUOUS`: more than one `Authorization` header,
     a scheme other than Bearer, or a Bearer value with embedded whitespace.
   - The sidecar MUST compare the request key's SHA-256 against **every** configured hash with
@@ -316,23 +327,28 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     `WWW-Authenticate: Bearer` and `retryable: false`.
   - Credentials MUST NOT be forwarded to Ollama or logged.
 
-  *Tests:* slice S2 (A1–A12).
+  *Tests:* TD-slice-2 §8: A1, A2, A6, A8–A11, A13.
 - **REQ-14. Scopes (ruling Q5).**
   - A key has the scope `infer` or `admin`. The admin key is a separate key; an `admin` key
     may also use `infer` routes.
   - The scope each route needs comes from REQ-5, so unknown endpoints need `admin`.
   - A key without the scope a route needs gets 403 `FORBIDDEN_SCOPE`.
 
-  *Tests:* slice S2.
+  *Tests:* TD-slice-2 §8: A2, A7.
 - **REQ-15. Fail closed on missing keys.**
   - With no keys configured, the sidecar MUST refuse to start, unless
-    `SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` is set. That setting exists for the PPE; it logs
-    a `WARNING` at startup and, from S2, every hour.
+    `SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` is set. That setting exists for the PPE and
+    tests; it logs a `WARNING` at startup and, from S2, every hour, whether or not keys are
+    configured (ruling S2-R1).
+  - When keys are configured, `ALLOW_UNAUTHENTICATED=true` MUST NOT disable authentication
+    (ruling S2-R1).
   - The sidecar MUST refuse a non-loopback listen address unless authentication is configured
-    and the exposure check (REQ-19) is active. In slices S1 to S3 that means loopback only,
-    except in the PPE.
+    and the exposure check (REQ-19) is active. `ALLOW_UNAUTHENTICATED=true` never relaxes
+    this: with it set, the sidecar listens on loopback only. The PPE reaches its sidecar
+    through container networking, from inside the node's network namespace (ruling S2-R2).
+    In slices S1 to S3 that means loopback only.
 
-  *Tests:* C5, slice S2.
+  *Tests:* C5; TD-slice-2 §8: A4, A12.
 
 ### 4.3 Sidecar: status, health, capacity, admin switch and exposure (slices S4a to S4c, as noted)
 
@@ -760,19 +776,24 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - One JSON line per request, with the fields given in TD-slice-1 Appendix A. Health
     requests (`/seriatim/health`) are logged at `DEBUG`, so at the default `INFO` level a
     load balancer's polling adds no lines (TD-slice-1 HL9).
-  - Never a request or response body, and never a credential.
+  - Never a request or response body, never a credential, and never query values: the `path`
+    field is the path without its query string, so a key put in a URL is not logged (REQ-13;
+    ruling S2-R6).
 
-  *Tests:* L1–L3, H18, HL9.
+  *Tests:* L1–L3, H18, HL9; TD-slice-2 §8: A11.
 - **REQ-23. Configuration.**
   - The sidecar reads only `SERIATIM_NODE_*` environment variables, plus an optional TOML file
     named by `SERIATIM_NODE_CONFIG`; environment variables take precedence. The gateway reads
     only `SERIATIM_GW_*`. Other `SERIATIM_*` variables are ignored, so developer tooling
     variables cannot collide.
+  - **Keys are configured in the file only.** The sidecar's keys (REQ-13) are `[[keys]]`
+    tables in the `SERIATIM_NODE_CONFIG` file. They have no environment form:
+    `SERIATIM_NODE_KEYS` in the environment MUST stop startup with exit code 2 (ruling S2-R4).
   - An unknown key under the process's own prefix, a value out of range, or a missing config
     file MUST stop startup with exit code 2 and a message that names the key.
   - Only `.env.example`, with placeholder values, is committed.
 
-  *Tests:* C1–C7, C9, C10.
+  *Tests:* C1–C7, C9, C10; TD-slice-2 §8: A3.
 - **REQ-24. Errors after the response headers.** If Ollama fails, or the hold limit passes,
   after the headers were sent:
   - **Error record.** The sidecar MAY send one final error record, but only when it can be
@@ -1658,6 +1679,8 @@ key that the gateway's allow list names, and the list is empty by default.
   - **Where the LAN is not trusted,** TLS between the gateway and the nodes is required.
 - **In the repository.**
   - gitleaks runs in the pre-commit hook and in CI (workflow `secret-scan`, check `gitleaks`).
+    From S2 its configuration adds a rule for the sidecar's key prefix, so a committed key is
+    caught (TD-slice-2 §7; ruling S2-R7).
   - A private list of terms that must never appear (host names and personal names) is kept as
     a CI secret and checked in CI (REQ-63). The check never runs code from a pull request,
     and never prints a matched term.
@@ -2642,6 +2665,23 @@ applied as follows:
 | 93-3 | One shared pull-and-verify implementation for `update-models` and the gateway | REQ-54, REQ-54a, REQ-71 |
 | 93-4 | Q1: A. The `POST` names the nodes and the models explicitly | REQ-71 (routes, precondition) |
 | 93-5 | Q2: A, one rollout at a time per gateway instance; and B, a cross-gateway lock using the sidecars' offline state, is required before more than one gateway is deployed | REQ-71 (one node at a time), ADR-001 D17, T22 |
+
+**Issue #35 (2026-11-23), slice S2.** The maintainer ruled on the questions of TD-slice-2 §10
+(https://github.com/thurlow-research/seriatim/issues/35#issuecomment-7109174985). They are
+applied as follows. A second ruling
+(https://github.com/thurlow-research/seriatim/issues/35#issuecomment-7109496940) settles the
+rest, as S2-R8, so every question in TD-slice-2 §10 is ruled:
+
+| # | ruling | where applied |
+|---|---|---|
+| S2-R1 | Q4: A. Configured keys are always enforced; the hourly `WARNING` fires whenever `ALLOW_UNAUTHENTICATED` is set, with or without keys | REQ-15; TD-slice-2 §2.2, §2.4, §6, A12 |
+| S2-R2 | REQ-15's PPE exception: A. `ALLOW_UNAUTHENTICATED` still forces a loopback listen address; the PPE reaches the sidecar through container networking | REQ-15; TD-slice-2 §2.2, §6, §9 (S2-2), A4 |
+| S2-R3 | Q6: unknown `/seriatim/*` paths and wrong methods need `admin`, as the contract's `x-seriatim-unknown-endpoint` says | TD-slice-2 §2.3, §4, A7, A8 |
+| S2-R4 | Q1: A. Keys are configured in the file only, with no environment form | REQ-23; TD-slice-2 §2.2, §6, A3 |
+| S2-R5 | Q7: A. Health reads no credentials | REQ-13, ADR-001 D6; TD-slice-2 §2.1, A8 |
+| S2-R6 | Query strings: a credential comes from headers only; the residual risk of a key in a URL is recorded; a test shows query values never reach the log | REQ-13, ADR-001 T3; TD-slice-2 A11 |
+| S2-R7 | T11 and T3: no `Access-Control-*` header on any sidecar response; T11's exceptions corrected; a gitleaks rule for the key prefix, added in S2 | REQ-6, ADR-001 T3, T11; TD-slice-2 §7, §9, A14 |
+| S2-R8 | Q2, Q3, Q5 and Q8 to Q16 take TD-slice-2's recommended answers. The PPE (the REQ-15 follow-up): A, the flag still forces loopback; `node-a` binds `127.0.0.1` and a `socat` forwarder publishes 11436, within the PPE guard's 4-CPU cap, and the `ppe/` change ships in S2. Gitleaks: a `.gitleaks.toml` that extends the default rules with the `seriatim_` key-prefix rule | REQ-15; TD-slice-2 §6, §7, §9 (S2-2, S2-4), §10 |
 
 ## 10. Open questions
 
