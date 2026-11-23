@@ -388,6 +388,18 @@ def sidecar_up() -> None:
     assert httpx.get(f"{BASE_URL}/seriatim/health").headers["x-seriatim-node"] == NODE_ID
 
 
+P5_ROUNDS = 20  # with two models loaded, each round matches with probability 1/2 or more
+
+
+def canonical(body: bytes) -> object:
+    """A JSON body with every list of models sorted by name: what is equal whatever the
+    order Ollama lists them in."""
+    doc = json.loads(body)
+    if isinstance(doc, dict) and isinstance(doc.get("models"), list):
+        doc = {**doc, "models": sorted(doc["models"], key=lambda m: m.get("name", ""))}
+    return doc
+
+
 @pytest.mark.td("P5")
 def test_p5_listings_through_the_sidecar_equal_plain_ollama():
     def comparable(raw: Raw) -> list[tuple[str, str]]:
@@ -395,15 +407,24 @@ def test_p5_listings_through_the_sidecar_equal_plain_ollama():
         return sorted((k.lower(), v) for k, v in raw.headers if k.lower() not in dropped)
 
     for path in ("/api/tags", "/api/ps", "/api/version"):
-        direct = raw_get(DIRECT_URL, path)
-        side = raw_get(BASE_URL, path)
-        assert direct.status == side.status == 200, path
-        assert side.body == direct.body, path
-        assert comparable(side) == comparable(direct), path
+        # Ollama lists the loaded models of /api/ps in no fixed order (a Go map), so two
+        # direct answers can differ in order alone. Each round asks Ollama, then the
+        # sidecar; the sidecar's bytes must equal Ollama's in some round, and every round
+        # must hold the same content.
+        for rounds in range(1, P5_ROUNDS + 1):  # noqa: B007 (reported below)
+            direct = raw_get(DIRECT_URL, path)
+            side = raw_get(BASE_URL, path)
+            assert direct.status == side.status == 200, path
+            assert comparable(side) == comparable(direct), path
+            assert canonical(side.body) == canonical(direct.body), path
+            if side.body == direct.body:
+                break
+        else:
+            pytest.fail(f"{path}: the sidecar's bytes never equalled Ollama's in {P5_ROUNDS}")
         mine = {k.lower(): v for k, v in side.headers if k.lower() in SERIATIM_HEADERS}
         assert mine["x-seriatim-gate"] == "ungated" and mine["x-seriatim-node"] == NODE_ID
         assert mine["x-request-id"]
-        print(f"P5 {path}: {len(side.body)} bytes, equal")
+        print(f"P5 {path}: {len(side.body)} bytes, equal (round {rounds})")
 
 
 @pytest.mark.td("P1")

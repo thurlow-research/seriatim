@@ -1510,6 +1510,12 @@ tests and `Enforced: yes`.
 - **P5** compares the status, the body bytes and the headers, without `Date` and Seriatim's
   three headers (case-insensitive, in any order). It also checks that those three headers
   are there.
+  - **Ollama's order.** Ollama lists the loaded models of `/api/ps` in no fixed order, so on
+    #92's third run two direct answers differed in order alone. Each round therefore asks
+    Ollama, then the sidecar. Every round must hold the same content, with the models
+    sorted by name, and in at least one of 20 rounds the sidecar's bytes must equal
+    Ollama's exactly. With two models loaded, each round matches with a probability of at
+    least 1/2.
 - **P6.** Each probe is timed to its first complete NDJSON record, not its first byte. The
   baseline is the median of three idle probes taken directly, after one probe that
   loads the model. The probe and the cancelled generation use the same model and context, so

@@ -30,9 +30,10 @@ def test_the_install_requires_hashes_wheels_only_and_no_resolution():
     for flag in ("--require-hashes", "--no-deps"):
         assert flag in install
     assert install[install.index("--only-binary") + 1] == ":all:"
-    assert install[install.index("--target") + 1] == "/stage"
+    assert install[install.index("--target") + 1] == str(Path("/stage"))
     assert install[install.index("--python-version") + 1] == "3.12"
-    assert install[install.index("-r") + 1] == export[export.index("-o") + 1] == "/r.txt"
+    requirements = str(Path("/r.txt"))
+    assert install[install.index("-r") + 1] == export[export.index("-o") + 1] == requirements
 
 
 def test_the_python_version_matches_node_a_s_image():
