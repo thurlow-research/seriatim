@@ -1,11 +1,10 @@
 # TD — Slice 2: sidecar authentication
 
-**Status:** revision 2, for review. **Date:** 2026-11-23. The design for ADR-001 §10's S2 row.
-Revision 1 listed sixteen questions in §10. Revision 2 applies the #95 review and the
-maintainer's rulings on #35 (issuecomment-7109174985), recorded as S2-R1 to S2-R7 in SPEC §9.
-Five questions are ruled; the other eleven stay open in §10, each with options and a
-recommendation that the design follows, so that it can be reviewed whole. It also maps the 15
-scenarios that #96 found missing (§8.2), and adds A13 and A14.
+**Status:** revision 3, for review. **Date:** 2026-11-23. The design for ADR-001 §10's S2 row.
+Revision 1 listed sixteen questions in §10. Revisions 2 and 3 apply two rounds of #95 review
+and the maintainer's rulings on #35 (issuecomment-7109174985 and issuecomment-7109496940),
+recorded as S2-R1 to S2-R8 in SPEC §9. Every question in §10 is now ruled. Revision 2 also
+mapped the 15 scenarios that #96 found missing (§8.2), and added A13 and A14.
 
 Enforced: no
 
@@ -45,7 +44,7 @@ Across the PR series of §9. No new dependency: everything is in the standard li
 
 | # | path | purpose |
 |---|---|---|
-| 1 | `node/seriatim_node/auth.py` (new) | `Principal`, `KeyEntry`, `Keyring`, `read_credentials()`, `allows()`, `authorise()`, `new_key()`, `keygen()` |
+| 1 | `node/seriatim_node/auth.py` (new) | `Principal`, `KeyEntry`, `Keyring`, `read_credentials()`, `allows()`, `authorise()` and `new_key()` (S2-1, so every later PR's tests can make keys); `keygen()` (S2-4) |
 | 2 | `node/seriatim_node/config.py` | the `keys` setting, its validation, and the REQ-15 refusal (load step 7) |
 | 3 | `node/seriatim_node/gate.py` | `classify()` gives `/seriatim/*` 404 and 405 the `admin` scope, the contract's `x-seriatim-unknown-endpoint` rule (§2.3, Q6) |
 | 4 | `node/seriatim_node/app.py` | the dispatcher's auth step, the 401/403/400 replies, the principal in the scope, the `client` log field, `main(argv)` with `keygen`, the hourly warning task |
@@ -58,7 +57,7 @@ Across the PR series of §9. No new dependency: everything is in the standard li
 | 11 | `tests/node/test_gate.py` | K1's `/seriatim/*` 404 and 405 rows carry `admin` (S2-R3) |
 | 12 | `.env.example` | says that keys are set in the TOML file, never in the environment (S2-R4) |
 | 13 | `.gitleaks.toml` (new) | the key-prefix rule (§7, S2-R7), extending gitleaks' default rules |
-| 14 | `ppe/compose.yaml` | `node-a` listens on loopback, behind a forwarder in its namespace (§6, S2-R2) |
+| 14 | `ppe/compose.yaml` | `node-a` listens on loopback, behind a new forwarder, `fwd-a`, in its namespace; `dbg-a`'s CPU limit drops to 0.15 to make room (§6, S2-R2, S2-R8) |
 | 15 | `docs/design/TD-slice-1.md` | the S1 rows whose tests or text S2 changes (C1, C5, C11, K1, L1, §2.1 step 5, §2.2's `/seriatim/*` scope note, §6's PPE lines; Appendix B) |
 | 16 | `docs/design/TD-slice-2.md` | the details fixed by the code, and `Enforced: yes` in S2-5 |
 
@@ -111,7 +110,7 @@ class Decision:
 def allows(have: Scope, need: Scope) -> bool
 def authorise(route: Route, headers: list[tuple[bytes, bytes]], keyring: Keyring | None) -> Decision
 
-def new_key() -> str                   # Q2
+def new_key() -> str                   # Q2; S2-1, used by every test that needs a key
 def keygen(argv: Sequence[str], out: TextIO) -> int
 ```
 
@@ -198,7 +197,7 @@ def keyring(settings: Settings) -> Keyring | None   # None in unauthenticated te
 ```
 
 `load_settings` keeps S1's six steps, adds to two of them, changes step 5 (below) and adds
-step 7:
+steps 7 and 8:
 - **Step 2 (unknown variables).** `SERIATIM_NODE_KEYS` in the environment →
   `ConfigError("SERIATIM_NODE_KEYS: keys are set in the SERIATIM_NODE_CONFIG file only")`
   (REQ-23; S2-R4). It is a field, so S1's rule alone would accept it.
@@ -218,6 +217,13 @@ step 7:
 
   `main()` already turns a `ConfigError` into exit code 2 with the message on stderr
   (REQ-23), so each of these refuses to start.
+- **Step 8 (the startup warning), moved from step 5.** S1's step 5 logs `ALLOW_WARNING` on
+  stderr whenever `allow_unauthenticated` is true. The message now depends on whether keys
+  are configured, and step 5 runs before step 7 has validated the keys, so the warning moves
+  to a new last step, after step 7: when `allow_unauthenticated` is true, `load_settings`
+  logs `ALLOW_WARNING` with no keys and `ALLOW_WITH_KEYS_WARNING` with keys (§2.4), then
+  returns. Settings that a later step refuses therefore log no warning, only their
+  `ConfigError`.
 
 `keyring(settings)` builds the `Keyring` from `settings.keys`, with each `sha256` as
 `bytes.fromhex(…)`. With no keys it returns `None`, which only happens in test mode, because
@@ -228,9 +234,8 @@ step 7 refused every other case. With keys it returns a `Keyring` whatever
 whatever `ALLOW_UNAUTHENTICATED` says, with or without keys, because REQ-15 needs both keys
 and the exposure check (S4a) and the flag never relaxes that. The message becomes
 `SERIATIM_NODE_LISTEN_HOST: '<host>' is not a loopback IP literal; a non-loopback address
-needs keys and the exposure check (S4a)`. The startup `WARNING` that step 5 logs when
-`allow_unauthenticated` is true is unchanged, and so are the flag's other test-mode
-relaxations (another lock directory, REQ-12b; from S4b the probe fixture, REQ-16). The PPE
+needs keys and the exposure check (S4a)`. Step 5 no longer logs the startup `WARNING`, which
+moves to step 8 (above). The flag's other test-mode relaxations are unchanged (another lock directory, REQ-12b; from S4b the probe fixture, REQ-16). The PPE
 therefore reaches its sidecar through container networking (§6).
 
 ### 2.3 `gate.py`
@@ -246,8 +251,8 @@ becomes the scope the request needs (REQ-5, "Their scopes are fixed by the contr
   403 `FORBIDDEN_SCOPE`: the answer it gets from `/seriatim/admin/*` once S4c serves those
   routes, and before. That includes `POST` and `HEAD` on `/seriatim/health`. S4a and S4c add
   their routes to `SERIATIM_ROUTES` with their contract scopes (`/seriatim/status`: `infer`;
-  `/seriatim/admin/*`: `admin`). Q6 asks the maintainer to confirm that the rule covers
-  `/seriatim/*`.
+  `/seriatim/admin/*`: `admin`). The maintainer confirmed that the rule covers `/seriatim/*`
+  (S2-R3).
 
 That keeps ADR-001 D6's rule that the scope a route needs comes from the same `classify()`
 that decides admission. K1's three `/seriatim/*` rows change with it (Appendix B).
@@ -322,17 +327,21 @@ async def _warn_allow_unauthenticated(self) -> None:
     message = ALLOW_WARNING if self.keyring is None else ALLOW_WITH_KEYS_WARNING
     while True:
         self.log.event("allow_unauthenticated", level="WARNING", message=message)
-        await anyio.sleep(self.warn_every_s)  # 3600; create_app(…, warn_every_s=…) in tests
+        await sleep(self.warn_every_s)  # 3600; create_app(…, warn_every_s=…) in tests
 ```
+
+`sleep` is `app`'s own binding (`from anyio import sleep`), so A12 can patch
+`seriatim_node.app.sleep` without touching `anyio.sleep`, which the rest of the sidecar and
+the test harness use.
 
 - **The message says which mode it is.** With no keys it is S1's `ALLOW_WARNING` ("…: the
   sidecar has no authentication (PPE and test mode only)"). With keys it is
   `ALLOW_WITH_KEYS_WARNING`: `SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true: test mode; keys are
   enforced (PPE and test mode only)`, because saying "no authentication" would be false.
-  `load_settings`'s startup line on stderr picks the same message by the same rule.
-
-- The first line is written when the lifespan starts, then one every hour (Q14). The stderr
-  line that `load_settings` already writes at startup stays as it is (TD-slice-1 C5).
+  `load_settings`'s startup line on stderr, now written by its step 8 (§2.2), picks the same
+  message by the same rule.
+- The first line is written when the lifespan starts, then one every hour (Q14), beside the
+  stderr line of step 8.
 - `RequestLog.event(name, *, level, **fields)` writes the same JSON line format as `emit`,
   with `event` set to `name` and no request fields (Appendix A). `emit` becomes
   `event("request", …)`.
@@ -473,15 +482,35 @@ Docker forwards a published port to the container's own interface, not to its lo
 the sidecar has to listen beyond loopback to be reached, and S1's step 5 allowed that only
 because the flag was set. Once S2-R2's step 5 lands, that `node-a` would exit 2 at startup and
 P1 to P7 would fail. So the same PR, S2-2, changes the PPE to use container networking, the
-way `dbg-a` already reaches Ollama:
+way `dbg-a` already reaches Ollama (ruled in S2-R8):
 - `node-a` listens on `127.0.0.1` inside the namespace, on another port (`11437`);
-- a forwarder service in the same namespace, built like `dbg-a` (the same pinned image,
-  `network_mode: "service:ollama-a"`, `cap_drop: [ALL]`, limits), runs
+- a new forwarder service, `fwd-a`, in the same namespace and built like `dbg-a` (the same
+  pinned image, `network_mode: "service:ollama-a"`, `cap_drop: [ALL]`), runs
   `socat TCP-LISTEN:11436,fork,reuseaddr TCP:127.0.0.1:11437`;
 - the published port, `127.0.0.1:11436` on the host, and every P test are unchanged.
 
-The PPE guard already accepts `dbg-a`'s shape, so the forwarder needs no guard change; S2-2
-checks that the sum of limits still fits the guard's 4 CPUs and 6 GiB. P7
+**The resource split.** `tools/ppe_guard.py` refuses limits that sum above `MAX_CPUS = 4.0`
+or `MAX_MEMORY = 6 GiB`. Today's sums are exactly 4.0 CPUs and 5.75 GiB:
+
+| service | CPUs now | CPUs in S2-2 | memory now | memory in S2-2 |
+|---|---|---|---|---|
+| `ollama-a` | 3 | 3 | 5G | 5G |
+| `cap-a` | 0.25 | 0.25 | 256M | 256M |
+| `dbg-a` | 0.25 | **0.15** | 128M | 128M |
+| `fwd-a` (new) | — | **0.1** | — | **64M** |
+| `node-a` | 0.5 | 0.5 | 384M | 384M |
+| **sum** | **4.0** | **4.0** | **5.75 GiB** (5,888 MiB) | **5.8125 GiB** (5,952 MiB) |
+
+A forwarder at `dbg-a`'s 0.25 would make 4.25, which the guard refuses. The 0.1 for `fwd-a`
+comes from `dbg-a`, not from `node-a`: both forwarders are `socat` copying bytes for one
+small model, while `node-a` is the code under test, and P1 to P7's timing margins were set
+with its 0.5. Folding the forwarder into `dbg-a` as a second listener would add no container,
+but one `socat` serves one listener, so `dbg-a` would need a shell running two `socat`s, and
+if one died the container would stay up half-broken; as its own service, each forwarder is
+its container's only process and fails visibly. S2-2's `ppe` job quotes the guard's
+acceptance of the new file.
+
+The PPE guard already accepts `dbg-a`'s shape, so `fwd-a` needs no guard change. P7
 already allows for a forwarder that accepts while `node-a` is down ("the host's port forwarder
 accepts and resets"; it waits for an answer, not for a listening port), so it still holds. The
 sidecar then sees every PPE client as `127.0.0.1`, which nothing in S1 to S3 reads.
@@ -500,10 +529,10 @@ seriatim-node keygen --id <id> --scope infer|admin
   so both options use a small `store` action, `Once`, that calls `parser.error(…)` when its
   option has already been given: `--id a --id b` and `--scope infer --scope admin` also exit 2
   with usage, never with the last value.
-- **The key.** `new_key()`: 32 bytes from `secrets.token_bytes`, encoded as Q2 says
-  (recommended: `seriatim_` followed by the 43-character unpadded base64url form,
-  `secrets.token_urlsafe(32)`). The prefix lets a secret scanner recognise a leaked key.
-- **The gitleaks rule (S2-R7).** The repository has no gitleaks configuration today: the
+- **The key.** `new_key()` (in `auth.py` from S2-1): `seriatim_` followed by
+  `secrets.token_urlsafe(32)`, the 43-character unpadded base64url form of 32 random bytes
+  (Q2, ruled B in S2-R8). The prefix lets a secret scanner recognise a leaked key.
+- **The gitleaks rule (S2-R7, S2-R8).** The repository has no gitleaks configuration today: the
   pre-commit hook (`.pre-commit-config.yaml`, gitleaks v8.21.2) and the `secret-scan`
   workflow (`gitleaks git --redact --verbose --exit-code 1 .`) both run gitleaks' default
   rules. gitleaks v8 reads a `.gitleaks.toml` at the root of the scanned repository when no
@@ -528,9 +557,8 @@ seriatim-node keygen --id <id> --scope infer|admin
   that happen to be 43 characters after the prefix) from matching. The repository has no
   test of its gitleaks configuration, so S2-4 adds none; its PR shows the rule working by
   running gitleaks on a scratch directory outside the repository that holds one `new_key()`
-  output (the check fails) and one 43-character identifier (it passes). The rule assumes Q2's
-  recommended form, `seriatim_` plus `token_urlsafe(32)`; if Q2 is ruled otherwise, the
-  regex follows the ruled form.
+  output (the check fails) and one 43-character identifier (it passes). The regex is exactly
+  `new_key()`'s form.
 - **The output**, on stdout only, once: the key on its own line, a blank line, then the
   `[[keys]]` table with `id`, `scope` and `sha256 = hashlib.sha256(key.encode("ascii")).hexdigest()`
   (Appendix A). That is the hash the sidecar computes for `Authorization: Bearer <key>`.
@@ -555,17 +583,17 @@ committed. The http tests write their `[[keys]]` file under `tmp_path`.
 | id | test | tier | REQ |
 |---|---|---|---|
 | A1 | `read_credentials`, table-driven: no header → `Missing`; `Authorization:` with an empty value → `Missing`; `Bearer` alone → `Missing`; `Bearer <key>` → `Presented` with the exact bytes; `bearer <key>` and `BEARER <key>` → `Presented` (Q8); `Bearer  <key>` (two spaces) → `Presented` (Q9); two `Authorization` headers, equal and different, one of them valid → `Ambiguous("two Authorization headers")`; `Basic <b64>`, `Digest x`, `Token <key>` → `Ambiguous("a scheme other than Bearer")`; `Bearer a b`, `Bearer a\tb`, `Bearer a, Bearer b`, `Bearer\t<key>` and `Bearer \t<key>` (a tab in the separator) → `Ambiguous("whitespace in the key")`. `X-API-Key: <key>` alone, `Cookie: key=<key>`, `Proxy-Authorization: Bearer <key>` alone, and a key only in the query string → `Missing` (S2-R6). Hypothesis: any token of `b64token` characters round-trips to `Presented` with the same bytes, and any token with an embedded space or tab is `Ambiguous` | unit | 13 |
-| A2 | `Keyring.match` and `allows`. With 5 keys, `hmac.compare_digest` (patched in `auth`, counting) is called exactly 5 times when the key matches the first entry, the third, the last, and none; SHA-256 is computed once per call. The matching entry's `Principal` (id and scope) is returned; a key differing in one character, the key's hex hash sent as the key, and an empty token → `None`. `allows` for every (have, need) pair of `INFER`/`ADMIN` × `NONE`/`INFER`/`ADMIN`: only `INFER` needing `ADMIN` is false. `Keyring` refuses 0 entries, 257 entries, a repeated id and a repeated digest (`ValueError`) | unit | 13, 14 |
+| A2 | `Keyring.match` and `allows`. With 5 keys, `hmac.compare_digest` (patched in `auth`, counting) is called exactly 5 times when the key matches the first entry, the third, the last, and none; SHA-256 is computed once per call. The matching entry's `Principal` (id and scope) is returned; a key differing in one character, the key's hex hash sent as the key, and an empty token → `None`. `allows` for every (have, need) pair of `INFER`/`ADMIN` × `NONE`/`INFER`/`ADMIN`: only `INFER` needing `ADMIN` is false. `Keyring` refuses 0 entries, 257 entries, a repeated id and a repeated digest (`ValueError`). `new_key()` (S2-1): `seriatim_` followed by 43 base64url characters that decode to 32 bytes, and 100 calls give 100 different keys | unit | 13, 14, §6.2 |
 | A3 | Loading keys. A config file with an `infer` and an `admin` key → `settings.keys` in order, and `keyring(settings)` matches each key with its id and scope; `sha256` in upper case is accepted and equal to the lower-case one. Each of these → `ConfigError` naming `SERIATIM_NODE_KEYS[<i>].<field>` or `SERIATIM_NODE_KEYS`: a table with no `id`, `scope` or `sha256`; an unknown field; `scope = "read"`; an id `Client`, `-a`, 33 characters or empty; a `sha256` of 63 or 65 digits, or with a non-hex digit; `keys = "x"`; 257 tables; two tables with one id (the message names the id); two tables with one hash in different cases (the message names both ids). `SERIATIM_NODE_KEYS` set in the environment → `ConfigError` naming it, even when it is valid JSON (REQ-23; S2-R4). No error message contains a configured `sha256` in either case, including the messages for a malformed `sha256` and a duplicate one | unit | 23, 13 |
 | A4 | Startup refusals (REQ-15). No keys and no `ALLOW_UNAUTHENTICATED` → `ConfigError` naming `SERIATIM_NODE_KEYS`, and `main()` exits 2 with that message on stderr and never calls `uvicorn.run`. No keys with `ALLOW_UNAUTHENTICATED=true` → starts, `keyring` is `None`, the startup `WARNING` is captured. Keys with `ALLOW_UNAUTHENTICATED=true` → starts with a `Keyring`, and the startup `WARNING` is the "keys are enforced" one (S2-R1). `LISTEN_HOST` = `0.0.0.0`, `::` or `192.0.2.10` → `ConfigError` naming `SERIATIM_NODE_LISTEN_HOST` in all four combinations of keys or none, and the flag set or not (S2-R2: the flag never relaxes it); `main()` then exits 2 without calling `uvicorn.run`. `create_app` given `Settings(keys=(), allow_unauthenticated=False)` built directly → `ConfigError` | process | 15, 23 |
 | A5 | `keygen`. `main(["keygen", "--id", "client-a", "--scope", "infer"])` exits 0 and prints the key, a blank line and the table; the key has the Q2 form and decodes to 32 bytes; the table's `sha256` is the SHA-256 of the printed key; written to a config file, the table loads (A3) and the sidecar built from it accepts the printed key with id `client-a` and scope `infer` (one http request). Two runs print different keys. It succeeds with an invalid `SERIATIM_NODE_SLOTS` and an unreadable `SERIATIM_NODE_CONFIG` in the environment (it reads neither), creates no file in the working directory or the lock directory, and calls neither `acquire_singleton` nor `uvicorn.run` (patched). `--scope read`, `--id Bad`, a missing `--id`, a repeated `--id` (`--id a --id b`), a repeated `--scope` (even with the same value), an extra argument, `main(["keygen"])` and `main(["nope"])` each exit 2 with usage on stderr and print no key. `main([])` serves as in S1 (TD-slice-1 C8) | process | §6.2, 23 |
-| A6 | 401 across every route class. With keys configured, for one pair of each class in §4 (every pair of the REQ-5 lists, from `tests/fixtures/route-pairs.json`, plus `POST /api/create`, `OPTIONS /api/tags`, `PUT /api/chat`, `POST /api/new-feature`, `GET /seriatim/nope` and `POST /seriatim/health`): no key → 401 `AUTH_MISSING`; a key that is not configured → 401 `AUTH_INVALID`. Each: `WWW-Authenticate: Bearer` exactly once, `retryable: false`, `replay_safe: true`, `X-Seriatim-Gate: ungated`, the body validates against `ErrorEnvelope` (K-OAS2); `fake_ollama` recorded nothing; every slot is `FREE` | http | 13, 25 |
+| A6 | 401 across every route class. With keys configured, for one pair of each class in §4 (every pair of the REQ-5 lists, from `tests/fixtures/route-pairs.json`, plus `POST /api/create`, `OPTIONS /api/tags`, `PUT /api/chat`, `POST /api/new-feature`, `GET /seriatim/nope` and `POST /seriatim/health`): no key → 401 `AUTH_MISSING`; a key that is not configured → 401 `AUTH_INVALID`. Each: `WWW-Authenticate: Bearer` exactly once, `retryable: false`, `replay_safe: true`, `X-Seriatim-Gate: ungated`, the body validates against `ErrorEnvelope` (K-OAS2); `fake_ollama` recorded nothing; every slot is `FREE`. **HEAD requests** (`HEAD /`, `HEAD /api/blobs/sha256:<hex>`, and any other HEAD pair) get no body (RFC 9110 §9.3.2), so for them the test asserts the status, `WWW-Authenticate` (on a 401) and `X-Seriatim-Gate: ungated`, and that the body is empty; `error_code` and `outcome` come from the request's log line instead of the envelope. A7, A8 and A14 treat HEAD the same way | http | 13, 25 |
 | A7 | The scope matrix of §4, for the same pairs as A6: an `infer` key → the `infer` classes pass (the gated ones get Ollama's answer with `X-Seriatim-Gate: acquired`, the ungated ones `ungated`), and every `admin` class gets 403 `FORBIDDEN_SCOPE`, including unknown endpoints, `/seriatim/nope`, `POST /seriatim/health`, `POST /seriatim/admin/offline` and `POST /seriatim/admin/online` (not yet served, so unknown `/seriatim/*` paths, S2-R3), `GET /seriatim/admin/offline` (a wrong method there), and §4's exact-matching cases `GET /seriatim/health/`, `GET /SERIATIM/HEALTH`, `GET /api/tags/` and `POST /API/chat`. Each 403 has no `WWW-Authenticate`, `error_code: FORBIDDEN_SCOPE`, `retryable: false`, `replay_safe: true`, `source: sidecar`, `node` equal to `settings.id`, `X-Seriatim-Gate: ungated`, and the body validates against `ErrorEnvelope` (K-OAS2); nothing recorded upstream and no slot taken. An `admin` key → every class passes; `/seriatim/nope`, `/seriatim/admin/offline` and `GET /seriatim/health/` get 404, `POST /seriatim/health` gets 405, and `GET /SERIATIM/HEALTH` is forwarded to Ollama. A 403's log line has `client` equal to the `infer` key's id. (Once S4c serves the admin switch, its own tests show an `infer` key's 403 there; these cases keep passing, because the route's scope stays `admin`.) | http | 14, 5, 25 |
-| A8 | Health. With keys configured, `GET /seriatim/health` with no key, a wrong key, two `Authorization` headers and `Basic x` → 200 `{"status":"ok"}` each time (S2-R5); its line is still at `DEBUG` with `client: null` (TD-slice-1 HL9). Degraded health with no key: Ollama down, and a new gate in its startup quarantine → 503 with `["ollama_unreachable"]` and `["starting"]`, never 401. `HEAD /seriatim/health` and `POST /seriatim/health` with no key → 401 `AUTH_MISSING`; with an `infer` key → 403 `FORBIDDEN_SCOPE`; with an `admin` key → 405 with `Allow: GET` (S2-R3) | http | 13, 18 |
+| A8 | Health. With keys configured, `GET /seriatim/health` with no key, a wrong key, two `Authorization` headers and `Basic x` → 200 `{"status":"ok"}` each time (S2-R5); its line is still at `DEBUG` with `client: null` (TD-slice-1 HL9). Degraded health with no key: Ollama down, and a new gate in its startup quarantine → 503 with `["ollama_unreachable"]` and `["starting"]`, never 401. `HEAD /seriatim/health` and `POST /seriatim/health` with no key → 401 `AUTH_MISSING` (for `HEAD`, the status, headers and empty body as in A6, and `error_code` from the log line); with an `infer` key → 403 `FORBIDDEN_SCOPE`; with an `admin` key → 405 with `Allow: GET` (S2-R3) | http | 13, 18 |
 | A9 | Ambiguous credentials over HTTP (raw socket where httpx would merge headers): two `Authorization` headers, one of them a valid `admin` key; `Basic <b64>`; `Bearer <key> x`; `Bearer a, Bearer b` → 400 `AUTH_AMBIGUOUS` on a gated, an ungated and a `/seriatim/*` route: `error_code: AUTH_AMBIGUOUS`, `retryable: false`, `replay_safe: true`, `source: sidecar`, `node` equal to `settings.id`, `X-Seriatim-Gate: ungated`, and the body validates against `ErrorEnvelope` (K-OAS2); no `WWW-Authenticate`; nothing recorded upstream; no slot taken; the message names the reason and contains no header value. A valid key in `X-API-Key` with no `Authorization` → 401 `AUTH_MISSING` with the `X-API-Key` hint (Q11); with a valid Bearer key as well → passes, and Ollama receives neither header. `?key=<valid key>`, `Cookie: key=<valid key>` and `Proxy-Authorization: Bearer <valid key>`, each with no `Authorization` → 401 `AUTH_MISSING`, and `fake_ollama` recorded nothing (S2-R6) | http | 13, 25 |
 | A10 | Auth comes first (§3). With no key: a gated request while the only slot is held → 401, never 429; during the startup quarantine → 401, never 503 `NODE_STARTING`; with `Content-Length` over `max_body_bytes` → 401, never 413; in each case the slot holder is undisturbed and the gate state is unchanged. Over a raw socket, the headers of a `POST /api/chat` with `Content-Length: 4096` and no body bytes → the 401 arrives before any body is sent, with `Connection: close`, and the connection is closed; an `Expect: 100-continue` request gets its 401 with no `100 Continue`. A 401 to a `GET` with no body keeps the connection, and the next request on it with a valid key gets 200. S1's earlier checks still win: HTTP/1.0 → 505, `/api/../chat` → 400 `BAD_PATH`, `Transfer-Encoding` with `Content-Length` → 400 `BAD_REQUEST_BODY`, each with no key (Q5) | http | 13, 3, 20, 20a |
 | A11 | The key never leaves. With a valid `infer` key on a gated `/api/chat` (non-streaming and streaming) and on `/api/tags`, and a valid `admin` key on a streamed `POST /api/blobs/sha256:<hex>`, each also sending `X-API-Key`, `Cookie` and `Proxy-Authorization` → `fake_ollama` recorded none of `Authorization`, `X-API-Key`, `Cookie` or `Proxy-Authorization`. Across one request of every outcome in §5 and TD-slice-1 §5 that S2 can reach (200, 400 `AUTH_AMBIGUOUS`, 401 both ways, 403, 404, 413, 429, 502), no log line, response body or response header contains the key, its SHA-256 in hex, or the configured hash of any other key. The same holds for credentials that are refused or ignored, each its own marker secret: a wrong key (`Bearer <secret>`, 401 `AUTH_INVALID`); `Basic <secret>` (400); `Bearer <secret> x` (400); and a secret sent only in `X-API-Key`, only in `Cookie`, and only in the query string (`?key=<secret>`), each with no `Authorization` → no log line (traceback included) and no response body or header contains the secret. This asserts only that nothing is logged or echoed; how a query-string key is answered is A9's. An authenticated `GET /api/tags?key=<secret>` (valid Bearer `infer` key) → 200: `fake_ollama` receives the query string `key=<secret>` byte for byte (REQ-6 forwards it unchanged; the residual risk REQ-13 records), and no log line contains `<secret>` (S2-R6). `client` is the key's id on the authenticated lines (the 403 included) and `null` on the 400 and 401 lines. Each auth refusal's line has §2.4's `outcome` and `level`: `unauthenticated` for both 401s, `forbidden` for the 403 and `rejected` for the 400, each at `INFO`. `uvicorn`'s access log stays off (TD-slice-1 L3) | http | 13, 22 |
-| A12 | Unauthenticated test mode and the hourly warning. With no keys and `ALLOW_UNAUTHENTICATED=true`: `POST /api/create` and `OPTIONS /api/tags` with no key reach Ollama (every route is open, Q12); a request with two `Authorization` headers is not refused, and Ollama receives neither; `client` is `null`. With `create_app(…, warn_every_s=0.2)`: one `WARNING` line with `event: "allow_unauthenticated"` and S1's "no authentication" message at startup, and further ones at that interval (at least two more within a bounded wait, each at least the interval apart); none after shutdown. With keys and `ALLOW_UNAUTHENTICATED=true` → the same lines, with the "keys are enforced" message (S2-R1). With keys and no flag → none at all. The line has the fields in Appendix A, `level: WARNING`, and no request fields. Without `warn_every_s`, `create_app` uses 3600 s: with `anyio.sleep` patched in `app` to record its argument and return, the task's first sleep asks for exactly 3600 | http | 15 |
+| A12 | Unauthenticated test mode and the hourly warning. With no keys and `ALLOW_UNAUTHENTICATED=true`: `POST /api/create` and `OPTIONS /api/tags` with no key reach Ollama (every route is open, Q12); a request with two `Authorization` headers is not refused, and Ollama receives neither; `client` is `null`. With `create_app(…, warn_every_s=0.2)`: one `WARNING` line with `event: "allow_unauthenticated"` and S1's "no authentication" message at startup, and further ones at that interval (at least two more within a bounded wait, each at least the interval apart); none after shutdown. With keys and `ALLOW_UNAUTHENTICATED=true` → the same lines, with the "keys are enforced" message (S2-R1). With keys and no flag → none at all. The line has the fields in Appendix A, `level: WARNING`, and no request fields. Without `warn_every_s`, `create_app` uses 3600 s: with `seriatim_node.app.sleep` (`app`'s own binding, §2.4; `anyio.sleep` itself is untouched) patched to a fake that records its argument and then `await anyio.sleep_forever()`, so the loop suspends until the lifespan cancels it instead of spinning, the recorded first argument is exactly 3600 and exactly one warning line was written | http | 15 |
 | A13 | Rotation (SPEC §6.2). A config file with two `infer` keys, `old` and `new` → each gets 200 on `/api/tags`, each logged with its own `client`. The same sidecar stopped, the `old` table removed, and a sidecar started from the edited file → `old` gets 401 `AUTH_INVALID` and `new` still gets 200 | http | 13, §6.2 |
 | A14 | No CORS on any response (REQ-6; S2-R7). With keys configured, and `fake_ollama` answering `/api/tags` and `/api/chat` with `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Credentials: true` and `Access-Control-Expose-Headers: x` → the client receives no `access-control-*` header (an `infer` key; Ollama's other headers kept). Every Seriatim-made response, each sent with an `Origin: http://example.com` header, has none either: 400 `AUTH_AMBIGUOUS`, 401 both ways, 403, a preflight `OPTIONS /api/chat` with `Access-Control-Request-Method: POST` and no key (401), health 200 and 503, 404, 405, 413, 429 and 503 `NODE_STARTING` | http | 6, 13 |
 
@@ -612,10 +640,10 @@ releasable and green, and ships the tests for exactly the IDs listed.
 
 | PR | scope | files (new or changed) | TD IDs | needs |
 |---|---|---|---|---|
-| S2-1 | Credentials and the keyring | `auth.py` (`Principal`, `KeyEntry`, `Keyring`, `read_credentials`, `allows`, `authorise`), `tests/node/test_auth.py` | A1, A2 | — |
-| S2-2 | Keys in the configuration, and the startup refusals | `config.py` (`KeyConfig`, `keys`, steps 2, 3, 5 and 7, `keyring()`), `app.py` (`main()` refuses configured keys until S2-3; below), `test_auth.py`, `test_config.py` and `harness.py` (Appendix B), `.env.example`, `ppe/compose.yaml` (`node-a` on loopback behind a forwarder, S2-R2; §6), `TD-slice-1.md` (C1, C5, C11, §2.1 step 5, §6's PPE lines) | A3, A4 (all but its `create_app` case and its case of keys starting) | 1 |
+| S2-1 | Credentials and the keyring | `auth.py` (`Principal`, `KeyEntry`, `Keyring`, `read_credentials`, `allows`, `authorise`, `new_key`), `tests/node/test_auth.py` | A1, A2 | — |
+| S2-2 | Keys in the configuration, and the startup refusals | `config.py` (`KeyConfig`, `keys`, steps 2, 3, 5, 7 and 8, `keyring()`), `app.py` (`main()` refuses configured keys until S2-3; below), `test_auth.py`, `test_config.py` and `harness.py` (Appendix B), `.env.example`, `ppe/compose.yaml` (`node-a` on loopback behind `fwd-a`, and the resource split; S2-R2, S2-R8; §6), `TD-slice-1.md` (C1, C5, C11, §2.1 step 5, §6's PPE lines) | A3, A4 (all but its `create_app` case and its case of keys starting) | 1 |
 | S2-3 | Enforcement | `app.py` (the auth step, `refuse_auth`, `PRINCIPAL_KEY`, the `client` field, the `create_app` refusal; S2-2's guard removed), `proxy.py` (`client`), `gate.py` (S2-R3), `tests/node/test_http_auth.py` (new), `test_http.py`, `test_gate.py` and `harness.py` (Appendix B), `TD-slice-1.md` (K1, L1, §2.2) | A4 (its `create_app` case and keys starting), A6–A11, A13, A14 | 2 |
-| S2-4 | `keygen` and the gitleaks rule | `auth.py` (`new_key`, `keygen`), `app.py` (`main(argv)`), `test_auth.py`, `test_config.py` (C8 calls `main([])`), `.gitleaks.toml` (new; §7, S2-R7) | A5 | 2, 3 |
+| S2-4 | `keygen` and the gitleaks rule | `auth.py` (`keygen`; `new_key` is S2-1's), `app.py` (`main(argv)`), `test_auth.py`, `test_config.py` (C8 calls `main([])`), `.gitleaks.toml` (new; §7, S2-R7, S2-R8) | A5 | 2, 3 |
 | S2-5 | Test mode's hourly warning, and enforcement | `app.py` (the warning task, `RequestLog.event`, `warn_every_s`), `test_http_auth.py`, `docs/design/TD-slice-2.md` (`Enforced: yes`, the details fixed by the code) | A12 | 1–4 (all) |
 
 - **S2-2 never serves with keys it doesn't check.** After S2-2, `load_settings` loads and
@@ -638,13 +666,16 @@ releasable and green, and ships the tests for exactly the IDs listed.
 - **Docs with code.** Each PR updates this TD's "details fixed by the code" for what it built,
   and the SPEC or ADR where the code refines them.
 
-## 10. Open questions
+## 10. Questions, all ruled
 
-Each is for the maintainer, on #35. Q1, Q4, Q6 and Q7 are **ruled**
+Each was put to the maintainer on #35. Q1, Q4, Q6 and Q7 are **ruled**
 (issuecomment-7109174985), and so are three points raised in the #95 review: REQ-15's PPE
 exception, credentials in query strings, and T11 and T3. SPEC §9 records all seven as S2-R1
-to S2-R7, with where each is applied, and the design above follows them. Q2, Q3, Q5 and Q8 to
-Q16 stay open; the design follows each one's recommendation.
+to S2-R7, with where each is applied, and the design above follows them. A second ruling
+(issuecomment-7109496940), S2-R8, gives Q2, Q3, Q5 and Q8 to Q16 their recommended answers,
+confirms the PPE layout of §6 (`node-a` on loopback behind a forwarder, within the guard's
+4-CPU cap, shipped in S2), and confirms the `.gitleaks.toml` of §7. So every question is
+ruled, and each is marked below.
 
 | ruling | outcome | TD sections |
 |---|---|---|
@@ -655,6 +686,7 @@ Q16 stay open; the design follows each one's recommendation.
 | S2-R5 (Q7) | Health reads no credentials; REQ-13 and ADR-001 D6 amended | §2.1, A8 |
 | S2-R6 | A credential comes from headers only; the URL residual risk is recorded (REQ-13, T3); query values never reach the log | §2.1, A1, A9, A11 |
 | S2-R7 | No `Access-Control-*` on any sidecar response (REQ-6); T11's exceptions corrected; a gitleaks rule for the key prefix in S2 | §2.5, §7, §9 (S2-4), A14 |
+| S2-R8 (Q2, Q3, Q5, Q8–Q16; the PPE; gitleaks) | Each of those questions takes its recommended answer. The PPE: `node-a` binds `127.0.0.1` and a `socat` forwarder publishes 11436, within the guard's 4-CPU cap; the `ppe/` change ships in S2. Gitleaks: a `.gitleaks.toml` that extends the defaults with the `seriatim_` key-prefix rule | §2.1, §2.2, §3, §6, §7, §9 (S2-2, S2-4), §10 |
 
 1. **Ruled (issuecomment-7109174985): A, and REQ-23 amended (S2-R4).** **Where keys are configured.** REQ-23 says the sidecar reads `SERIATIM_NODE_*` variables and
    one TOML file. Options: **(A)** `[[keys]]` tables in the `SERIATIM_NODE_CONFIG` file only;
@@ -664,14 +696,13 @@ Q16 stay open; the design follows each one's recommendation.
    environment variable, and one place means rotation edits one file. (§2.2, §6.) A related
    detail: SPEC §6.2 says `keygen` prints "the config line"; a `[[keys]]` table is three lines.
    The TD prints the table (§7, Appendix A).
-2. **The key's printed form.** SPEC §6.2 and D6 fix 256 random bits, not the encoding.
+2. **Ruled (issuecomment-7109496940): B (S2-R8).** **The key's printed form.** SPEC §6.2 and D6 fix 256 random bits, not the encoding.
    Options: **(A)** `secrets.token_urlsafe(32)`, 43 base64url characters; **(B)** the same with
    a fixed prefix, `seriatim_`; **(C)** 64 hex digits. *Recommendation: B.* The prefix lets
    gitleaks (and other scanners) be given a rule for leaked keys (T3), and base64url is a valid
    RFC 6750 `b64token`. The sidecar never checks the form: it hashes whatever is presented.
-   (§7.) S2-R7's gitleaks rule for "the key prefix" assumes B; this question stays open, and
-   the rule's regex follows whatever form is ruled.
-3. **Key ids and the number of keys.** The SPEC gives no rule. Options: **(A)** the node-id
+   (§7.) S2-R7's gitleaks rule matches this form.
+3. **Ruled (issuecomment-7109496940): A (S2-R8).** **Key ids and the number of keys.** The SPEC gives no rule. Options: **(A)** the node-id
    pattern `^[a-z0-9][a-z0-9-]{0,31}$`, at most 256 keys; **(B)** any printable string up to 64
    characters, no limit. *Recommendation: A.* Ids appear in logs, and from S4c in `changed_by`,
    so a narrow alphabet keeps them safe to log; a cap bounds the per-request comparison cost.
@@ -687,7 +718,7 @@ Q16 stay open; the design follows each one's recommendation.
    and the keys are ignored. *Recommendation: A.* It is the only option that lets a PPE or a
    test run with keys on, and C would silently turn configured keys off. A later rename of the
    flag to say "test mode" is a separate question. (§2.2, §6.)
-5. **The checks before auth.** Auth needs `classify()` for the scope, and REQ-20a puts the
+5. **Ruled (issuecomment-7109496940): A (S2-R8).** **The checks before auth.** Auth needs `classify()` for the scope, and REQ-20a puts the
    path check before `classify()`. Options: **(A)** keep S1's 505, framing 400, missing
    `raw_path` 500 and `BAD_PATH` 400 before auth; **(B)** read the credentials (400 and 401)
    before everything, and check the scope (403) after `classify()`. *Recommendation: A.* Those
@@ -713,50 +744,51 @@ Q16 stay open; the design follows each one's recommendation.
    `Authorization`. Options: **(A)** credentials are not read: 200; **(B)** they are checked
    whenever present: 401 or 400. *Recommendation: A.* Health needs no key (REQ-18), and a load
    balancer configured with a stale key should not take a healthy node out. (§2.1, A8.)
-8. **The scheme's case.** RFC 9110 §11.1 makes auth schemes case-insensitive; REQ-13 says "a
+8. **Ruled (issuecomment-7109496940): A (S2-R8).** **The scheme's case.** RFC 9110 §11.1 makes auth schemes case-insensitive; REQ-13 says "a
    scheme other than Bearer". Options: **(A)** `bearer` and `BEARER` are Bearer; **(B)** only
    the exact `Bearer`; anything else is `AUTH_AMBIGUOUS`. *Recommendation: A*, as the RFC
    says. (§2.1.)
-9. **Whitespace after `Bearer`.** RFC 6750 §2.1 allows one or more spaces before the token;
+9. **Ruled (issuecomment-7109496940): A (S2-R8).** **Whitespace after `Bearer`.** RFC 6750 §2.1 allows one or more spaces before the token;
    REQ-13 rejects "a Bearer value with embedded whitespace". Options: **(A)** one or more
    spaces after the scheme; whitespace inside the token is ambiguous; **(B)** exactly one
    space; any other whitespace is ambiguous. *Recommendation: A*, as the RFC says; "embedded"
    then means inside the token. (§2.1.)
-10. **An empty credential.** `Authorization:` with an empty value, or `Bearer` with no token.
+10. **Ruled (issuecomment-7109496940): A (S2-R8).** **An empty credential.** `Authorization:` with an empty value, or `Bearer` with no token.
     Options: **(A)** 401 `AUTH_MISSING`; **(B)** 401 `AUTH_INVALID`; **(C)** 400
     `AUTH_AMBIGUOUS`. *Recommendation: A.* No key was presented, and the client's fix is the
     same as for no header. (§2.1.)
-11. **`X-API-Key`.** REQ-13 says it is not accepted. Options: **(A)** ignored: the request is
+11. **Ruled (issuecomment-7109496940): A (S2-R8).** **`X-API-Key`.** REQ-13 says it is not accepted. Options: **(A)** ignored: the request is
     judged on `Authorization` alone, so a client that sends only `X-API-Key` gets 401
     `AUTH_MISSING`, with a `hint` saying to send `Authorization: Bearer`; **(B)** its presence
     is `AUTH_AMBIGUOUS`. *Recommendation: A.* The predecessor's clients that still send
     `X-API-Key` get a fatal 401 that tells them what to change (SPEC §7.1), and one that
     sends both keeps working. Either way it is never forwarded. (§2.1, §2.4.)
-12. **Unauthenticated test mode.** With no keys and the flag set. Options: **(A)** auth is
+12. **Ruled (issuecomment-7109496940): A (S2-R8).** **Unauthenticated test mode.** With no keys and the flag set. Options: **(A)** auth is
     skipped entirely: every route is open, `admin` ones included, and `Authorization` is not
     parsed; **(B)** ambiguous headers are still refused. *Recommendation: A.* It is S1's
     behaviour, so S1's suite and the PPE run unchanged (TD-slice-1 H16 sends two
     `Authorization` headers and expects them stripped, not refused). (§2.1.)
-13. **Where the no-keys refusal lives.** Options: **(A)** in `load_settings` (step 7), with every
+13. **Ruled (issuecomment-7109496940): A (S2-R8).** **Where the no-keys refusal lives.** Options: **(A)** in `load_settings` (step 7), with every
     other startup refusal, so it exits 2 (REQ-23); several S1 tests that call
     `load_settings({})` then get a key or the flag (Appendix B); **(B)** in `main()` and
     `create_app` only, so `load_settings({})` stays valid and fewer S1 tests change.
     *Recommendation: A.* One place for every refusal, and settings that would be refused can
     never be loaded. REQ-15 says "refuse to start" without an exit code; A gives it REQ-23's
     2. (§2.2, Appendix B.)
-14. **The hourly warning's form.** Today's startup warning goes through Python `logging` to
+14. **Ruled (issuecomment-7109496940): A (S2-R8).** **The hourly warning's form.** Today's startup warning goes through Python `logging` to
     stderr, as plain text. Options: **(A)** the hourly one is a JSON line on stdout, in the
     request log's format (`event: "allow_unauthenticated"`, `level: WARNING`), first at startup and
     then every hour, beside today's stderr line; **(B)** the same plain stderr line every
     hour. *Recommendation: A.* Operators and S4d read the JSON stream, and a warning that is
     meant to be noticed belongs where the request lines are. (§2.4, Appendix A.)
-15. **How auth refusals are logged.** S1 has `outcome: rejected` for its 400, 404 and 405.
+15. **Ruled (issuecomment-7109496940): A (S2-R8).** **How auth refusals are logged.** S1 has `outcome: rejected` for its 400, 404 and 405.
     Options: **(A)** `unauthenticated` for both 401s, `forbidden` for the 403, `rejected` for
     the 400, all at `INFO`; **(B)** `rejected` for all of them; **(C)** as A, with
     `AUTH_INVALID` at `WARNING`. *Recommendation: A.* Distinct outcomes answer T15's "who
     tried" and give S4d something to count, without making every stale client a warning.
     (§2.4, §5.)
-16. **A PPE case in S2.** The ADR's S2 row names no PPE test. Options: **(A)** none; the A
+16. **Ruled (issuecomment-7109496940): A (S2-R8); the PPE's layout change of §6 ships in
+    S2-2.** **A PPE case in S2.** The ADR's S2 row names no PPE test. Options: **(A)** none; the A
     tests run in process, and the PPE stays in unauthenticated test mode until S4a (its
     layout still changes for S2-R2, §6); **(B)** a PPE case with keys, which S2-R1 now allows,
     with a key generated by `ppe/ppe up` and
@@ -812,7 +844,7 @@ message is §2.4's "keys are enforced" one):
  "node":"node-a"}
 ```
 
-`keygen`'s output (Q2's recommended form; the key is shown as a placeholder):
+`keygen`'s output (Q2's form, S2-R8; the key is shown as a placeholder):
 
 ```text
 seriatim_<43 base64url characters>

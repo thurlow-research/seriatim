@@ -340,6 +340,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     `SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` is set. That setting exists for the PPE and
     tests; it logs a `WARNING` at startup and, from S2, every hour, whether or not keys are
     configured (ruling S2-R1).
+  - When keys are configured, `ALLOW_UNAUTHENTICATED=true` MUST NOT disable authentication
+    (ruling S2-R1).
   - The sidecar MUST refuse a non-loopback listen address unless authentication is configured
     and the exposure check (REQ-19) is active. `ALLOW_UNAUTHENTICATED=true` never relaxes
     this: with it set, the sidecar listens on loopback only. The PPE reaches its sidecar
@@ -774,9 +776,11 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - One JSON line per request, with the fields given in TD-slice-1 Appendix A. Health
     requests (`/seriatim/health`) are logged at `DEBUG`, so at the default `INFO` level a
     load balancer's polling adds no lines (TD-slice-1 HL9).
-  - Never a request or response body, and never a credential.
+  - Never a request or response body, never a credential, and never query values: the `path`
+    field is the path without its query string, so a key put in a URL is not logged (REQ-13;
+    ruling S2-R6).
 
-  *Tests:* L1–L3, H18, HL9.
+  *Tests:* L1–L3, H18, HL9; TD-slice-2 §8: A11.
 - **REQ-23. Configuration.**
   - The sidecar reads only `SERIATIM_NODE_*` environment variables, plus an optional TOML file
     named by `SERIATIM_NODE_CONFIG`; environment variables take precedence. The gateway reads
@@ -2664,7 +2668,9 @@ applied as follows:
 
 **Issue #35 (2026-11-23), slice S2.** The maintainer ruled on the questions of TD-slice-2 §10
 (https://github.com/thurlow-research/seriatim/issues/35#issuecomment-7109174985). They are
-applied as follows; the questions he did not rule on stay open in TD-slice-2 §10:
+applied as follows. A second ruling
+(https://github.com/thurlow-research/seriatim/issues/35#issuecomment-7109496940) settles the
+rest, as S2-R8, so every question in TD-slice-2 §10 is ruled:
 
 | # | ruling | where applied |
 |---|---|---|
@@ -2675,6 +2681,7 @@ applied as follows; the questions he did not rule on stay open in TD-slice-2 §1
 | S2-R5 | Q7: A. Health reads no credentials | REQ-13, ADR-001 D6; TD-slice-2 §2.1, A8 |
 | S2-R6 | Query strings: a credential comes from headers only; the residual risk of a key in a URL is recorded; a test shows query values never reach the log | REQ-13, ADR-001 T3; TD-slice-2 A11 |
 | S2-R7 | T11 and T3: no `Access-Control-*` header on any sidecar response; T11's exceptions corrected; a gitleaks rule for the key prefix, added in S2 | REQ-6, ADR-001 T3, T11; TD-slice-2 §7, §9, A14 |
+| S2-R8 | Q2, Q3, Q5 and Q8 to Q16 take TD-slice-2's recommended answers. The PPE (the REQ-15 follow-up): A, the flag still forces loopback; `node-a` binds `127.0.0.1` and a `socat` forwarder publishes 11436, within the PPE guard's 4-CPU cap, and the `ppe/` change ships in S2. Gitleaks: a `.gitleaks.toml` that extends the default rules with the `seriatim_` key-prefix rule | REQ-15; TD-slice-2 §6, §7, §9 (S2-2, S2-4), §10 |
 
 ## 10. Open questions
 
