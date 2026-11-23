@@ -1,6 +1,7 @@
 # The PPE: one Ollama node with real CPU-only micro-models and the sidecar in front of it
 # (SPEC §8.3; TD-slice-1 §6, §8.6 and App. B, S0b).
-# Start it only through `ppe/ppe up`, which checks this file's effective configuration first.
+# Start it only through `ppe/ppe up`, which checks this file's effective configuration first,
+# after staging node-a's code with `python3 -I tools/ppe_stage_node.py`.
 #
 # Images are pinned by digest (multi-arch index); Dependabot's docker-compose ecosystem proposes
 # digest bumps (.github/dependabot.yml, SPEC §7.9).
@@ -71,10 +72,12 @@ services:
           memory: 128M
 
   # The sidecar (TD-slice-1 §6, S1-14), in ollama-a's network namespace, as on a node: it
-  # forwards to Ollama on 127.0.0.1:11435. It runs from ppe/data/node, which the ppe job fills
-  # before `ppe/ppe up` (the package and its hash-pinned dependencies from uv.lock; ci.yml,
-  # "Stage the sidecar"), mounted read-only. No image is built, so the guard's allowlist
-  # needs no `build` key. drain_s is 10, so P7's NODE_STARTING window is wide.
+  # forwards to Ollama on 127.0.0.1:11435. It runs from ppe/data/node, mounted read-only,
+  # which `python3 -I tools/ppe_stage_node.py` fills before `ppe/ppe up`, in CI and locally
+  # (the package and its hash-pinned dependencies from uv.lock). No image is built, so the
+  # guard's allowlist needs no `build` key. drain_s is 10, so P7's NODE_STARTING window is
+  # wide. It runs as root with every capability dropped: `user`, `read_only` and
+  # `security_opt` are not on the guard's allowlist.
   node-a:
     image: python:3.12.16-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
     network_mode: "service:ollama-a"
@@ -91,6 +94,9 @@ services:
       SERIATIM_NODE_OLLAMA_URL: http://127.0.0.1:11435
       SERIATIM_NODE_ID: node-a
       SERIATIM_NODE_DRAIN_S: "10"
+      # P4 holds a gated request in its body read while a model downloads; the default 30 s
+      # would make a slow registry look like a sidecar failure.
+      SERIATIM_NODE_BODY_TIMEOUT_S: "300"
       SERIATIM_NODE_LOCK_DIR: /run/seriatim
     volumes:
       - type: bind

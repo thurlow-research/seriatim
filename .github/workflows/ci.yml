@@ -97,19 +97,10 @@ jobs:
           key: ppe-models-ollama-0.40.16-qwen2.5-0.5b-1.5b-all-minilm-22m-v1
       # node-a runs the sidecar from ppe/data/node (gitignored), mounted read-only: this
       # checkout's package and its runtime dependencies, installed only from uv.lock's hashes,
-      # as wheels for the container's Python (ppe/compose.yaml). No image is built.
+      # as wheels for the container's Python. No image is built. A local pre-check run stages
+      # with the same script (#69, question 1).
       - name: Stage the sidecar for node-a
-        run: |
-          set -euo pipefail
-          stage=ppe/data/node
-          mkdir -p ppe/data
-          rm -rf "$stage"
-          uv export --frozen --package seriatim-node --no-dev --no-emit-workspace --no-header \
-            -o "$RUNNER_TEMP/node-requirements.txt"
-          uv pip install --target "$stage" --python-version 3.12 \
-            --python-platform x86_64-manylinux_2_28 --only-binary :all: --require-hashes \
-            --no-deps -r "$RUNNER_TEMP/node-requirements.txt"
-          cp -R node/seriatim_node "$stage/"
+        run: python3 -I tools/ppe_stage_node.py
       - name: Start the PPE through the guard
         run: ppe/ppe up --ci
       - name: S0b checks and P1-P7 (tests/behaviour)

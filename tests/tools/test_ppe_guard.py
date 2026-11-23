@@ -690,7 +690,7 @@ def test_the_committed_compose_file_passes_the_guard():
     assert node["network_mode"] == "service:ollama-a"
     assert node["cap_drop"] == ["ALL"] and not node.get("cap_add")
     node_env = node["environment"]
-    assert node_env["SERIATIM_NODE_LISTEN_HOST"] == "0.0.0.0"  # nosec B104 # checks the PPE value
+    assert node_env["SERIATIM_NODE_LISTEN_HOST"] == ANY_ADDRESS
     assert node_env["SERIATIM_NODE_ALLOW_UNAUTHENTICATED"] == "true"
     assert node_env["SERIATIM_NODE_OLLAMA_URL"] == "http://127.0.0.1:11435"
     assert node_env["SERIATIM_NODE_LOCK_DIR"] == "/run/seriatim"
