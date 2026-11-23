@@ -42,6 +42,7 @@ defects (SPEC §1, F1 to F4). This ADR records how Seriatim is built instead.
 | D12 | **Exact classification.** Only verified method and path pairs are ungated. Everything unknown is gated and needs `admin`. Unsafe raw paths are rejected before matching. |
 | D14 | **Measured fit is deferred.** Sidecars measure and report capacity now; admission from it is a later slice, calibrated on real nodes. Until then, routing uses the operator's rules and fails closed without them. |
 | D16 | **Releases deploy.** CI builds verified, attested releases from `main`; a release follower installs them. Until it has passed PPE, hosts follow `ppe`/`prod` branches, changed only by maintainer-approved pull requests (`prod` from `main` only), through self-hosted runners behind approval. |
+| D17 | **Model rollouts run from the gateway** (deferred). The gateway drains a node, pulls through the sidecar's admin route and brings it back, one node at a time, failing closed. The sidecar never starts a process for a remote caller. |
 | D15 | **Metrics through the host's exporter.** Sidecar and gateway write Prometheus text files for the standard `node_exporter` / `windows_exporter` textfile collector; Seriatim opens no metrics port. |
 
 ## 3. Decisions and the alternatives rejected
@@ -267,8 +268,11 @@ Seriatim-owned endpoint, header, status and error code.
   check every native exit code, and are tested with Pester and bats.
 - **Model updates** use the sidecar's admin route, `POST /api/pull`, never 11435 directly. No
   Seriatim component therefore bypasses the gate.
-- **The local-only check** runs after install, after every model update, after every Ollama
-  upgrade, and weekly.
+- **The local-only check** runs after install, after every model update by `update-models`,
+  after every Ollama upgrade, and weekly. The weekly run covers model updates the gateway
+  runs (D17, SPEC REQ-53).
+- **One pull-and-verify implementation** serves `update-models` and the gateway's rollout
+  (SPEC REQ-54a), so the stream rule exists once.
 
 **Alternatives rejected.**
 - **Copying the predecessor's scripts.** They are tied to one machine. They also wrap native
@@ -495,6 +499,43 @@ route but health authenticated, and an exposure check (D2, D6, D12).
 - **Promotion needs the dev session,** or anyone holding an App token, to run the builder.
   That is deliberate: the maintainer asks for each one.
 
+### D17. Model rollouts run from the gateway; the sidecar never starts a process
+
+**Status.** Agreed by the maintainer on issue #93. Deferred: not scheduled, not built
+(SPEC §4.5b).
+
+**Decision.**
+- **The gateway does the work** (SPEC REQ-71). For each node in turn it takes the node
+  offline through the admin switch, waits until nothing is in flight, pulls each model
+  through the sidecar's admin `POST /api/pull` with REQ-54's stream rule, confirms the
+  models in `/api/tags`, and brings the node back online.
+- **Polled progress.** A `POST` starts a rollout and returns a job id; a `GET` on the job
+  shows each node's state.
+- **Fail closed, one node at a time.** A failure or a timeout leaves the node offline, stops
+  the rollout and reports the reason. Nothing brings the node back automatically.
+- **Access by allow list.** Only the admin key ids the gateway's configuration names may
+  start a rollout; by default none may. Every rollout is logged with the key id.
+- **Shared code.** The pull and its verification are one implementation, used by the
+  gateway and by `update-models` (SPEC REQ-54a).
+- **Model updates only.** Ollama upgrades stay under SPEC REQ-56.
+
+**Alternatives rejected.**
+- **A sidecar route that runs an update script,** even one from a fixed path with no caller
+  arguments. It would keep the local-only check in step with each update, but the sidecar
+  would start processes at a remote caller's request, which widens what an admin key can do.
+  The weekly local-only run covers gateway-run updates instead, because a pull changes no
+  binding, service setting or firewall rule (SPEC REQ-53).
+- **Updating every node at once.** It would take the whole pool out of service and put every
+  node at risk together.
+- **Bringing a node back after a failed pull.** It could serve a model in an unknown state.
+  A person looks first.
+
+**Consequences.**
+- **The local-only check can lag a gateway-run update by up to a week.** That is accepted,
+  because the check verifies nothing a pull changes.
+- **`update-models` becomes a thin script** around the shared implementation, in Python on
+  every OS.
+
 ## 4. Components
 
 | component | package | runs on | state |
@@ -653,6 +694,7 @@ The details are in TD-slice-1 §3.
 | T19 | Tampering: a downgrade or rollback attack (follower) | An attacker offers an older, vulnerable release | SPEC REQ-69: the follower installs only versions newer than its durable last-good record, in semantic-version order per channel; an older one only by an operator pin, by tag and digest, in the host's local config, never read from GitHub; held versions are never retried | A pinned old version is the operator's choice |
 | T20 | DoS: the GitHub API is unavailable (follower) | An outage, a rate limit, or a failed attestation lookup | SPEC REQ-69: the follower keeps running the current version, retries with backoff, reports the condition, and never installs anything it could not fully verify; rollback uses the cached, digest-checked last-good artifacts, with no network | No updates during the outage |
 | T21 | Elevation: misuse of the promotion builder's App identity (interim deployment) | A leaked `seriatim-worker` token pushes a `promote/ppe-*` branch or opens a promotion pull request | The token is short-lived, minted per use outside the repository, and never stored in Actions secrets; the App bypasses no ruleset but `promote-branches`, so it can't push `main`, `ppe`, `prod` or a `v*` tag; only it can create `promote/**` branches, and the builder refuses any whose `.github/` differs from `main`'s, so no counterfeit `promotion-source` job can ride on a promotion; a promotion still needs the maintainer's approval of the pull request and of the `ppe` environment, `promotion-source`, and `deploy.yml`'s checks (SPEC REQ-70, D16) | A leaked token can open pull requests and push working branches until it expires; nothing merges without the maintainer |
+| T22 | DoS: a model rollout takes nodes out of service (deferred, SPEC REQ-71) | A stolen admin key starts rollouts, or a failing pull leaves a node offline | Only key ids on the gateway's allow list may start one, and the list is empty by default; one node at a time, so the rest keep serving; every rollout is logged with the key id; the sidecar gains no route, so a key can't make a node run anything | A failed rollout leaves one node offline until a person brings it back, by design |
 | T15 | Repudiation | "Who used the GPU?" | A request log with key id, request id, path, model and timings (REQ-22) | Logs are local and not tamper-proof |
 
 ## 8. Residual risks
@@ -727,6 +769,7 @@ The evidence is in [EVALUATION.md](../EVALUATION.md). In short:
 | **S9** `/models/select` | task preferences, eligibility routing (REQ-32), `eligibility_basis`, every other node in `alternatives` with its verdict, routing errors as in REQ-32 | SEL1–SEL8 | TD-slice-9 |
 | **S10** Gateway deploy + two-node PPE | Dockerfile, systemd example, a two-node PPE with real size metadata; the client-compatibility suite (REQ-62a) with pinned `ollama` and `openai` clients, and the README's verified-versions line; the gateway image added to `release.yml`, pushed to GHCR and deployed by digest | P-GW1–P-GW7 (routing, never-too-small, busy isolation between nodes (F1), spill-over, merged views, streaming end to end, failover); CC1–CC18 (both clients against plain Ollama, a sidecar and the gateway: chat, generate, completions and embeddings, streamed and not; errors raise the client's exception with retries off; listing against a sidecar and the gateway's merge; baseline repeatability; every standard response validated against the plain shape with no extra keys; `NODE_OFFLINE` and the PPE trigger for `MODEL_NOT_ELIGIBLE`) | TD-slice-10 |
 | **S11** TLS (optional) | certificate and key settings for the sidecar and the gateway; PPE TLS smoke test | T1–T4 | TD-slice-11 |
+| *Deferred* Model rollout | Gateway-triggered model updates (D17, SPEC REQ-71, issue #93): the rollout routes and job, drain, pulls through the shared pull-and-verify implementation (SPEC REQ-54a), `/api/tags` verification, fail-closed stop, one node at a time, the allow list. Not scheduled | — | its own TD |
 | *Deferred* Measured fit | Admission from measured capacity (D14). Starts after S4b has run on real NVIDIA and Apple nodes, calibrated against their capacity recordings and the actual `size_vram`. It starts from D14's open problems | — | its own TD |
 | **Interim deploy** (now, a small PR after this one) | `.github/workflows/deploy.yml`, `.github/workflows/promotion-source.yml` and `deploy/promote-ppe.py` (SPEC §7.8): the promotion flow; the source rules (`ppe` only from `promote/ppe-*` built from a branch of this repository, `prod` from `main` only, never a fork); the `.github/`-equals-`main` rule; the merge-commit, tree, base and pull-request lookup checks (with retry); the clean wipe of the PPE project; a no-op deploy step until there is a service; the settings in §7.9 | each fail-closed check shown on a deliberate bad pull request or push, recorded in the PR; a wipe that leaves another project's containers and volumes untouched | none |
 | **S12** Release candidate 0.1.0-rc.1 | operator guide, supported Ollama versions, changelog; the first rc, `v0.1.0-rc.1`, through `release.yml` (`v0.1.0` follows in the release-follower slice, once the rc has passed PPE) | a full PPE run in CI, plus each node's local-only output; checksum and attestation verified by the installers | none |

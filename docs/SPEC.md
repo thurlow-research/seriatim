@@ -577,6 +577,12 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
       node: the `infer` ones (`/api/tags`, `/api/ps`, `/api/version`, `/api/show`,
       `/v1/models`) and the ungated `admin` ones (pull, push, copy, delete, blobs), as well
       as `/seriatim/*`.
+    - **Admin pulls in particular.** An offline node, drained or not, MUST accept `POST
+      /api/pull` with an `admin` key, and MUST NOT refuse it with `NODE_OFFLINE`. Updating a
+      node's models while it is out of service is what the switch is for: `update-models`
+      (REQ-54) and the gateway's model rollout (REQ-71) both pull into an offline node. A
+      pull is ungated (REQ-5), so it takes no slot and never waits for one (a maintainer
+      ruling on #93).
   - **One commit point.** Changes are serialised by an admin lock of their own, never by
     the gate's lock:
     - **Persist first.** The new state is written and made durable (below) in a worker
@@ -812,6 +818,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - `/models/select`;
   - `GET /seriatim/health`, `GET /seriatim/nodes` and `GET /seriatim/models`;
   - `POST /seriatim/admin/nodes/{id}/offline` and `.../online` (REQ-42a);
+  - once its slice is built, `POST /seriatim/admin/rollouts` and
+    `GET /seriatim/admin/rollouts/{job_id}` (REQ-71, deferred and not yet scheduled);
   - `GET /` and `HEAD /`, which answer 200 `Ollama is running` when at least one node is
     healthy, and 503 `FLEET_UNAVAILABLE` otherwise (REQ-35).
 
@@ -1434,6 +1442,89 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - an unset directory writes nothing;
   - the gateway's per-node series follow config reloads.
 
+### 4.5b Gateway: model rollout (deferred, not yet scheduled)
+
+**Status.** This section records a design the maintainer agreed on issue #93. It is not
+part of any slice yet and nothing in it is built. It has no slice row in ADR-001 §10 beyond
+the *Deferred* entry, no TD and no test IDs. When it is scheduled, its slice gets a TD that
+names the tests and adds the routes, schemas and error codes to the contract (ADR-001
+Appendix A, §5.4). Until then no code may claim REQ-71.
+
+- **REQ-71. Gateway-triggered model rollout.** An operator can ask the gateway to update the
+  models on a list of nodes. The gateway does the work itself, over routes the sidecar
+  already has, so the sidecar gains no new power and never starts a process because a
+  remote caller asked (ADR-001 D17).
+  - **Scope: model updates only.** A rollout pulls models. It never upgrades Ollama, which
+    stays under REQ-56 and its PPE-first order, and never updates Seriatim (ruling Q10).
+  - **Routes**, on the gateway, in the `admin` scope:
+    - `POST /seriatim/admin/rollouts` starts a rollout. Its body names the nodes, in the
+      order they are updated, and the models to pull on each. Both lists are explicit and
+      non-empty; an unknown node id, a duplicate, or an empty or malformed list gets 400
+      `BAD_REQUEST_BODY`, and nothing starts. It returns 202 with a job id at once, before
+      any node is touched.
+    - `GET /seriatim/admin/rollouts/{job_id}` returns the job: its overall state
+      (`running`, `succeeded` or `failed`), when it started and ended, the key id that
+      started it, and each node's state. An unknown job id gets 404 `NOT_FOUND`.
+  - **Progress is polled**, never streamed. Each node's state is one of:
+    - `queued`: not reached yet;
+    - `draining`: taken offline, waiting for in-flight work to end;
+    - `pulling <model> <pct>`: the latest progress of that model's pull stream, where
+      `<pct>` comes from the latest record that carries both `completed` and `total`, or
+      is `-` before one has arrived. The gateway keeps only the latest record of each
+      stream, not the whole stream;
+    - `online`: updated, verified and back in service;
+    - `failed: <reason>`: stopped, with the reason (below).
+  - **One node at a time.** The gateway finishes one node, back `online`, before it touches
+    the next, so at most one node is ever out of service because of the rollout and the
+    others keep serving. A gateway instance runs at most one rollout at a time; a `POST`
+    while one is running is refused, and the running one is unaffected.
+  - **For each node, in order:**
+    1. **Precondition.** The node must be online and healthy when its turn comes. A node
+       that is already offline, reconciling (REQ-42a) or unhealthy is not touched: it
+       fails, so a rollout never brings back a node someone else took out of service.
+    2. **Drain.** The gateway takes the node offline through the admin switch (REQ-42a),
+       with a reason that names the rollout's job id. It counts as offline only once the
+       sidecar has confirmed it. It then polls the sidecar's `/seriatim/status` with the
+       node's admin key until every slot is `free`: no request held, none draining
+       (REQ-10). A `stuck` slot fails the node at once, because only a restart frees it.
+    3. **Pull.** For each model, the gateway pulls through the sidecar's admin
+       `POST /api/pull`, with the node's admin key, never through Ollama's port. An offline
+       node accepts the pull (REQ-19a). The pull uses the shared pull-and-verify
+       implementation (REQ-54a), so the stream rule is exactly REQ-54's: the HTTP status is
+       200, no record has `error`, and the last record is `{"status":"success"}`.
+    4. **Verify.** The gateway reads the sidecar's `/api/tags` and confirms that every
+       model it pulled is listed (also part of REQ-54a).
+    5. **Online.** Only then does the gateway bring the node back through the admin switch
+       (REQ-42a), which refreshes its discovery before routing to it again.
+  - **Fail closed.** On any failure the node stays offline, the rollout stops, and the
+    reason is reported in the job and logged. No later node is touched; they stay
+    `queued` in a job whose state is `failed`. A node is **never** brought back online
+    automatically after a failure: a person looks at it, then calls `online` (REQ-42a).
+    - **What counts as a failure:** a precondition that doesn't hold; an admin call that
+      fails or whose outcome is unknown (REQ-42a's 502s); a drain that doesn't end within
+      its timeout; a stuck slot; a pull that breaks REQ-54's stream rule, fails to connect,
+      or stalls or overruns its timeouts; a model missing from `/api/tags`; an `online`
+      call that fails.
+    - **Every wait is bounded:** the drain, each pull (a total time and a stall time with
+      no record), and the tags read. The timeouts are gateway configuration; their
+      defaults are set in the slice's TD.
+    - **A gateway restart mid-rollout** loses the job, because the gateway persists nothing
+      (REQ-42a). The node being updated stays offline, since the sidecar keeps its state
+      across restarts (REQ-19a), and its offline reason names the job. That is the same
+      fail-closed outcome. A `GET` on the lost job id gets 404.
+  - **Access.**
+    - **An allow list.** The gateway configuration holds the admin key ids that may start
+      a rollout. The default is an empty list, so **no key may** until the operator names
+      one. A key that is not on the list gets 403, even with `admin` scope. Reading a job
+      needs only `admin` scope.
+    - **To the nodes,** the gateway uses each node's own admin key from its configuration
+      (REQ-31), as the admin switch does.
+    - **Logged.** Every rollout is logged at `WARNING` when it starts and when it ends,
+      with the key id that started it, the job id, the nodes and the models. Every node
+      state change is logged with the job id. A refused `POST` is logged with its key id.
+  - **The local-only check** is not run by the rollout. A pull changes no binding, service
+    setting or firewall rule, and the next weekly maintenance run covers it (REQ-53, REQ-55).
+
 ### 4.6 Repository and process
 
 - **REQ-50. Licence and contributing.** MIT licence. `CONTRIBUTING.md` says that bug-fix PRs
@@ -1516,8 +1607,9 @@ Four independent layers protect the bind:
    non-loopback upstream (REQ-1).
 2. **Firewall.** Inbound traffic is allowed to port 11434 (the sidecar) only. There is no rule
    for 11435.
-3. **Deploy check (REQ-53).** It runs after install, after every model update, after every
-   Ollama upgrade, and weekly.
+3. **Deploy check (REQ-53).** It runs after install, after every model update by
+   `update-models`, after every Ollama upgrade, and weekly. The weekly run covers model
+   updates the gateway runs (REQ-71).
 4. **Runtime exposure check (REQ-19).** It fails closed: nothing is admitted until the check
    passes.
 
@@ -1527,7 +1619,13 @@ The offline switch (REQ-19a, REQ-42a) can take a node out of service, so it is a
 route on both the sidecar and the gateway, and every change is logged with the key id. A
 holder of an admin key can already delete models, so the switch adds no new class of power.
 An offline node still serves the read-only routes, so taking it offline hides nothing from
-the operator.
+the operator. It also accepts admin pulls (REQ-19a), so its models can be updated while it
+is out of service.
+
+The gateway's model rollout (REQ-71, deferred) drives the switch and the pulls from the
+gateway. It uses only these existing routes, and the sidecar has **no route that starts a
+process**: no remote caller can make a node run a script. Starting a rollout needs an admin
+key that the gateway's allow list names, and the list is empty by default.
 
 ### 6.2 Key handling
 
@@ -1610,7 +1708,14 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
     `CUDA_DEVICE_ORDER=PCI_BUS_ID`;
   - the firewall has no rule for 11435.
 
-  It runs after install, after every model update, after every Ollama upgrade, and weekly.
+  - **When it runs:** after install, after every model update by `update-models` (REQ-54),
+    after every Ollama upgrade, and weekly (REQ-55).
+  - **Model updates the gateway runs** (REQ-71) are covered by the weekly run, not by a run
+    after each update. A pull changes none of what this check verifies (bindings, service
+    settings, the firewall), and the gateway cannot run the check remotely: the sidecar has
+    **no route that starts a process**, and none may be added to run this check or
+    `update-models` (a maintainer ruling on #93).
+
   It is tested with Pester (Windows) and bats (macOS), with system commands stubbed.
 - **REQ-54. Model update** (`deploy/<os>/update-models`).
   - It pulls models **through the sidecar's admin route** (`POST /api/pull` with the node's
@@ -1619,10 +1724,37 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
     the HTTP status is 200, no record contains `error`, and the last record is
     `{"status":"success"}`. Ollama can report an error inside an HTTP 200 stream, so the
     status alone proves nothing.
+  - **It does both through the shared pull-and-verify implementation** (REQ-54a), never
+    with its own stream parsing.
   - It prints one line per model, and exits non-zero if any pull failed.
   - It then runs the local-only check.
+- **REQ-54a. One pull-and-verify implementation** (a maintainer ruling on #93).
+  - **One implementation, two callers.** Pulling a model through a sidecar and verifying it
+    is implemented once, in Python, and used by both `update-models` (REQ-54) and the
+    gateway's model rollout (REQ-71). Neither has a second copy of the stream rule, and
+    `update-models` on every OS calls this implementation rather than reading the stream
+    in PowerShell or shell.
+  - **What it does,** for one sidecar URL, that node's admin key and one model:
+    1. sends `POST /api/pull` to the sidecar, never to Ollama's port;
+    2. reads the whole progress stream and applies REQ-54's rule: HTTP 200, no record with
+       `error`, and a last record of `{"status":"success"}`. A record that isn't valid JSON
+       fails the pull;
+    3. hands each progress record to its caller as it arrives, so the caller can report
+       progress (REQ-71 keeps only the latest);
+    4. bounds the pull by a total timeout and a stall timeout, either of which fails it;
+    5. reads the sidecar's `/api/tags` and confirms the model is listed.
+
+    It returns success, or a failure with a reason that names the step that failed. It
+    never treats a timeout, a broken stream or an unparseable answer as success (G5).
+  - **One test suite** covers it, for both callers: a 200 stream with an `error` record, a
+    non-200 status, a stream that ends without `success`, a `success` that isn't last, an
+    invalid record, a stall, an overrun, and a model missing from `/api/tags`.
+  - **Where it lives** (a module both packages depend on) is fixed in the TD of the first
+    slice that needs it: S5 for `update-models`, or the rollout's slice if that comes first.
 - **REQ-55. Weekly maintenance.**
   - It runs the model update, the local-only check and log rotation, and writes a summary.
+  - Its local-only check also covers every model update the gateway ran since the last
+    weekly run (REQ-53, REQ-71).
   - It does **not** update Seriatim (ruling Q10). Seriatim changes only through a verified
     release (§7.6, §7.7), or, until the follower has passed PPE on that host, the interim
     deployment (§7.8).
@@ -1635,6 +1767,9 @@ repository, is idempotent, logs with timestamps, and exits non-zero on any failu
   6. Upgrade the other nodes.
 
   Supported Ollama versions are listed in `README.md`; the first is 0.40.16.
+
+  The gateway's model rollout (REQ-71) never upgrades Ollama; upgrades follow these steps
+  only.
 
 ### 7.3 Windows (GPU node)
 
@@ -2487,6 +2622,15 @@ The maintainer ruled on the open questions of revision 1 as follows.
 Two points were raised in review and decided without change. Ollama **0.40.16** is the real
 version the evaluation ran. Per-mutant timeouts count as killed, and the whole-run timeout
 fails closed (REQ-61).
+
+**Issue #93 (2026-11-23).** The maintainer agreed the design for gateway-triggered model
+updates, with three changes, applied as follows:
+
+| # | ruling | where applied |
+|---|---|---|
+| 93-1 | A drained node accepts admin pulls | REQ-19a, §6.1a |
+| 93-2 | The weekly run covers the local-only check for gateway-run updates; no sidecar route starts a process | REQ-53, REQ-55, §6.1, §6.1a |
+| 93-3 | One shared pull-and-verify implementation for `update-models` and the gateway | REQ-54, REQ-54a, REQ-71 |
 
 ## 10. Open questions
 
