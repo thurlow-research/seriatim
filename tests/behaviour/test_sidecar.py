@@ -46,6 +46,7 @@ PCAP = Path(
 NODE_ENV = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]["node-a"]["environment"]
 DRAIN_S = float(NODE_ENV["SERIATIM_NODE_DRAIN_S"])
 NODE_ID = NODE_ENV["SERIATIM_NODE_ID"]
+BODY_TIMEOUT_S = float(NODE_ENV["SERIATIM_NODE_BODY_TIMEOUT_S"])  # bounds P4's held request
 MODEL = "qwen2.5:0.5b"
 EMBED_MODEL = "all-minilm:22m"
 # Generation on the PPE's CPUs takes seconds; nothing here waits longer than this for one answer.
@@ -53,6 +54,12 @@ GENERATION_TIMEOUT = httpx.Timeout(120.0, connect=5.0)
 WAIT_S = 60.0  # the upper bound of every poll for a state; a hang fails the test instead
 POLL_S = 0.2
 LATENCY_P99_S = 0.25  # TD §7: "The PPE bound is p99 < 250 ms"
+# P3: 48 tokens take over a second on the PPE's CPUs (2.2 s in CI), so a streamed answer's
+# first and final records are far more than this apart; a buffered one's arrive together.
+MIN_STREAM_GAP_S = 0.25
+# P7: from `docker compose start` to the sidecar's gate existing (the container, the
+# interpreter and the imports); its quarantine ends drain_s after that.
+STARTUP_ALLOWANCE_S = 15.0
 # The gated routes of the infer scope (TD §2.2 rule 4): what P2 counts as an inference request.
 INFER_PATHS = frozenset(
     {
@@ -168,7 +175,7 @@ class Captured:
     method: bytes
     target: bytes
     headers: dict[str, list[bytes]]
-    body: bytes
+    body: bytes | None  # None while the body is still arriving: the headers alone match an id
 
     @property
     def request_id(self) -> str | None:
@@ -260,8 +267,11 @@ def _streams(data: bytes) -> Iterator[tuple[bytes, list[tuple[int, float]]]]:
             for rel, ts, payload in sorted(
                 ((seq - base) % 2**32, ts, p) for seq, ts, p in conn.segments
             ):
-                if rel > len(stream):
-                    break  # a gap: nothing after it can be placed
+                # Loopback loses nothing, and tcpdump writes each packet in order, so a gap
+                # means the capture lost bytes: fail, rather than drop requests silently.
+                assert rel <= len(stream), (
+                    f"{PCAP}: a gap of {rel - len(stream)} bytes in a connection to Ollama"
+                )
                 new = payload[len(stream) - rel :]
                 if new:  # else a retransmission of bytes already placed
                     starts.append((len(stream), ts))
@@ -283,35 +293,46 @@ def _requests(stream: bytes, starts: list[tuple[int, float]]) -> Iterator[Captur
             name, _, value = line.partition(b":")
             headers.setdefault(name.strip().lower().decode("latin-1"), []).append(value.strip())
         j = end + 4
+        ts = starts[bisect.bisect_right(offsets, i) - 1][1]
         if "content-length" in headers:
             n = int(headers["content-length"][0])
-            if j + n > len(stream):
-                return  # still arriving
-            body, after = stream[j : j + n], j + n
+            body, after = (stream[j : j + n], j + n) if j + n <= len(stream) else (None, None)
         elif b"chunked" in b",".join(headers.get("transfer-encoding", [])).lower():
             body, after = _dechunk(stream, j)
-            if after is None:
-                return
         else:
             body, after = b"", j
-        ts = starts[bisect.bisect_right(offsets, i) - 1][1]
         yield Captured(ts, method, target, headers, body)
+        if after is None:
+            return  # the rest of this connection is still arriving
         i = after
 
 
-def _dechunk(stream: bytes, j: int) -> tuple[bytes, int | None]:
+def _dechunk(stream: bytes, j: int) -> tuple[bytes | None, int | None]:
+    """A chunked body and where it ends, or (None, None) while it is still arriving. Every
+    chunk's CRLF and the trailer section's closing empty line are checked (RFC 9112 §7.1)."""
     body = bytearray()
     while True:
         eol = stream.find(b"\r\n", j)
         if eol < 0:
-            return b"", None
-        size = int(stream[j:eol].split(b";")[0], 16)
+            return None, None
+        size_field = stream[j:eol].split(b";")[0].strip()
+        assert size_field and all(c in b"0123456789abcdefABCDEF" for c in size_field), (
+            f"a malformed chunk size {stream[j:eol]!r}"
+        )
+        size = int(size_field, 16)
         j = eol + 2
         if size == 0:
-            trailer_end = stream.find(b"\r\n", j)
-            return (bytes(body), trailer_end + 2) if trailer_end >= 0 else (b"", None)
+            while True:  # trailer fields, then the empty line
+                eol = stream.find(b"\r\n", j)
+                if eol < 0:
+                    return None, None
+                if eol == j:
+                    return bytes(body), j + 2
+                assert b":" in stream[j:eol], f"a malformed trailer {stream[j:eol]!r}"
+                j = eol + 2
         if j + size + 2 > len(stream):
-            return b"", None
+            return None, None
+        assert stream[j + size : j + size + 2] == b"\r\n", "a chunk without its CRLF"
         body += stream[j : j + size]
         j += size + 2
 
@@ -322,16 +343,21 @@ def captured() -> list[Captured]:
     return sorted(found, key=lambda r: r.ts)
 
 
-def wait_captured(ids: set[str]) -> dict[str, list[Captured]]:
+def wait_captured(ids: set[str], *, bodies: bool = False) -> dict[str, list[Captured]]:
     """The captured requests carrying each id, once every id has reached the capture file
-    (tcpdump writes each packet as it arrives, `-U`, but the file is read from outside)."""
+    (tcpdump writes each packet as it arrives, `-U`, but the file is read from outside). Ids
+    match on the headers alone; with `bodies`, each one's body must have arrived too."""
 
     def check() -> dict[str, list[Captured]] | None:
         by_id: dict[str, list[Captured]] = {}
         for r in captured():
             if r.request_id in ids:
                 by_id.setdefault(r.request_id, []).append(r)
-        return by_id if set(by_id) == ids else None
+        if set(by_id) != ids:
+            return None
+        if bodies and any(r.body is None for rs in by_id.values() for r in rs):
+            return None
+        return by_id
 
     return wait_for(f"requests {sorted(ids)} in the capture", check)
 
@@ -393,7 +419,7 @@ def test_p1_the_bytes_ollama_receives_are_the_bytes_sent_and_num_ctx_is_loaded()
         assert r.status_code == 200, r.text
         assert r.headers["x-seriatim-gate"] == "acquired"
         assert r.json()["done"] is True
-        [wire] = wait_captured({request_id})[request_id]
+        [wire] = wait_captured({request_id}, bodies=True)[request_id]
         assert (wire.method, wire.target) == (b"POST", b"/api/generate")
         assert wire.body == body
         assert wire.headers["content-length"] == [str(len(body)).encode()]
@@ -406,7 +432,8 @@ def test_p1_the_bytes_ollama_receives_are_the_bytes_sent_and_num_ctx_is_loaded()
 def test_p3_a_stream_arrives_as_ndjson_before_it_ends():
     wait_free()
     data = b""
-    first = None
+    arrived: list[float] = []  # when each complete record reached the client
+    first_byte = None
     t0 = time.perf_counter()
     with httpx.stream(
         "POST",
@@ -418,17 +445,27 @@ def test_p3_a_stream_arrives_as_ndjson_before_it_ends():
         assert r.headers["content-type"].startswith("application/x-ndjson")
         assert r.headers["x-seriatim-gate"] == "acquired"
         for chunk in r.iter_raw():
-            if first is None and chunk:
-                first = time.perf_counter() - t0
+            now = time.perf_counter() - t0
+            if first_byte is None and chunk:
+                first_byte = now
+            arrived += [now] * chunk.count(b"\n")
             data += chunk
     total = time.perf_counter() - t0
     records = ndjson(data)
     assert data.endswith(b"\n")
-    assert len(records) > 2
+    assert len(records) == len(arrived) > 2
     assert all(rec["done"] is False for rec in records[:-1])
     assert records[-1]["done"] is True
-    assert first is not None and first < total, (first, total)
-    print(f"P3: {len(records)} records, first byte {first * 1000:.0f} ms of {total * 1000:.0f} ms")
+    assert first_byte is not None and first_byte < total, (first_byte, total)
+    # Streamed, not buffered: the first record reached the client well before the final one.
+    # A sidecar that collected the response would deliver them together.
+    gap = arrived[-1] - arrived[0]
+    assert gap >= MIN_STREAM_GAP_S, (arrived[0], arrived[-1])
+    print(
+        f"P3: {len(records)} records, first byte {first_byte * 1000:.0f} ms, first record "
+        f"{arrived[0] * 1000:.0f} ms, final record {arrived[-1] * 1000:.0f} ms "
+        f"of {total * 1000:.0f} ms"
+    )
 
 
 @pytest.mark.td("P2")
@@ -501,6 +538,21 @@ def test_p4_a_pull_completes_while_a_gated_request_is_held():
         # The gate admits on the headers, then waits for the body (TD §3.3 lines 6 and 12):
         # half a body holds the slot for as long as the test needs it, with no model running.
         held.sendall(head + body[:8])
+        t_hold = time.monotonic()
+        # The hold lasts body_timeout_s (raised for the PPE, ppe/compose.yaml). Everything below
+        # must finish well inside it, or the held request ends in 408 and the check means
+        # nothing, so a slow registry fails here, saying so.
+        budget = BODY_TIMEOUT_S - 30
+
+        def within_the_hold(step: str) -> None:
+            spent = time.monotonic() - t_hold
+            if spent > budget:
+                pytest.fail(
+                    f"P4: {step} took the hold to {spent:.0f} s, past its {budget:.0f} s budget "
+                    f"(body_timeout_s {BODY_TIMEOUT_S:g} s): the registry was too slow to show "
+                    "anything about the sidecar"
+                )
+
         wait_for("the held request to take the slot", busy, timeout=10)
 
         def tags() -> set[str]:
@@ -515,16 +567,21 @@ def test_p4_a_pull_completes_while_a_gated_request_is_held():
         progress = b""
         t0 = time.perf_counter()
         with httpx.stream(
-            "POST", f"{BASE_URL}/api/pull", json={"model": EMBED_MODEL}, timeout=GENERATION_TIMEOUT
+            "POST",
+            f"{BASE_URL}/api/pull",
+            json={"model": EMBED_MODEL},
+            timeout=httpx.Timeout(budget, connect=5.0),
         ) as r:
             assert r.status_code == 200 and r.headers["x-seriatim-gate"] == "ungated"
             assert r.headers["content-type"].startswith("application/x-ndjson")
             for chunk in r.iter_raw():
                 progress += chunk
+                within_the_hold("the pull")
         records = ndjson(progress)
         assert not [rec for rec in records if "error" in rec], records
         assert records[-1] == {"status": "success"}, records[-3:]
         assert EMBED_MODEL in tags()
+        within_the_hold("the pull and its checks")
         assert busy(), "the gated request was no longer held when the pull ended"
         took = time.perf_counter() - t0
         print(f"P4: pull of {EMBED_MODEL}, {len(records)} records in {took:.1f} s")
@@ -539,7 +596,8 @@ def test_p4_a_pull_completes_while_a_gated_request_is_held():
 
 
 def ttft(base: str, prompt: str) -> float:
-    """Seconds from sending a streamed generation to its first record."""
+    """Seconds from sending a streamed generation to its first complete NDJSON record, so a
+    flush of the headers or of a partial line can't count as the first token."""
     t = time.perf_counter()
     with httpx.stream(
         "POST",
@@ -552,9 +610,11 @@ def ttft(base: str, prompt: str) -> float:
         timeout=GENERATION_TIMEOUT,
     ) as r:
         assert r.status_code == 200
-        for chunk in r.iter_raw():
-            if chunk:
-                return time.perf_counter() - t
+        for line in r.iter_lines():
+            if line:
+                took = time.perf_counter() - t
+                assert "response" in json.loads(line), line
+                return took
     raise AssertionError("the probe streamed no record")
 
 
@@ -581,11 +641,32 @@ def test_p6_a_disconnect_lets_the_next_generation_start_soon():
     after = ttft(DIRECT_URL, "Hi.")
     extra = after - baseline
     summary(
-        f"P6 cancellation latency (CPU evidence only): idle first token {baseline * 1000:.0f} ms, "
-        f"after a disconnect {after * 1000:.0f} ms, extra {extra * 1000:.0f} ms "
+        f"P6 cancellation latency (CPU evidence only): idle first record {baseline * 1000:.0f} "
+        f"ms, after a disconnect {after * 1000:.0f} ms, extra {extra * 1000:.0f} ms "
         f"(limit drain_s / 2 = {DRAIN_S / 2:g} s)"
     )
     assert extra <= DRAIN_S / 2
+
+
+@dataclass
+class Answer:
+    status: int
+    headers: httpx.Headers
+    at: float  # time.monotonic() when the response headers arrived
+    body: bytes
+
+
+def gated_answer() -> Answer | None:
+    """A gated request, timed at its response headers (not after a generation), or None when
+    nothing answered: while node-a is down, the host's port forwarder accepts and resets."""
+    try:
+        with httpx.stream(
+            "POST", f"{BASE_URL}/api/chat", json=chat("Say hi.", 4, stream=False), timeout=60
+        ) as r:
+            at = time.monotonic()
+            return Answer(r.status_code, r.headers, at, r.read())
+    except httpx.TransportError:
+        return None
 
 
 @pytest.mark.td("P7")
@@ -598,44 +679,40 @@ def test_p7_a_restart_mid_generation_aborts_the_stream_and_starts_in_quarantine(
         assert r.status_code == 200
         lines = r.iter_lines()
         records.append(json.loads(next(lines)))
+        assert records[0]["done"] is False  # so the kill lands mid-generation
         compose("kill", "node-a")
         with pytest.raises(httpx.TransportError):  # the stream ends without its terminator
             for line in lines:
                 if line:
                     records.append(json.loads(line))
     assert not any(rec.get("done") for rec in records)
+    # The new process, and its gate, start after this, so its quarantine ends no sooner
+    # than DRAIN_S from here.
+    t_start = time.monotonic()
     compose("start", "node-a")
 
-    def gated() -> httpx.Response | None:
-        try:
-            return httpx.post(
-                f"{BASE_URL}/api/chat", json=chat("Say hi.", 4, stream=False), timeout=60
-            )
-        except httpx.TransportError:  # not listening yet (the host's port forwarder resets)
-            return None
-
-    first = wait_for("node-a to accept again", gated, timeout=WAIT_S)
-    t_first = time.monotonic()
-    assert first.status_code == 503, first.text
-    assert first.json()["error_code"] == "NODE_STARTING"
+    first = wait_for("node-a to accept again", gated_answer, timeout=WAIT_S)
+    assert first.status == 503, first.body
+    assert json.loads(first.body)["error_code"] == "NODE_STARTING"
     assert first.headers["x-seriatim-gate"] == "refused"
-    retry_after = int(first.headers["retry-after"])
-    assert 1 <= retry_after <= math.ceil(DRAIN_S)
+    assert 1 <= int(first.headers["retry-after"]) <= math.ceil(DRAIN_S)
     while True:
-        r = gated()
-        assert r is not None
-        if r.status_code != 503:
+        answer = gated_answer()
+        assert answer is not None
+        if answer.status != 503:
             break
-        assert r.json()["error_code"] == "NODE_STARTING"
-        assert time.monotonic() - t_first < DRAIN_S + WAIT_S
+        assert json.loads(answer.body)["error_code"] == "NODE_STARTING"
+        assert answer.at - t_start < DRAIN_S + STARTUP_ALLOWANCE_S + WAIT_S
         time.sleep(POLL_S)
-    waited = time.monotonic() - t_first
-    assert r.status_code == 200, r.text
-    assert r.headers["x-seriatim-gate"] == "acquired"
-    # Retry-After is the quarantine left, rounded up, so the 200 can't come a second earlier.
-    assert waited >= retry_after - 1, (waited, retry_after)
-    assert waited <= retry_after + 2 * POLL_S + 5, (waited, retry_after)
+    assert answer.status == 200, answer.body
+    assert answer.headers["x-seriatim-gate"] == "acquired"
+    admitted = answer.at - t_start
+    # A full drain_s of quarantine, measured from the restart, not from the server's own
+    # Retry-After. The upper bound allows for the container and the interpreter to start.
+    assert admitted >= DRAIN_S, (admitted, DRAIN_S)
+    assert admitted <= DRAIN_S + STARTUP_ALLOWANCE_S + 2 * POLL_S, (admitted, DRAIN_S)
     summary(
-        f"P7: first answer after the restart NODE_STARTING (Retry-After {retry_after} s), "
-        f"200 after {waited:.1f} s more (drain_s {DRAIN_S:g} s)"
+        f"P7: after the restart, first answer NODE_STARTING at {first.at - t_start:.1f} s, "
+        f"first 200 (headers) at {admitted:.1f} s (drain_s {DRAIN_S:g} s, startup allowance "
+        f"{STARTUP_ALLOWANCE_S:g} s)"
     )
