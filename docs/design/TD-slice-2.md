@@ -44,15 +44,15 @@ Across the PR series of §9. No new dependency: everything is in the standard li
 |---|---|---|
 | 1 | `node/seriatim_node/auth.py` (new) | `Principal`, `KeyEntry`, `Keyring`, `read_credentials()`, `allows()`, `authorise()`, `new_key()`, `keygen()` |
 | 2 | `node/seriatim_node/config.py` | the `keys` setting, its validation, and the REQ-15 refusal (load step 7) |
-| 3 | `node/seriatim_node/gate.py` | `classify()` gives `/seriatim/*` 404 and 405 the `infer` scope (§4, Q6) |
+| 3 | `node/seriatim_node/gate.py` | `classify()` gives `/seriatim/*` 404 and 405 the `admin` scope, the contract's `x-seriatim-unknown-endpoint` rule (§2.3, Q6) |
 | 4 | `node/seriatim_node/app.py` | the dispatcher's auth step, the 401/403/400 replies, the principal in the scope, the `client` log field, `main(argv)` with `keygen`, the hourly warning task |
 | 5 | `node/seriatim_node/proxy.py` | the `client` field on the proxy's log line; the strip lists are unchanged |
 | 6 | `tests/node/test_auth.py` (new) | A1 to A5 |
 | 7 | `tests/node/test_http_auth.py` (new) | A6 to A12 |
-| 8 | `tests/node/harness.py` | `make_settings(keys=…)`, test mode by default, the log reader keeps `event: request` lines only (Appendix B) |
+| 8 | `tests/node/harness.py` | `make_settings(keys=…)`, test mode by default, and `log_lines()`, the shared log reader, which keeps `event: request` lines only (Appendix B) |
 | 9 | `tests/node/test_config.py` | the S1 tests' baseline gains a key (Appendix B) |
-| 10 | `tests/node/test_http.py` | L1's field list gains `client`; the shared log reader (Appendix B) |
-| 11 | `tests/node/test_gate.py` | K1's `/seriatim/*` 404 and 405 rows carry `infer` (Q6) |
+| 10 | `tests/node/test_http.py` | L1's field list gains `client`; `_log_lines` is replaced by `harness.log_lines` (Appendix B) |
+| 11 | `tests/node/test_gate.py` | K1's `/seriatim/*` 404 and 405 rows carry `admin` (Q6) |
 | 12 | `.env.example` | says that keys are set in the TOML file, never in the environment (Q1) |
 | 13 | `docs/design/TD-slice-1.md` | the S1 rows whose tests S2 changes (C1, K1, L1, and §2.2's `/seriatim/*` scope note; Appendix B) |
 | 14 | `docs/design/TD-slice-2.md` | the details fixed by the code, and `Enforced: yes` in S2-5 |
@@ -118,9 +118,12 @@ strips the value's leading and trailing whitespace. In order:
 3. **The scheme** is the value up to its first space or tab. It must be `Bearer`, compared
    without regard to case (Q8). Any other scheme, `Basic` and `Digest` included, →
    `Ambiguous("a scheme other than Bearer")`.
-4. **The token** is what follows the scheme and one or more spaces (Q9). No token
-   (`Bearer` alone) → `Missing` (Q10). A token that contains a space, a tab or any other byte
-   below `0x21` → `Ambiguous("whitespace in the key")`. So `Bearer a, Bearer b`, the form a
+4. **The separator** after the scheme must be one or more spaces (Q9; RFC 6750 §2.1's
+   `1*SP`). A separator that contains a tab, such as `Bearer<TAB><key>` or
+   `Bearer <TAB><key>`, → `Ambiguous("whitespace in the key")`, so steps 3 and 4 agree on
+   where the scheme ends. **The token** is what follows the separator. No token (`Bearer`
+   alone) → `Missing` (Q10). A token that contains a space, a tab or any other byte below
+   `0x21` → `Ambiguous("whitespace in the key")`. So `Bearer a, Bearer b`, the form a
    proxy gives two headers folded into one, is ambiguous.
 5. Otherwise → `Presented(token)`, with the token's bytes exactly as received.
 
@@ -190,9 +193,10 @@ def keyring(settings: Settings) -> Keyring | None   # None in unauthenticated te
   `ConfigError("SERIATIM_NODE_KEYS: keys are set in the SERIATIM_NODE_CONFIG file only")`
   (Q1). It is a field, so S1's rule alone would accept it.
 - **Step 3 (build).** A `ValidationError` inside `keys` names the entry:
-  `SERIATIM_NODE_KEYS[<index>].<field>: <pydantic's message>`. Pydantic's message never
-  contains the input value, and the code never adds it, so neither a hash nor anything else
-  from the file is printed.
+  `SERIATIM_NODE_KEYS[<index>].<field>: <err["msg"]>`, built from the first error's `loc` and
+  `msg` only, as S1's step 3 does. `str(ValidationError)` is never used, because it includes
+  each error's `input_value`. **Ids may be named in errors; hashes never are**: step 7 names
+  the ids involved, and no message contains a configured `sha256` or a presented key.
 - **Step 7 (keys), new, after step 6:**
   - more than `MAX_KEYS` entries → `ConfigError` naming `SERIATIM_NODE_KEYS`;
   - two entries with the same `id` → `ConfigError` naming the id;
@@ -221,10 +225,15 @@ unchanged.
 becomes the scope the request needs (REQ-5, "Their scopes are fixed by the contract"):
 - `GET /seriatim/health` → scope `NONE` (the contract's `none`), as in S1;
 - an unknown `/seriatim/*` path (404), and a known one with the wrong method (405), → scope
-  `INFER` (Q6), so they need a valid key of either scope before they get their 404 or 405.
-  That includes `POST` and `HEAD` on `/seriatim/health`. S4a and S4c add their routes to
-  `SERIATIM_ROUTES` with their contract scopes (`/seriatim/status`: `infer`;
-  `/seriatim/admin/*`: `admin`).
+  `ADMIN`. That is the contract's rule for every method and path pair it doesn't list,
+  `x-seriatim-unknown-endpoint: { x-seriatim-gate: gated, x-seriatim-scope: admin }`
+  (`contract/openapi.yaml`, lines 525–526), which REQ-5's "everything else … needs the
+  `admin` scope" states too. So an `admin` key gets the 404 or 405, and an `infer` key gets
+  403 `FORBIDDEN_SCOPE`: the answer it gets from `/seriatim/admin/*` once S4c serves those
+  routes, and before. That includes `POST` and `HEAD` on `/seriatim/health`. S4a and S4c add
+  their routes to `SERIATIM_ROUTES` with their contract scopes (`/seriatim/status`: `infer`;
+  `/seriatim/admin/*`: `admin`). Q6 asks the maintainer to confirm that the rule covers
+  `/seriatim/*`.
 
 That keeps ADR-001 D6's rule that the scope a route needs comes from the same `classify()`
 that decides admission. K1's three `/seriatim/*` rows change with it (Appendix B).
@@ -357,7 +366,7 @@ with the principal in the scope, and is served as S1 serves it.
 | route class (REQ-5) | needs | no key | wrong key | `infer` key | `admin` key |
 |---|---|---|---|---|---|
 | `GET /seriatim/health` | none | passes | passes (not read, Q7) | passes | passes |
-| other `/seriatim/*` (404, 405) | `infer` (Q6) | 401 `AUTH_MISSING` | 401 `AUTH_INVALID` | 404 / 405 | 404 / 405 |
+| other `/seriatim/*` (404, 405) | `admin` (the contract's unknown-endpoint rule; Q6) | 401 `AUTH_MISSING` | 401 `AUTH_INVALID` | 403 `FORBIDDEN_SCOPE` | 404 / 405 |
 | ungated, `infer`: `GET /`, `HEAD /`, `GET /api/tags`, `GET /api/ps`, `GET /api/version`, `POST /api/show`, `GET /v1/models` | `infer` | 401 `AUTH_MISSING` | 401 `AUTH_INVALID` | passes | passes |
 | ungated, `admin`: `POST /api/pull`, `POST /api/push`, `POST /api/copy`, `DELETE /api/delete`, `HEAD`/`POST /api/blobs/sha256:<64 hex>` | `admin` | 401 `AUTH_MISSING` | 401 `AUTH_INVALID` | 403 `FORBIDDEN_SCOPE` | passes |
 | gated, `infer`: `POST /api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | `infer` | 401 `AUTH_MISSING` | 401 `AUTH_INVALID` | passes | passes |
@@ -433,8 +442,11 @@ seriatim-node keygen --id <id> --scope infer|admin
 ```
 
 - **Arguments.** Both are required. `--id` follows the key-id rule of §6; `--scope` is `infer`
-  or `admin`. A missing, repeated or invalid argument, or any other argument, prints argparse's
-  usage on stderr and exits 2.
+  or `admin`. A missing or invalid argument, or any other argument, prints argparse's usage on
+  stderr and exits 2. argparse's default `store` action keeps the last of a repeated option,
+  so both options use a small `store` action, `Once`, that calls `parser.error(…)` when its
+  option has already been given: `--id a --id b` and `--scope infer --scope admin` also exit 2
+  with usage, never with the last value.
 - **The key.** `new_key()`: 32 bytes from `secrets.token_bytes`, encoded as Q2 says
   (recommended: `seriatim_` followed by the 43-character unpadded base64url form,
   `secrets.token_urlsafe(32)`). The prefix lets a secret scanner recognise a leaked key.
@@ -461,18 +473,18 @@ committed. The http tests write their `[[keys]]` file under `tmp_path`.
 
 | id | test | tier | REQ |
 |---|---|---|---|
-| A1 | `read_credentials`, table-driven: no header → `Missing`; `Authorization:` with an empty value → `Missing`; `Bearer` alone → `Missing`; `Bearer <key>` → `Presented` with the exact bytes; `bearer <key>` and `BEARER <key>` → `Presented` (Q8); `Bearer  <key>` (two spaces) → `Presented` (Q9); two `Authorization` headers, equal and different, one of them valid → `Ambiguous("two Authorization headers")`; `Basic <b64>`, `Digest x`, `Token <key>` → `Ambiguous("a scheme other than Bearer")`; `Bearer a b`, `Bearer a\tb`, `Bearer a, Bearer b` → `Ambiguous("whitespace in the key")`. `X-API-Key: <key>` alone, `Cookie: key=<key>`, and a key only in the query string → `Missing`. Hypothesis: any token of `b64token` characters round-trips to `Presented` with the same bytes, and any token with an embedded space or tab is `Ambiguous` | unit | 13 |
+| A1 | `read_credentials`, table-driven: no header → `Missing`; `Authorization:` with an empty value → `Missing`; `Bearer` alone → `Missing`; `Bearer <key>` → `Presented` with the exact bytes; `bearer <key>` and `BEARER <key>` → `Presented` (Q8); `Bearer  <key>` (two spaces) → `Presented` (Q9); two `Authorization` headers, equal and different, one of them valid → `Ambiguous("two Authorization headers")`; `Basic <b64>`, `Digest x`, `Token <key>` → `Ambiguous("a scheme other than Bearer")`; `Bearer a b`, `Bearer a\tb`, `Bearer a, Bearer b`, `Bearer\t<key>` and `Bearer \t<key>` (a tab in the separator) → `Ambiguous("whitespace in the key")`. `X-API-Key: <key>` alone, `Cookie: key=<key>`, and a key only in the query string → `Missing`. Hypothesis: any token of `b64token` characters round-trips to `Presented` with the same bytes, and any token with an embedded space or tab is `Ambiguous` | unit | 13 |
 | A2 | `Keyring.match` and `allows`. With 5 keys, `hmac.compare_digest` (patched in `auth`, counting) is called exactly 5 times when the key matches the first entry, the third, the last, and none; SHA-256 is computed once per call. The matching entry's `Principal` (id and scope) is returned; a key differing in one character, the key's hex hash sent as the key, and an empty token → `None`. `allows` for every (have, need) pair of `INFER`/`ADMIN` × `NONE`/`INFER`/`ADMIN`: only `INFER` needing `ADMIN` is false. `Keyring` refuses 0 entries, 257 entries, a repeated id and a repeated digest (`ValueError`) | unit | 13, 14 |
-| A3 | Loading keys. A config file with an `infer` and an `admin` key → `settings.keys` in order, and `keyring(settings)` matches each key with its id and scope; `sha256` in upper case is accepted and equal to the lower-case one. Each of these → `ConfigError` naming `SERIATIM_NODE_KEYS[<i>].<field>` or `SERIATIM_NODE_KEYS`: a table with no `id`, `scope` or `sha256`; an unknown field; `scope = "read"`; an id `Client`, `-a`, 33 characters or empty; a `sha256` of 63 or 65 digits, or with a non-hex digit; `keys = "x"`; 257 tables; two tables with one id; two tables with one hash in different cases. `SERIATIM_NODE_KEYS` set in the environment → `ConfigError` naming it, even when it is valid JSON (Q1). No error message contains the configured hash or any other value from the file | unit | 23, 13 |
+| A3 | Loading keys. A config file with an `infer` and an `admin` key → `settings.keys` in order, and `keyring(settings)` matches each key with its id and scope; `sha256` in upper case is accepted and equal to the lower-case one. Each of these → `ConfigError` naming `SERIATIM_NODE_KEYS[<i>].<field>` or `SERIATIM_NODE_KEYS`: a table with no `id`, `scope` or `sha256`; an unknown field; `scope = "read"`; an id `Client`, `-a`, 33 characters or empty; a `sha256` of 63 or 65 digits, or with a non-hex digit; `keys = "x"`; 257 tables; two tables with one id (the message names the id); two tables with one hash in different cases (the message names both ids). `SERIATIM_NODE_KEYS` set in the environment → `ConfigError` naming it, even when it is valid JSON (Q1). No error message contains a configured `sha256` in either case, including the messages for a malformed `sha256` and a duplicate one | unit | 23, 13 |
 | A4 | Startup refusals (REQ-15). No keys and no `ALLOW_UNAUTHENTICATED` → `ConfigError` naming `SERIATIM_NODE_KEYS`, and `main()` exits 2 with that message on stderr and never calls `uvicorn.run`. No keys with `ALLOW_UNAUTHENTICATED=true` → starts, `keyring` is `None`, the startup `WARNING` is captured. Keys with `ALLOW_UNAUTHENTICATED=true` → starts with a `Keyring` (Q4). Keys and `LISTEN_HOST=0.0.0.0` without `ALLOW_UNAUTHENTICATED` → still `ConfigError` naming `SERIATIM_NODE_LISTEN_HOST` (S2 does not relax the listen rule). `create_app` given `Settings(keys=(), allow_unauthenticated=False)` built directly → `ConfigError` | process | 15, 23 |
-| A5 | `keygen`. `main(["keygen", "--id", "client-a", "--scope", "infer"])` exits 0 and prints the key, a blank line and the table; the key has the Q2 form and decodes to 32 bytes; the table's `sha256` is the SHA-256 of the printed key; written to a config file, the table loads (A3) and the sidecar built from it accepts the printed key with id `client-a` and scope `infer` (one http request). Two runs print different keys. It succeeds with an invalid `SERIATIM_NODE_SLOTS` and an unreadable `SERIATIM_NODE_CONFIG` in the environment (it reads neither), creates no file in the working directory or the lock directory, and calls neither `acquire_singleton` nor `uvicorn.run` (patched). `--scope read`, `--id Bad`, a missing `--id`, an extra argument, `main(["keygen"])` and `main(["nope"])` each exit 2 with usage on stderr. `main([])` serves as in S1 (TD-slice-1 C8) | process | §6.2, 23 |
+| A5 | `keygen`. `main(["keygen", "--id", "client-a", "--scope", "infer"])` exits 0 and prints the key, a blank line and the table; the key has the Q2 form and decodes to 32 bytes; the table's `sha256` is the SHA-256 of the printed key; written to a config file, the table loads (A3) and the sidecar built from it accepts the printed key with id `client-a` and scope `infer` (one http request). Two runs print different keys. It succeeds with an invalid `SERIATIM_NODE_SLOTS` and an unreadable `SERIATIM_NODE_CONFIG` in the environment (it reads neither), creates no file in the working directory or the lock directory, and calls neither `acquire_singleton` nor `uvicorn.run` (patched). `--scope read`, `--id Bad`, a missing `--id`, a repeated `--id` (`--id a --id b`), a repeated `--scope` (even with the same value), an extra argument, `main(["keygen"])` and `main(["nope"])` each exit 2 with usage on stderr and print no key. `main([])` serves as in S1 (TD-slice-1 C8) | process | §6.2, 23 |
 | A6 | 401 across every route class. With keys configured, for one pair of each class in §4 (every pair of the REQ-5 lists, from `tests/fixtures/route-pairs.json`, plus `POST /api/create`, `OPTIONS /api/tags`, `PUT /api/chat`, `POST /api/new-feature`, `GET /seriatim/nope` and `POST /seriatim/health`): no key → 401 `AUTH_MISSING`; a key that is not configured → 401 `AUTH_INVALID`. Each: `WWW-Authenticate: Bearer` exactly once, `retryable: false`, `replay_safe: true`, `X-Seriatim-Gate: ungated`, the body validates against `ErrorEnvelope` (K-OAS2); `fake_ollama` recorded nothing; every slot is `FREE` | http | 13, 25 |
-| A7 | The scope matrix of §4, for the same pairs as A6: an `infer` key → the `infer` classes pass (the gated ones get Ollama's answer with `X-Seriatim-Gate: acquired`, the ungated ones `ungated`, `/seriatim/nope` 404 and `POST /seriatim/health` 405), and every `admin` class, unknown endpoints included, gets 403 `FORBIDDEN_SCOPE` with no `WWW-Authenticate`, nothing recorded upstream and no slot taken; an `admin` key → every class passes. A 403's log line has `client` equal to the `infer` key's id | http | 14, 5 |
-| A8 | Health. With keys configured, `GET /seriatim/health` with no key, a wrong key, two `Authorization` headers and `Basic x` → 200 `{"status":"ok"}` each time (Q7); its line is still at `DEBUG` with `client: null` (TD-slice-1 HL9). `HEAD /seriatim/health` and `POST /seriatim/health` with no key → 401 `AUTH_MISSING`; with an `infer` key → 405 with `Allow: GET` (Q6) | http | 13, 18 |
-| A9 | Ambiguous credentials over HTTP (raw socket where httpx would merge headers): two `Authorization` headers, one of them a valid `admin` key; `Basic <b64>`; `Bearer <key> x`; `Bearer a, Bearer b` → 400 `AUTH_AMBIGUOUS` on a gated, an ungated and a `/seriatim/*` route; no `WWW-Authenticate`; nothing recorded upstream; no slot taken; the message names the reason and contains no header value. A valid key in `X-API-Key` with no `Authorization` → 401 `AUTH_MISSING` with the `X-API-Key` hint (Q11); with a valid Bearer key as well → passes, and Ollama receives neither header. `?key=<valid key>` and `Cookie: key=<valid key>` with no `Authorization` → 401 `AUTH_MISSING` | http | 13 |
+| A7 | The scope matrix of §4, for the same pairs as A6: an `infer` key → the `infer` classes pass (the gated ones get Ollama's answer with `X-Seriatim-Gate: acquired`, the ungated ones `ungated`), and every `admin` class, unknown endpoints, `/seriatim/nope` and `POST /seriatim/health` included (Q6), gets 403 `FORBIDDEN_SCOPE`: no `WWW-Authenticate`, `error_code: FORBIDDEN_SCOPE`, `retryable: false`, `replay_safe: true`, `source: sidecar`, `node` equal to `settings.id`, `X-Seriatim-Gate: ungated`, and the body validates against `ErrorEnvelope` (K-OAS2); nothing recorded upstream and no slot taken. An `admin` key → every class passes; `/seriatim/nope` gets 404 and `POST /seriatim/health` 405. A 403's log line has `client` equal to the `infer` key's id | http | 14, 5, 25 |
+| A8 | Health. With keys configured, `GET /seriatim/health` with no key, a wrong key, two `Authorization` headers and `Basic x` → 200 `{"status":"ok"}` each time (Q7); its line is still at `DEBUG` with `client: null` (TD-slice-1 HL9). `HEAD /seriatim/health` and `POST /seriatim/health` with no key → 401 `AUTH_MISSING`; with an `infer` key → 403 `FORBIDDEN_SCOPE`; with an `admin` key → 405 with `Allow: GET` (Q6) | http | 13, 18 |
+| A9 | Ambiguous credentials over HTTP (raw socket where httpx would merge headers): two `Authorization` headers, one of them a valid `admin` key; `Basic <b64>`; `Bearer <key> x`; `Bearer a, Bearer b` → 400 `AUTH_AMBIGUOUS` on a gated, an ungated and a `/seriatim/*` route: `error_code: AUTH_AMBIGUOUS`, `retryable: false`, `replay_safe: true`, `source: sidecar`, `node` equal to `settings.id`, `X-Seriatim-Gate: ungated`, and the body validates against `ErrorEnvelope` (K-OAS2); no `WWW-Authenticate`; nothing recorded upstream; no slot taken; the message names the reason and contains no header value. A valid key in `X-API-Key` with no `Authorization` → 401 `AUTH_MISSING` with the `X-API-Key` hint (Q11); with a valid Bearer key as well → passes, and Ollama receives neither header. `?key=<valid key>` and `Cookie: key=<valid key>` with no `Authorization` → 401 `AUTH_MISSING` | http | 13, 25 |
 | A10 | Auth comes first (§3). With no key: a gated request while the only slot is held → 401, never 429; during the startup quarantine → 401, never 503 `NODE_STARTING`; with `Content-Length` over `max_body_bytes` → 401, never 413; in each case the slot holder is undisturbed and the gate state is unchanged. Over a raw socket, the headers of a `POST /api/chat` with `Content-Length: 4096` and no body bytes → the 401 arrives before any body is sent, with `Connection: close`, and the connection is closed; an `Expect: 100-continue` request gets its 401 with no `100 Continue`. A 401 to a `GET` with no body keeps the connection, and the next request on it with a valid key gets 200. S1's earlier checks still win: HTTP/1.0 → 505, `/api/../chat` → 400 `BAD_PATH`, `Transfer-Encoding` with `Content-Length` → 400 `BAD_REQUEST_BODY`, each with no key (Q5) | http | 13, 3, 20, 20a |
-| A11 | The key never leaves. With a valid `infer` key on a gated `/api/chat` (non-streaming and streaming) and on `/api/tags`, and a valid `admin` key on a streamed `POST /api/blobs/sha256:<hex>`, each also sending `X-API-Key`, `Cookie` and `Proxy-Authorization` → `fake_ollama` recorded none of `Authorization`, `X-API-Key`, `Cookie` or `Proxy-Authorization`. Across one request of every outcome in §5 and TD-slice-1 §5 that S2 can reach (200, 400 `AUTH_AMBIGUOUS`, 401 both ways, 403, 404, 413, 429, 502), no log line, response body or response header contains the key, its SHA-256 in hex, or the configured hash of any other key; `client` is the key's id on the authenticated lines (the 403 included) and `null` on the 400 and 401 lines. `uvicorn`'s access log stays off (TD-slice-1 L3) | http | 13, 22 |
-| A12 | Unauthenticated test mode and the hourly warning. With no keys and `ALLOW_UNAUTHENTICATED=true`: `POST /api/create` and `OPTIONS /api/tags` with no key reach Ollama (every route is open, Q12); a request with two `Authorization` headers is not refused, and Ollama receives neither; `client` is `null`. With `create_app(…, warn_every_s=0.2)`: one `WARNING` line with `event: "unauthenticated"` at startup, and further ones at that interval (at least two more within a bounded wait, each at least the interval apart); none after shutdown; none at all when keys are configured, with or without `ALLOW_UNAUTHENTICATED` (Q4). The line has the fields in Appendix A and no request fields | http | 15 |
+| A11 | The key never leaves. With a valid `infer` key on a gated `/api/chat` (non-streaming and streaming) and on `/api/tags`, and a valid `admin` key on a streamed `POST /api/blobs/sha256:<hex>`, each also sending `X-API-Key`, `Cookie` and `Proxy-Authorization` → `fake_ollama` recorded none of `Authorization`, `X-API-Key`, `Cookie` or `Proxy-Authorization`. Across one request of every outcome in §5 and TD-slice-1 §5 that S2 can reach (200, 400 `AUTH_AMBIGUOUS`, 401 both ways, 403, 404, 413, 429, 502), no log line, response body or response header contains the key, its SHA-256 in hex, or the configured hash of any other key. The same holds for credentials that are refused or ignored, each its own marker secret: a wrong key (`Bearer <secret>`, 401 `AUTH_INVALID`); `Basic <secret>` (400); `Bearer <secret> x` (400); and a secret sent only in `X-API-Key`, only in `Cookie`, and only in the query string (`?key=<secret>`), each with no `Authorization` → no log line (traceback included) and no response body or header contains the secret. This asserts only that nothing is logged or echoed; how a query-string key is answered is A9's. `client` is the key's id on the authenticated lines (the 403 included) and `null` on the 400 and 401 lines. Each auth refusal's line has §2.4's `outcome` and `level`: `unauthenticated` for both 401s, `forbidden` for the 403 and `rejected` for the 400, each at `INFO`. `uvicorn`'s access log stays off (TD-slice-1 L3) | http | 13, 22 |
+| A12 | Unauthenticated test mode and the hourly warning. With no keys and `ALLOW_UNAUTHENTICATED=true`: `POST /api/create` and `OPTIONS /api/tags` with no key reach Ollama (every route is open, Q12); a request with two `Authorization` headers is not refused, and Ollama receives neither; `client` is `null`. With `create_app(…, warn_every_s=0.2)`: one `WARNING` line with `event: "unauthenticated"` at startup, and further ones at that interval (at least two more within a bounded wait, each at least the interval apart); none after shutdown; none at all when keys are configured, with or without `ALLOW_UNAUTHENTICATED` (Q4). The line has the fields in Appendix A, `level: WARNING`, and no request fields. Without `warn_every_s`, `create_app` uses 3600 s: with `anyio.sleep` patched in `app` to record its argument and return, the task's first sleep asks for exactly 3600 | http | 15 |
 
 ### 8.1 Quality gates for this slice (CI output quoted in each PR)
 
@@ -495,15 +507,21 @@ releasable and green, and ships the tests for exactly the IDs listed.
 | PR | scope | files (new or changed) | TD IDs | needs |
 |---|---|---|---|---|
 | S2-1 | Credentials and the keyring | `auth.py` (`Principal`, `KeyEntry`, `Keyring`, `read_credentials`, `allows`, `authorise`), `tests/node/test_auth.py` | A1, A2 | — |
-| S2-2 | Keys in the configuration, and the startup refusals | `config.py` (`KeyConfig`, `keys`, steps 2, 3 and 7, `keyring()`), `test_auth.py`, `test_config.py` and `harness.py` (Appendix B), `.env.example`, `TD-slice-1.md` (C1) | A3, A4 (all but its `create_app` case) | 1 |
-| S2-3 | Enforcement | `app.py` (the auth step, `refuse_auth`, `PRINCIPAL_KEY`, the `client` field, the `create_app` refusal), `proxy.py` (`client`), `gate.py` (Q6), `tests/node/test_http_auth.py` (new), `test_http.py`, `test_gate.py` (Appendix B), `TD-slice-1.md` (K1, L1, §2.2) | A4 (its `create_app` case), A6–A11 | 2 |
+| S2-2 | Keys in the configuration, and the startup refusals | `config.py` (`KeyConfig`, `keys`, steps 2, 3 and 7, `keyring()`), `app.py` (`main()` refuses configured keys until S2-3; below), `test_auth.py`, `test_config.py` and `harness.py` (Appendix B), `.env.example`, `TD-slice-1.md` (C1) | A3, A4 (all but its `create_app` case and its case of keys starting) | 1 |
+| S2-3 | Enforcement | `app.py` (the auth step, `refuse_auth`, `PRINCIPAL_KEY`, the `client` field, the `create_app` refusal; S2-2's guard removed), `proxy.py` (`client`), `gate.py` (Q6), `tests/node/test_http_auth.py` (new), `test_http.py`, `test_gate.py` and `harness.py` (Appendix B), `TD-slice-1.md` (K1, L1, §2.2) | A4 (its `create_app` case and keys starting), A6–A11 | 2 |
 | S2-4 | `keygen` | `auth.py` (`new_key`, `keygen`), `app.py` (`main(argv)`), `test_auth.py`, `test_config.py` (C8 calls `main([])`) | A5 | 2, 3 |
 | S2-5 | Test mode's hourly warning, and enforcement | `app.py` (the warning task, `RequestLog.event`, `warn_every_s`), `test_http_auth.py`, `docs/design/TD-slice-2.md` (`Enforced: yes`, the details fixed by the code) | A12 | 1–4 (all) |
 
-- **S2-2 before S2-3.** Between them, `main` refuses to start without keys, but does not yet
-  check them. Nothing is deployed from S1 to S3 (the "Still not deployed" note above), so no
-  node runs that state. Putting both in one PR would make it about 12 files and the largest
-  review of the slice.
+- **S2-2 never serves with keys it doesn't check.** After S2-2, `load_settings` loads and
+  validates `[[keys]]`, but nothing enforces them until S2-3. So S2-2's `main()` refuses to
+  start, with exit 2 and the message `SERIATIM_NODE_KEYS: keys are configured, but this build
+  does not enforce them yet (TD-slice-2 S2-3)`, whenever `settings.keys` is not empty. A
+  sidecar built from S2-2 therefore either runs in unauthenticated test mode, with its
+  startup `WARNING`, or doesn't start: it never serves unauthenticated while keys are
+  configured. S2-2 tests the guard with a test that carries no TD ID; S2-3 removes the guard
+  and that test together, in the PR that adds enforcement, and A4's "keys … starts" case moves
+  to S2-3 with it. No TD ID depends on the guard. This keeps each PR small: merging S2-2 and
+  S2-3 instead would make one PR of about 13 files and the largest review of the slice.
 - **S2-3 and S2-4 both change `app.py`,** so they go one at a time. S2-4 needs S2-2, because
   A5 loads the printed table through `load_settings`.
 - **S2-5 needs every earlier PR,** because it sets `Enforced: yes`, so all of A1 to A12 must
@@ -549,13 +567,17 @@ Each is for the maintainer, on #35. The design above follows each recommendation
    checks reveal nothing about the node, and A keeps the dispatcher's order and S1's tests as
    they are. (§3.)
 6. **Unknown `/seriatim/*` paths and wrong methods** (404, 405, including `POST` and `HEAD` on
-   `/seriatim/health`). REQ-13 says every endpoint but `GET /seriatim/health` needs a key, and
-   the contract gives no scope to paths it doesn't list. Options: **(A)** any valid key
-   (`infer`), then 404 or 405; **(B)** answer 404 or 405 before auth; **(C)** `admin`.
-   *Recommendation: A.* It follows REQ-13 to the letter, and an unauthenticated caller learns
-   nothing about which `/seriatim/*` routes a node has. Until S4c adds them, the
-   `/seriatim/admin/*` paths are a 404 to any valid key; from S4c an `infer` key gets 403. It
-   changes K1's three `/seriatim/*` rows. (§2.3, §4.)
+   `/seriatim/health`). REQ-13 says every endpoint but `GET /seriatim/health` needs a key. The
+   contract gives every method and path pair it doesn't list the `admin` scope:
+   `x-seriatim-unknown-endpoint: { x-seriatim-gate: gated, x-seriatim-scope: admin }`
+   (`contract/openapi.yaml`, lines 525–526), as REQ-5's "everything else" rule does. It does
+   not single out `/seriatim/*`, so it covers those paths too. Options: **(A)** `admin`, as the
+   contract says: an `admin` key gets the 404 or 405 and an `infer` key gets 403, so
+   `/seriatim/admin/*` is a 403 to an `infer` key both before and after S4c; **(B)** any valid
+   key (`infer`), then 404 or 405, which needs a contract change and makes `/seriatim/admin/*`
+   a 404 to an `infer` key until S4c, against REQ-5; **(C)** answer 404 or 405 before auth,
+   against REQ-13. *Recommendation: A*, the contract's rule as written; the design (§2.3, §4,
+   A7, A8) follows it. A or B changes K1's three `/seriatim/*` rows.
 7. **Health with bad credentials.** `GET /seriatim/health` with a wrong key or an ambiguous
    `Authorization`. Options: **(A)** credentials are not read: 200; **(B)** they are checked
    whenever present: 401 or 400. *Recommendation: A.* Health needs no key (REQ-18), and a load
@@ -684,10 +706,11 @@ some of those tests, never their IDs. Each change is in the PR that causes it (�
   call gets the flag. C2 to C11 build on a baseline file with one key wherever they call
   `load_settings` with neither keys nor the flag (Q13), so a refusal they assert is still the
   one they test. C5's "no warning by default" uses the one-key baseline.
-- **`test_http.py` (S2-3).** `_log_lines` keeps only `event: "request"` lines, so the hourly
-  line (S2-5) is never counted as a request. L1's exact field list gains `client` after
-  `known`.
-- **`test_gate.py` (S2-3).** K1's `/seriatim/*` rows: 404 and 405 carry scope `INFER`, health
+- **`harness.py` and `test_http.py` (S2-3).** The log reader moves to `harness.py` as
+  `log_lines(text)`, which keeps only `event: "request"` lines, so the hourly line (S2-5) is
+  never counted as a request. `test_http.py`'s `_log_lines` is replaced by it, and
+  `test_http_auth.py` uses it too. L1's exact field list gains `client` after `known`.
+- **`test_gate.py` (S2-3).** K1's `/seriatim/*` rows: 404 and 405 carry scope `ADMIN`, health
   keeps `NONE` (Q6). K-OAS1's check that the `/seriatim/*` scopes S1 serves agree with
   `classify()` is unchanged: health is still `none`.
 - **`test_config.py` (S2-4).** C8 calls `main([])`.
