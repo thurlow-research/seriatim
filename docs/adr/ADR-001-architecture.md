@@ -511,8 +511,10 @@ route but health authenticated, and an exposure check (D2, D6, D12).
   models in `/api/tags`, and brings the node back online.
 - **Polled progress.** A `POST` starts a rollout and returns a job id; a `GET` on the job
   shows each node's state.
-- **Fail closed, one node at a time.** A failure or a timeout leaves the node offline, stops
-  the rollout and reports the reason. Nothing brings the node back automatically.
+- **Fail closed, one node at a time.** A failure or a timeout stops the rollout and reports
+  the reason. A node the rollout had taken offline stays offline; nothing brings it back
+  automatically. One rollout runs at a time per gateway instance; a cross-gateway lock using
+  the sidecars' offline state is required before more than one gateway is deployed.
 - **Access by allow list.** Only the admin key ids the gateway's configuration names may
   start a rollout; by default none may. Every rollout is logged with the key id.
 - **Shared code.** The pull and its verification are one implementation, used by the
@@ -533,8 +535,8 @@ route but health authenticated, and an exposure check (D2, D6, D12).
 **Consequences.**
 - **The local-only check can lag a gateway-run update by up to a week.** That is accepted,
   because the check verifies nothing a pull changes.
-- **`update-models` becomes a thin script** around the shared implementation, in Python on
-  every OS.
+- **`update-models` becomes a thin OS script that calls the shared Python implementation.**
+  The OS-native `deploy/<os>/update-models` scripts and their Pester and bats tests stay.
 
 ## 4. Components
 
@@ -694,7 +696,7 @@ The details are in TD-slice-1 §3.
 | T19 | Tampering: a downgrade or rollback attack (follower) | An attacker offers an older, vulnerable release | SPEC REQ-69: the follower installs only versions newer than its durable last-good record, in semantic-version order per channel; an older one only by an operator pin, by tag and digest, in the host's local config, never read from GitHub; held versions are never retried | A pinned old version is the operator's choice |
 | T20 | DoS: the GitHub API is unavailable (follower) | An outage, a rate limit, or a failed attestation lookup | SPEC REQ-69: the follower keeps running the current version, retries with backoff, reports the condition, and never installs anything it could not fully verify; rollback uses the cached, digest-checked last-good artifacts, with no network | No updates during the outage |
 | T21 | Elevation: misuse of the promotion builder's App identity (interim deployment) | A leaked `seriatim-worker` token pushes a `promote/ppe-*` branch or opens a promotion pull request | The token is short-lived, minted per use outside the repository, and never stored in Actions secrets; the App bypasses no ruleset but `promote-branches`, so it can't push `main`, `ppe`, `prod` or a `v*` tag; only it can create `promote/**` branches, and the builder refuses any whose `.github/` differs from `main`'s, so no counterfeit `promotion-source` job can ride on a promotion; a promotion still needs the maintainer's approval of the pull request and of the `ppe` environment, `promotion-source`, and `deploy.yml`'s checks (SPEC REQ-70, D16) | A leaked token can open pull requests and push working branches until it expires; nothing merges without the maintainer |
-| T22 | DoS: a model rollout takes nodes out of service (deferred, SPEC REQ-71) | A stolen admin key starts rollouts, or a failing pull leaves a node offline | Only key ids on the gateway's allow list may start one, and the list is empty by default; one node at a time, so the rest keep serving; every rollout is logged with the key id; the sidecar gains no route, so a key can't make a node run anything | A failed rollout leaves one node offline until a person brings it back, by design |
+| T22 | DoS: a model rollout takes nodes out of service (deferred, SPEC REQ-71) | A stolen admin key starts rollouts, or a failing pull leaves a node offline | Only key ids on the gateway's allow list may start one, and the list is empty by default; one node at a time, so the rest keep serving (a cross-gateway lock is required before a second gateway is deployed); every rollout is logged with the key id; the sidecar gains no route, so a key can't make a node run anything | A failed rollout leaves one node offline until a person brings it back, by design |
 | T15 | Repudiation | "Who used the GPU?" | A request log with key id, request id, path, model and timings (REQ-22) | Logs are local and not tamper-proof |
 
 ## 8. Residual risks

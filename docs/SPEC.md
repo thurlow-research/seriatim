@@ -1459,7 +1459,7 @@ Appendix A, §5.4). Until then no code may claim REQ-71.
   - **Routes**, on the gateway, in the `admin` scope:
     - `POST /seriatim/admin/rollouts` starts a rollout. Its body names the nodes, in the
       order they are updated, and the models to pull on each. Both lists are explicit and
-      non-empty; an unknown node id, a duplicate, or an empty or malformed list gets 400
+      non-empty (93-4); an unknown node id, a duplicate, or an empty or malformed list gets 400
       `BAD_REQUEST_BODY`, and nothing starts. It returns 202 with a job id at once, before
       any node is touched.
     - `GET /seriatim/admin/rollouts/{job_id}` returns the job: its overall state
@@ -1478,8 +1478,12 @@ Appendix A, §5.4). Until then no code may claim REQ-71.
     the next, so at most one node is ever out of service because of the rollout and the
     others keep serving. A gateway instance runs at most one rollout at a time; a `POST`
     while one is running is refused, and the running one is unaffected.
+    - **More than one gateway.** That limit holds only within one gateway instance, because
+      gateways share no state. B, a cross-gateway lock using the sidecars' offline state, is
+      required before more than one gateway is deployed (a maintainer ruling on #93, 93-5).
   - **For each node, in order:**
-    1. **Precondition.** The node must be online and healthy when its turn comes. A node
+    1. **Precondition.** The node must be online and healthy when its turn comes, and the
+       body names it explicitly with the models to pull (93-4). A node
        that is already offline, reconciling (REQ-42a) or unhealthy is not touched: it
        fails, so a rollout never brings back a node someone else took out of service.
     2. **Drain.** The gateway takes the node offline through the admin switch (REQ-42a),
@@ -1496,10 +1500,13 @@ Appendix A, §5.4). Until then no code may claim REQ-71.
        model it pulled is listed (also part of REQ-54a).
     5. **Online.** Only then does the gateway bring the node back through the admin switch
        (REQ-42a), which refreshes its discovery before routing to it again.
-  - **Fail closed.** On any failure the node stays offline, the rollout stops, and the
-    reason is reported in the job and logged. No later node is touched; they stay
+  - **Fail closed.** On any failure the node is left as the failure found it: offline if
+    the rollout took it offline, and untouched if it failed the precondition or the call
+    that would take it offline failed. The rollout stops, and the reason is reported in the
+    job and logged. No later node is touched; they stay
     `queued` in a job whose state is `failed`. A node is **never** brought back online
-    automatically after a failure: a person looks at it, then calls `online` (REQ-42a).
+    automatically after a failure: a person looks at it, then calls `online` (REQ-42a)
+    if the rollout took it offline.
     - **What counts as a failure:** a precondition that doesn't hold; an admin call that
       fails or whose outcome is unknown (REQ-42a's 502s); a drain that doesn't end within
       its timeout; a stuck slot; a pull that breaks REQ-54's stream rule, fails to connect,
@@ -1509,8 +1516,8 @@ Appendix A, §5.4). Until then no code may claim REQ-71.
       no record), and the tags read. The timeouts are gateway configuration; their
       defaults are set in the slice's TD.
     - **A gateway restart mid-rollout** loses the job, because the gateway persists nothing
-      (REQ-42a). The node being updated stays offline, since the sidecar keeps its state
-      across restarts (REQ-19a), and its offline reason names the job. That is the same
+      (REQ-42a). A node the rollout had taken offline stays offline, since the sidecar keeps
+      its state across restarts (REQ-19a), and its offline reason names the job. That is the same
       fail-closed outcome. A `GET` on the lost job id gets 404.
   - **Access.**
     - **An allow list.** The gateway configuration holds the admin key ids that may start
@@ -2624,13 +2631,17 @@ version the evaluation ran. Per-mutant timeouts count as killed, and the whole-r
 fails closed (REQ-61).
 
 **Issue #93 (2026-11-23).** The maintainer agreed the design for gateway-triggered model
-updates, with three changes, applied as follows:
+updates, with three changes, then answered two follow-up questions
+(https://github.com/thurlow-research/seriatim/issues/93#issuecomment-7095037459). They are
+applied as follows:
 
 | # | ruling | where applied |
 |---|---|---|
 | 93-1 | A drained node accepts admin pulls | REQ-19a, §6.1a |
 | 93-2 | The weekly run covers the local-only check for gateway-run updates; no sidecar route starts a process | REQ-53, REQ-55, §6.1, §6.1a |
 | 93-3 | One shared pull-and-verify implementation for `update-models` and the gateway | REQ-54, REQ-54a, REQ-71 |
+| 93-4 | Q1: A. The `POST` names the nodes and the models explicitly | REQ-71 (routes, precondition) |
+| 93-5 | Q2: A, one rollout at a time per gateway instance; and B, a cross-gateway lock using the sidecars' offline state, is required before more than one gateway is deployed | REQ-71 (one node at a time), ADR-001 D17, T22 |
 
 ## 10. Open questions
 
