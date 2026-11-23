@@ -45,6 +45,8 @@ from seriatim_node.gate import Gate, SlotState
 LOOPBACK = "127.0.0.1"
 # TD §7 "Timing": an elapsed-time assertion may overrun its target by this much.
 TIMING_BOUND_S = 0.5 if os.environ.get("CI") == "true" else 0.1
+# asyncio fires a timer up to one monotonic tick early (~15.6 ms on Windows; #97).
+TICK_S = time.get_clock_info("monotonic").resolution
 STALL_LIMIT_S = 30.0  # a stalled fake gives up after this, so teardown can never hang
 WAIT_S = 5.0  # TD §7: tests wait on events for at most this long, so a hang fails the test
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "ollama-0.40.16.json"
