@@ -5,6 +5,7 @@
 **Companion documents:**
 - [ADR-001](adr/ADR-001-architecture.md): architecture, contract, threat model, slice plan.
 - [TD-slice-1](design/TD-slice-1.md): the first code slice only.
+- [TD-slice-2](design/TD-slice-2.md): slice S2, sidecar authentication.
 - [EVALUATION](EVALUATION.md): the comparison that led here.
 
 Seriatim is a one-at-a-time GPU gate for [Ollama](https://ollama.com). It has two parts:
@@ -15,8 +16,8 @@ Seriatim is a one-at-a-time GPU gate for [Ollama](https://ollama.com). It has tw
   operator has made eligible for that model, and combines the read-only Ollama views across machines.
 
 The words MUST, MUST NOT, SHOULD and MAY follow RFC 2119. Each requirement has an ID (`REQ-n`)
-and the tests that prove it. The test IDs for slice 1 are defined in TD-slice-1 §8; the tests
-for later slices are named in ADR-001 §10.
+and the tests that prove it. The test IDs for slices 1 and 2 are defined in TD-slice-1 §8 and
+TD-slice-2 §8; the tests for later slices are named in ADR-001 §10.
 
 ---
 
@@ -316,14 +317,14 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     `WWW-Authenticate: Bearer` and `retryable: false`.
   - Credentials MUST NOT be forwarded to Ollama or logged.
 
-  *Tests:* slice S2 (A1–A12).
+  *Tests:* TD-slice-2 §8: A1, A2, A6, A8–A11.
 - **REQ-14. Scopes (ruling Q5).**
   - A key has the scope `infer` or `admin`. The admin key is a separate key; an `admin` key
     may also use `infer` routes.
   - The scope each route needs comes from REQ-5, so unknown endpoints need `admin`.
   - A key without the scope a route needs gets 403 `FORBIDDEN_SCOPE`.
 
-  *Tests:* slice S2.
+  *Tests:* TD-slice-2 §8: A2, A7.
 - **REQ-15. Fail closed on missing keys.**
   - With no keys configured, the sidecar MUST refuse to start, unless
     `SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` is set. That setting exists for the PPE; it logs
@@ -332,7 +333,7 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
     and the exposure check (REQ-19) is active. In slices S1 to S3 that means loopback only,
     except in the PPE.
 
-  *Tests:* C5, slice S2.
+  *Tests:* C5; TD-slice-2 §8: A4, A12.
 
 ### 4.3 Sidecar: status, health, capacity, admin switch and exposure (slices S4a to S4c, as noted)
 
