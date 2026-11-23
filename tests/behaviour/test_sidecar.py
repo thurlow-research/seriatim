@@ -99,18 +99,26 @@ def gated_probe() -> httpx.Response:
 
 
 def wait_free() -> None:
-    """Wait until the gate admits a request: a drain (10 s after a disconnect) or the startup
-    quarantine left by an earlier test is a time window, so this polls it."""
+    """Wait until the gate admits a request, and that request's slot has been freed: a drain
+    (10 s after a disconnect) or the startup quarantine left by an earlier test is a time
+    window, so this polls it.
+
+    The probe's answer has a `Content-Length`, so the client has all of it before the
+    sidecar's `finally` closes upstream and frees the slot (§3.3 steps (a) to (c)). A second,
+    ungated request on the same connection is handled only after the probe's final message,
+    which comes after the slot was freed, so once it answers the gate is free."""
     deadline = time.monotonic() + DRAIN_S + WAIT_S
-    while True:
-        r = gated_probe()
-        if r.status_code not in (429, 503):
-            assert r.status_code == 404, r.text  # Ollama's own answer: the probe was admitted
-            assert r.headers["x-seriatim-gate"] == "acquired"
-            return
-        assert r.json()["error_code"] in ("GPU_BUSY", "NODE_STARTING"), r.text
-        assert time.monotonic() < deadline, f"the gate stayed closed: {r.text}"
-        time.sleep(POLL_S)
+    with httpx.Client(timeout=10) as client:
+        while True:
+            r = client.get(f"{BASE_URL}{GATE_PROBE}")
+            if r.status_code not in (429, 503):
+                assert r.status_code == 404, r.text  # Ollama's answer: the probe was admitted
+                assert r.headers["x-seriatim-gate"] == "acquired"
+                assert client.get(f"{BASE_URL}/api/version").status_code == 200
+                return
+            assert r.json()["error_code"] in ("GPU_BUSY", "NODE_STARTING"), r.text
+            assert time.monotonic() < deadline, f"the gate stayed closed: {r.text}"
+            time.sleep(POLL_S)
 
 
 def wait_for(what: str, check: Callable[[], object], timeout: float = WAIT_S) -> object:

@@ -1528,7 +1528,15 @@ tests and `Enforced: yes`.
     doesn't count.
 - **Between tests**, a gated probe to an unlisted path (`GET /api/seriatim-ppe-gate-probe`,
   gated by §2.2 rule 5, and answered 404 by Ollama without a model) is polled until it's
-  admitted. That waits out any drain or quarantine an earlier test left. `drain_s` is read
+  admitted. That waits out any drain or quarantine an earlier test left.
+  - **The probe's own slot.** Ollama's 404 has a `Content-Length`, so the client has the
+    whole answer before the sidecar's `finally` closes upstream and frees the slot (§3.3
+    steps (a) and (b) come before (c), the final empty message). A request on a new
+    connection in that window gets 429. That is the design (the slot is freed only once
+    the close is proven), and on #92's second run it failed P2's first request. So after
+    an admitted probe, `wait_free` sends `GET /api/version` on the **same** connection.
+    uvicorn handles it only after the probe's final message, so its answer means the slot
+    is free. `drain_s` is read
   from `ppe/compose.yaml`, so the bounds follow the PPE's own setting.
 
 ### 8.7 Quality gates for this slice (CI output quoted in the PR)
