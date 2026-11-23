@@ -7,12 +7,12 @@ the route probe (Appendix B, S0b; #29); revision 8 adds the 57 scenarios of #15 
 (57 new IDs; Appendix C maps each one), fixes the design gaps they found (Appendix C,
 "Design changes"), and splits the code into the PR series of §9.
 
-Enforced: no
+Enforced: yes
 
 (The `td-test-ids` check, SPEC REQ-63, reads this line. S1's code ships as the series of
-small PRs in §9. The **last** one, S1-14, sets it to `yes`, and from then on every ID in §8
-needs a passing test marked `@pytest.mark.td("<ID>")`. Each earlier PR marks the tests of the
-IDs it delivers, as §9 lists them.)
+small PRs in §9. The **last** one, S1-14, set it to `yes`, so every ID in §8 needs a passing
+test marked `@pytest.mark.td("<ID>")`. Each earlier PR marked the tests of the IDs it
+delivered, as §9 lists them.)
 **Implements:** SPEC REQ-1 to REQ-7, REQ-10 to REQ-12b, REQ-15 (pre-auth form), REQ-18
 (S1 form), REQ-20 to REQ-26. **Architecture:** ADR-001 D1 to D4, D7, D8, D10 to D12.
 **Not in this slice:**
@@ -608,6 +608,14 @@ far.
   (S1-10), and isn't re-raised: the client is gone, and nothing is left to tell it. In
   health, only a failed write is swallowed. Any other error in the handler still reaches
   uvicorn after the line, which says `internal_error`, at `ERROR`, with `status: null`.
+  - **The double failure** (#91 follow-up, fixed in S1-14). If the handler raises and
+    Starlette's 500 then fails to send as well, Starlette never reaches its own re-raise,
+    and the send error arrives with the handler's error as its `__context__`. So a write
+    failure is swallowed only when it is pure, that is, `_health` had returned (its status
+    is in the scope). Otherwise the send error propagates, and uvicorn logs it with the
+    handler's traceback chained, after the line, which also notes the failed write.
+    `test_a_health_check_that_breaks_and_whose_500_fails_keeps_its_error` and
+    `test_a_health_check_whose_client_left_is_still_swallowed` check both cases.
   `test_l2_a_refusal_whose_write_fails_…` drives each of these paths three ways: `send`
   raises at the start, raises at the body, or succeeds.
 - **A refusal test sends no body** (#91 review). On the first Windows run of #91,
@@ -1190,7 +1198,8 @@ can be set in the TOML file named by `SERIATIM_NODE_CONFIG`.
 
 In the PPE, the compose file sets these, inside the container's network namespace:
 - `LISTEN_HOST=0.0.0.0` and `ALLOW_UNAUTHENTICATED=true`;
-- `LOCK_DIR=/run/seriatim`, on a tmpfs.
+- `LOCK_DIR=/run/seriatim`, on a tmpfs;
+- `LISTEN_PORT=11436`, `ID=node-a` and `DRAIN_S=10` (S1-14, §8.6).
 
 The published port is bound to `127.0.0.1` on the host.
 
@@ -1433,6 +1442,116 @@ and the capture log. They import nothing from `seriatim_node`. They run in the r
 | P6 | **Cancellation latency (a measurement, not a proof).** A client disconnects mid-generation. The test then sends a probe directly to Ollama (debug port), with the model already loaded, and measures the delay to its first token against an idle baseline taken the same way. The extra delay is recorded in the job summary. The test fails if it exceeds `drain_s / 2`. This is CPU evidence only; S5 and S6 repeat the measurement on each GPU node and record it (ADR-001 §8 risk 2) | 10 |
 | P7 | **Restart mid-generation.** `docker compose kill node-a`, then `start`, while a generation is streaming → the client's stream is aborted. The test polls the port and sends a gated request the moment it accepts: that request gets `NODE_STARTING` (the PPE uses `drain_s=10`, so the window is wide). After `drain_s` it gets 200 | 12a |
 
+**Details fixed by the code (S1-14).** S1-14 adds the sidecar container to the PPE, the P
+tests and `Enforced: yes`.
+- **Asked on #69** (https://github.com/thurlow-research/seriatim/issues/69#issuecomment-7071983385):
+  question 1, how node-a gets its code, and question 2, P4's model. Option A is built for
+  both, as below.
+- **node-a** (`ppe/compose.yaml`) runs a digest-pinned `python:3.12.16-slim-trixie`
+  (Dependabot's docker-compose ecosystem bumps it with the others) in `ollama-a`'s network
+  namespace, with `cap_drop: [ALL]`, the §6 settings and its code mounted read-only from
+  `ppe/data/node` (gitignored). No image is built, so the guard needs no `build` key and its
+  allowlist is unchanged (#28).
+  - **Staging** (#69, question 1, option A, with the step in a committed script). Before
+    `ppe/ppe up`, `tools/ppe_stage_node.py` installs the runtime dependencies there from
+    `uv.lock`'s hashes (`uv export --frozen`, then `uv pip install --target …
+    --require-hashes --only-binary :all: --no-deps` as cp312 manylinux wheels), and copies in
+    `node/seriatim_node`. The `ppe` job runs it, and a local pre-check run on the designated
+    host runs the same script first. Before writing, it refuses a `ppe/data` or
+    `ppe/data/node` that is a symlink or resolves outside ppe/, with the guard's own check.
+    `tests/tools/test_ppe_stage_node.py` checks its commands and that refusal.
+  - **Ports.** The sidecar listens on 11436, published as `127.0.0.1:11436` on `ollama-a`,
+    because `dbg-a` already has 11434 in the namespace. 11434 stays plain Ollama, so S0b's
+    checks and `capture_fixtures.py` are unchanged. The tests get `SERIATIM_BASE_URL` (the
+    sidecar) and `SERIATIM_PPE_URL` (plain Ollama) from the job.
+  - **Limits.** cap-a drops to 0.25 CPU / 256 MiB, and node-a gets 0.5 CPU / 384 MiB. The
+    sum is 4 CPUs and 5.75 GiB, inside the guard's bound.
+  - **`BODY_TIMEOUT_S=300`** for node-a, so that P4's hold (below) covers a slow download.
+  - **No `user`, `read_only` or `security_opt`.** None is on the guard's allowlist, and
+    `security_opt` is one of the keys SPEC §8.3 refuses, so adding them would widen it.
+    node-a runs as root, but with every capability dropped, so it can't change user, and
+    its code mount is read-only.
+  - `tests/tools/test_ppe_guard.py` checks the rendered node-a (namespace, no capability,
+    test mode, the tmpfs, the read-only mount and the two loopback ports).
+- **The capture.** `test_sidecar.py` reads cap-a's pcap (`ppe/data/capture/ollama-a.pcap`)
+  with the standard library. It reassembles each client-to-Ollama connection by sequence
+  number, splitting on each SYN (in case a port is reused) and dropping retransmissions, then
+  splits it into HTTP requests by `Content-Length` or chunked framing. A gap in a
+  connection's sequence numbers fails the test, so a lost request can't vanish silently, and
+  a chunked body is checked for every CRLF and the closing empty line. Each request is matched
+  by the `X-Request-Id` the test sent, which the sidecar keeps and forwards (§4), from its
+  headers alone: a body that is still arriving is `None`, and P1 waits for it. Each request is
+  timed by its first packet. Host and container share the kernel clock, so a trial's window
+  can be compared with the capture's timestamps.
+- **P3** records when each complete NDJSON record reached the client. The first must arrive
+  at least 0.25 s before the final one (48 tokens take over a second on the PPE), so a
+  sidecar that buffered the response fails, and a first byte that comes before the end isn't
+  enough on its own.
+- **P1** sends a body spaced, ordered and escaped as no JSON encoder would write it
+  (`"temperature": 0.30`, `\u00e9`), so a re-serialised body can't match. The captured body
+  must equal it byte for byte, with the same method, path and `Content-Length`. `/api/ps` is
+  read directly from Ollama.
+- **P2.** Request 1 asks for `num_predict` 128, and is read to its end, so each trial ends
+  cleanly and frees the slot without a drain. Request 2's latency is measured from its send to
+  its complete 429, and the p99 over 20 trials is the nearest rank, here the slowest one. "Exactly one
+  inference request per trial" means that, in each trial's window, the capture has exactly
+  one `POST` to a gated `infer` route (§2.2 rule 4), and that it is request 1. Request 2's id
+  is nowhere in the capture.
+- **P4 holds the slot without a model** (the slot is `HELD`, §2.2). A raw socket sends the
+  headers of a gated `/api/chat` and half its body. The gate admits on the headers (§3.3
+  line 6), then waits for the body, within `body_timeout_s` (300 s for node-a). A gated
+  probe getting 429 shows the slot is held, before the pull and again after it. The rest of
+  the body then completes that request with 200. The delete, the pull and their checks must
+  finish within `body_timeout_s` minus 30 s; past that, the test fails and says the
+  registry was too slow, rather than giving an unexplained 408.
+  - **The model** (#69, question 2, option A). `all-minilm:22m` is deleted through the
+    sidecar and pulled again through it, so `/api/tags` listing it proves the pull installed
+    it. The progress stream must end with `{"status":"success"}` and contain no `error`.
+- **P5** compares the status, the body bytes and the headers, without `Date` and Seriatim's
+  three headers (case-insensitive, in any order). It also checks that those three headers
+  are there.
+  - **Ollama's order.** Ollama lists the loaded models of `/api/ps` in no fixed order, so on
+    #92's third run two direct answers differed in order alone. Each round therefore asks
+    Ollama, then the sidecar. Every round must hold the same content, with the models
+    sorted by name, and in at least one of 20 rounds the sidecar's bytes must equal
+    Ollama's exactly. With two models loaded, each round matches with a probability of at
+    least 1/2.
+- **P6.** Each probe is timed to its first complete NDJSON record, not its first byte. The
+  baseline is the median of three idle probes taken directly, after one probe that
+  loads the model. The probe and the cancelled generation use the same model and context, so
+  Ollama doesn't reload between them. The client disconnects after three records. The result
+  goes into the job summary (`GITHUB_STEP_SUMMARY`) and the log.
+- **P7.** While node-a is down, the host's port forwarder still accepts on 11436 and then
+  drops the connection, so "the moment it accepts" means the first gated request that gets
+  an HTTP answer. That answer must be 503 `NODE_STARTING` with `X-Seriatim-Gate: refused`.
+  Every answer after it is also `NODE_STARTING`, until a 200 arrives. Before the kill, the
+  first record must not be the final one, so the kill lands mid-generation.
+  - **The quarantine is timed from `docker compose start`**, not from the server's own
+    `Retry-After`: the new gate exists only after that call, so the 200 can come no sooner
+    than `drain_s` after it. It must come within `drain_s` plus a startup allowance of 15 s
+    (the container, the interpreter and the imports) plus two poll intervals.
+  - **And from the first `NODE_STARTING` answer** (#92 re-review). The bound from `start`
+    counts the startup toward `drain_s`, so a quarantine short by the startup time would
+    still pass it. The gate exists before uvicorn binds the port, and the port is polled
+    every 0.2 s, so the first `NODE_STARTING` answer comes at most
+    `QUARANTINE_MARGIN_S` (1 s) after the gate was made. The 200 must therefore come at least
+    `drain_s` minus 1 s after that answer.
+  - Each answer is timed when its **response headers** arrive, and the polled request asks
+    for a stream (`stream: true`), so Ollama sends the headers with the first token. The
+    200's own generation doesn't count.
+- **Between tests**, a gated probe to an unlisted path (`GET /api/seriatim-ppe-gate-probe`,
+  gated by §2.2 rule 5, and answered 404 by Ollama without a model) is polled until it's
+  admitted. That waits out any drain or quarantine an earlier test left.
+  - **The probe's own slot.** Ollama's 404 has a `Content-Length`, so the client has the
+    whole answer before the sidecar's `finally` closes upstream and frees the slot (§3.3
+    steps (a) and (b) come before (c), the final empty message). A request on a new
+    connection in that window gets 429. That is the design (the slot is freed only once
+    the close is proven), and on #92's second run it failed P2's first request. So after
+    an admitted probe, `wait_free` sends `GET /api/version` on the **same** connection.
+    uvicorn handles it only after the probe's final message, so its answer means the slot
+    is free. `drain_s` is read
+  from `ppe/compose.yaml`, so the bounds follow the PPE's own setting.
+
 ### 8.7 Quality gates for this slice (CI output quoted in the PR)
 
 - **Coverage.** `pytest --cov=seriatim_node --cov-branch --cov-fail-under=80`, plus a
@@ -1599,7 +1718,9 @@ A log line, one per request:
       `OLLAMA_NUM_PARALLEL=1` and `OLLAMA_CONTEXT_LENGTH=2048`, and a debug port published
       on loopback only, through a small `socat` helper, for direct comparison;
     - `cap-a`: tcpdump in `ollama-a`'s network namespace, with the filter
-      `tcp dst port 11435` and the capabilities `NET_RAW` and `NET_ADMIN` only.
+      `tcp dst port 11435` and the capabilities `NET_RAW` and `NET_ADMIN` only;
+    - from S1-14, `node-a`: the sidecar, in `ollama-a`'s network namespace (§8.6, "Details
+      fixed by the code (S1-14)").
 
     The limits sum to at most 4 CPUs and 6 GiB.
   - **`ppe/ppe up`.** Before anything starts, it checks the effective configuration

@@ -427,8 +427,10 @@ class _Dispatcher:
     async def _health_route(self, scope: Scope, receive: Receive, send: Send) -> None:
         """`GET /seriatim/health` through Starlette, then its one line, at `DEBUG`, once the
         response has been sent (or its write has failed): `_health` leaves the status in
-        the scope, and `bytes_out` counts what `send()` took. Only a failed write is
-        swallowed; any other error still propagates, after the line."""
+        the scope, and `bytes_out` counts what `send()` took. Only a pure write failure is
+        swallowed: one after `_health` returned. If `_health` itself raised, Starlette's 500
+        is what failed to send, and its send error carries the handler's error as its
+        `__context__`, so that error still propagates, with the write noted on the line."""
         sent = SentBytes(send)
         fields: dict[str, object] = {}
         try:
@@ -437,6 +439,8 @@ class _Dispatcher:
             if sent.failed is None:
                 raise
             note_write_failed(fields, sent.failed)  # the client is gone (S1-10)
+            if scope.get(_HEALTH_KEY) is None:  # the handler broke first: keep its traceback
+                raise
         finally:
             status = scope.get(_HEALTH_KEY)  # None if `_health` itself failed
             result = _HEALTH_OUTCOMES.get(status, "internal_error")
