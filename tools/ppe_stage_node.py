@@ -74,7 +74,8 @@ def commands(requirements: Path, stage: Path) -> list[list[str]]:
 def stage(run=subprocess.run) -> Path:
     check_data_dirs(PPE_DIR, (DATA_DIR, STAGE))
     DATA_DIR.mkdir(exist_ok=True)
-    shutil.rmtree(STAGE, ignore_errors=True)
+    if STAGE.exists():  # a failure to empty it is an error, not something to stage over
+        shutil.rmtree(STAGE)
     with tempfile.TemporaryDirectory(prefix="seriatim-stage-") as tmp:
         for cmd in commands(Path(tmp) / "node-requirements.txt", STAGE):
             r = run(cmd, cwd=ROOT, check=False)

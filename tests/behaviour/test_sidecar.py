@@ -60,6 +60,10 @@ MIN_STREAM_GAP_S = 0.25
 # P7: from `docker compose start` to the sidecar's gate existing (the container, the
 # interpreter and the imports); its quarantine ends drain_s after that.
 STARTUP_ALLOWANCE_S = 15.0
+# P7: the most time between the new gate being made and its first NODE_STARTING answer
+# reaching the test: uvicorn binding after the lifespan, one POLL_S poll interval, and the
+# request itself through the host's port forwarder.
+QUARANTINE_MARGIN_S = 1.0
 # The gated routes of the infer scope (TD §2.2 rule 4): what P2 counts as an inference request.
 INFER_PATHS = frozenset(
     {
@@ -689,8 +693,9 @@ def gated_answer() -> Answer | None:
     """A gated request, timed at its response headers (not after a generation), or None when
     nothing answered: while node-a is down, the host's port forwarder accepts and resets."""
     try:
+        # Streamed, so Ollama sends the headers with the first token, not after the answer.
         with httpx.stream(
-            "POST", f"{BASE_URL}/api/chat", json=chat("Say hi.", 4, stream=False), timeout=60
+            "POST", f"{BASE_URL}/api/chat", json=chat("Say hi.", 4, stream=True), timeout=60
         ) as r:
             at = time.monotonic()
             return Answer(r.status_code, r.headers, at, r.read())
@@ -740,8 +745,15 @@ def test_p7_a_restart_mid_generation_aborts_the_stream_and_starts_in_quarantine(
     # Retry-After. The upper bound allows for the container and the interpreter to start.
     assert admitted >= DRAIN_S, (admitted, DRAIN_S)
     assert admitted <= DRAIN_S + STARTUP_ALLOWANCE_S + 2 * POLL_S, (admitted, DRAIN_S)
+    # The bound above counts the startup toward drain_s, so a quarantine short by the startup
+    # time would pass it. The first NODE_STARTING answer came at most QUARANTINE_MARGIN_S after
+    # the gate was made (the gate exists before the port is bound, and the port is polled
+    # every POLL_S), so from that answer at least drain_s minus the margin must remain.
+    quarantined = answer.at - first.at
+    assert quarantined >= DRAIN_S - QUARANTINE_MARGIN_S, (quarantined, DRAIN_S)
     summary(
         f"P7: after the restart, first answer NODE_STARTING at {first.at - t_start:.1f} s, "
-        f"first 200 (headers) at {admitted:.1f} s (drain_s {DRAIN_S:g} s, startup allowance "
-        f"{STARTUP_ALLOWANCE_S:g} s)"
+        f"first 200 (headers) at {admitted:.1f} s, {quarantined:.1f} s after the first "
+        f"NODE_STARTING (drain_s {DRAIN_S:g} s, margin {QUARANTINE_MARGIN_S:g} s, startup "
+        f"allowance {STARTUP_ALLOWANCE_S:g} s)"
     )

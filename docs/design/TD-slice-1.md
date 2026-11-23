@@ -1530,8 +1530,15 @@ tests and `Enforced: yes`.
     `Retry-After`: the new gate exists only after that call, so the 200 can come no sooner
     than `drain_s` after it. It must come within `drain_s` plus a startup allowance of 15 s
     (the container, the interpreter and the imports) plus two poll intervals.
-  - Each answer is timed when its **response headers** arrive, so the 200's own generation
-    doesn't count.
+  - **And from the first `NODE_STARTING` answer** (#92 re-review). The bound from `start`
+    counts the startup toward `drain_s`, so a quarantine short by the startup time would
+    still pass it. The gate exists before uvicorn binds the port, and the port is polled
+    every 0.2 s, so the first `NODE_STARTING` answer comes at most
+    `QUARANTINE_MARGIN_S` (1 s) after the gate was made. The 200 must therefore come at least
+    `drain_s` minus 1 s after that answer.
+  - Each answer is timed when its **response headers** arrive, and the polled request asks
+    for a stream (`stream: true`), so Ollama sends the headers with the first token. The
+    200's own generation doesn't count.
 - **Between tests**, a gated probe to an unlisted path (`GET /api/seriatim-ppe-gate-probe`,
   gated by §2.2 rule 5, and answered 404 by Ollama without a model) is polled until it's
   admitted. That waits out any drain or quarantine an earlier test left.
