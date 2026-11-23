@@ -4388,6 +4388,49 @@ def test_a_health_check_that_breaks_still_logs_its_line_and_raises(monkeypatch, 
     assert "client_write_failed" not in line
 
 
+@pytest.mark.parametrize("fail_on", ["start", "body"])
+def test_a_health_check_that_breaks_and_whose_500_fails_keeps_its_error(
+    monkeypatch, capsys, fail_on
+):
+    """The double failure (#91 follow-up): the handler raises, and Starlette's 500 can't be
+    sent either. The send error escapes with the handler's error as its `__context__`, so
+    the server logs both tracebacks, and the line notes the failed write."""
+
+    class DistinctiveError(RuntimeError):
+        pass
+
+    async def broken(self):
+        raise DistinctiveError("the health handler's own bug")
+
+    monkeypatch.setattr(_Dispatcher, "_probe", broken)
+    app = create_app(make_settings("http://127.0.0.1:1"), gate=ready_gate()[0])
+    capsys.readouterr()
+    _sent, send = _send_failing_on(fail_on)
+    scope = _refusal_scope("GET", b"/seriatim/health", length=0)
+    with pytest.raises(OSError, match="the client is gone") as caught:
+        anyio.run(app, scope, _never_received, send)
+    chain, exc = [], caught.value
+    while exc is not None:
+        chain.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    assert any(isinstance(e, DistinctiveError) for e in chain), chain
+    (line,) = _log_lines(capsys.readouterr().out)
+    assert (line["level"], line["outcome"], line["status"]) == ("ERROR", "internal_error", None)
+    assert (line["client_write_failed"], line["client_write_failed_reason"]) == (True, "OSError")
+
+
+@pytest.mark.parametrize("fail_on", ["start", "body"])
+def test_a_health_check_whose_client_left_is_still_swallowed(capsys, fail_on):
+    """A pure write failure, after `_health` returned: nothing escapes, the line notes it."""
+    call, _outcome, _status = _health_ok()
+    capsys.readouterr()
+    _sent, send = _send_failing_on(fail_on)
+    anyio.run(call, send)
+    (line,) = _log_lines(capsys.readouterr().out)
+    assert (line["level"], line["outcome"], line["status"]) == ("DEBUG", "ok", 200)
+    assert (line["client_write_failed"], line["client_write_failed_reason"]) == (True, "OSError")
+
+
 # --- S1-13: K-OAS2, the hook itself -------------------------------------------------------
 
 
