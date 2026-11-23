@@ -134,9 +134,9 @@ without stopping at a match (REQ-13; T4):
 ```python
 digest = hashlib.sha256(token).digest()
 found = None
-for entry in self._entries:                       # all of them, always
+for entry in self._entries:  # all of them, always
     if hmac.compare_digest(digest, entry.digest):
-        found = entry                             # digests are unique: at most one match
+        found = entry  # digests are unique: at most one match
 return None if found is None else Principal(found.id, found.scope)
 ```
 
@@ -241,7 +241,7 @@ decision = authorise(route, scope["headers"], self.keyring)
 if decision.verdict is not Verdict.ALLOW:
     await self.refuse_auth(send, decision, request_id=rid, method=method, where=where)
     return
-scope[PRINCIPAL_KEY] = decision.principal      # "seriatim.principal": Principal | None
+scope[PRINCIPAL_KEY] = decision.principal  # "seriatim.principal": Principal | None
 ```
 
 - `self.keyring` is `keyring(settings)`, built once in `_Dispatcher.__init__`.
@@ -297,7 +297,7 @@ in a task group that the lifespan cancels on shutdown:
 async def _warn_unauthenticated(self) -> None:
     while True:
         self.log.event("unauthenticated", level="WARNING", message=ALLOW_WARNING)
-        await anyio.sleep(self.warn_every_s)       # 3600; create_app(…, warn_every_s=…) in tests
+        await anyio.sleep(self.warn_every_s)  # 3600; create_app(…, warn_every_s=…) in tests
 ```
 
 - The first line is written when the lifespan starts, then one every hour (Q14). The stderr
