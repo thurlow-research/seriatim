@@ -29,7 +29,6 @@ import jsonschema
 import pytest
 import yaml
 from harness import (
-    TICK_S,
     TIMING_BOUND_S,
     WAIT_S,
     Hold,
@@ -44,6 +43,7 @@ from harness import (
     reset_after,
     sequence,
     status,
+    timer_slack,
     wait_closed,
     wait_for,
 )
@@ -254,7 +254,7 @@ def test_s7_the_hold_limit_mid_stream(fake_ollama, sidecar, record_validator, ca
     car = sidecar(fake_ollama.url, gate=gate)
     started = time.perf_counter()
     _, got = _aborted(car)
-    assert 1 - TICK_S <= time.perf_counter() - started < 1 + TIMING_BOUND_S
+    assert 1 - timer_slack() <= time.perf_counter() - started < 1 + TIMING_BOUND_S
     assert got.startswith(LINE_1)
     _record(got[len(LINE_1) :], "LOCK_HOLD_EXCEEDED", record_validator)
     wait_for(lambda: _slot_states(gate) == ["draining"])
@@ -275,7 +275,7 @@ def test_s8_the_hold_limit_before_the_headers(fake_ollama, sidecar, envelope_val
     car = sidecar(fake_ollama.url, gate=gate)
     started = time.perf_counter()
     resp = httpx.post(car.url + "/api/chat", content=b"{}", timeout=WAIT_S)
-    assert 1 - TICK_S <= time.perf_counter() - started < 1 + TIMING_BOUND_S
+    assert 1 - timer_slack() <= time.perf_counter() - started < 1 + TIMING_BOUND_S
     assert resp.status_code == 504
     doc = json.loads(resp.content)
     envelope_validator.validate(doc)
@@ -931,7 +931,7 @@ def test_s12_a_second_cancellation_while_the_close_is_pending(monkeypatch, capsy
 
     started = time.perf_counter()
     task = asyncio.run(main())
-    assert time.perf_counter() - started >= SLOW_CLOSE_S - TICK_S
+    assert time.perf_counter() - started >= SLOW_CLOSE_S - timer_slack()
     assert task.cancelled()
     assert seen == {"at_second": (False, ["held"])}
     (client,) = clients
@@ -1051,7 +1051,7 @@ def test_s14_a_slow_reader_until_the_hold_deadline(raw_upstream, sidecar, capsys
         wait_for(lambda: written["failed_at"] is not None)
         wait_for(lambda: _slot_states(gate) == ["draining"])
     assert written["bytes"] < BIG  # the fake's writes blocked: the upstream reads paused
-    assert 1 - TICK_S <= written["failed_at"] - started < 1 + TIMING_BOUND_S
+    assert 1 - timer_slack() <= written["failed_at"] - started < 1 + TIMING_BOUND_S
     (line,) = _chat_lines(capsys, 1)
     assert (line["level"], line["outcome"], line["slot_end"]) == (
         "CRITICAL",
@@ -1085,7 +1085,7 @@ def test_s15_the_final_write_hangs_or_raises(final, monkeypatch, capsys):
     assert at_final == [["free"]]  # the slot was already free when the write began
     assert _slot_states(gate) == ["free"] and ends == [("finish", True)]  # and it stays free
     if final == "hang":
-        assert FINAL_CLOSE_S - TICK_S <= elapsed < FINAL_CLOSE_S + TIMING_BOUND_S  # on time
+        assert FINAL_CLOSE_S - timer_slack() <= elapsed < FINAL_CLOSE_S + TIMING_BOUND_S  # on time
     else:
         assert elapsed < TIMING_BOUND_S
     (line,) = _log(capsys)  # one line per request, even at DEBUG (L2; ruled on #60)
@@ -1243,7 +1243,7 @@ def test_f4_an_unproven_close_marks_the_slot_stuck(how, fake_ollama, sidecar, mo
     wait_for(lambda: _slot_states(gate) == ["stuck"])
     stuck_after = time.perf_counter() - started
     if how == "hang":  # step (a) waited for its bound, then gave up
-        assert F4_CLOSE_S - TICK_S <= stuck_after < F4_CLOSE_S + TIMING_BOUND_S
+        assert F4_CLOSE_S - timer_slack() <= stuck_after < F4_CLOSE_S + TIMING_BOUND_S
     else:
         assert stuck_after < TIMING_BOUND_S
     busy = refused_post(car.url + "/api/chat")

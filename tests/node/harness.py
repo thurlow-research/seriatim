@@ -45,7 +45,8 @@ from seriatim_node.gate import Gate, SlotState
 LOOPBACK = "127.0.0.1"
 # TD §7 "Timing": an elapsed-time assertion may overrun its target by this much.
 TIMING_BOUND_S = 0.5 if os.environ.get("CI") == "true" else 0.1
-# asyncio fires a timer up to one monotonic tick early (~15.6 ms on Windows; #97).
+# The asyncio loop's clock is time.monotonic(); its tick is TICK_S (about 15.6 ms on Windows up
+# to Python 3.12, and tiny on Linux, macOS and Windows 3.13+). See `timer_slack` (#97).
 TICK_S = time.get_clock_info("monotonic").resolution
 STALL_LIMIT_S = 30.0  # a stalled fake gives up after this, so teardown can never hang
 WAIT_S = 5.0  # TD §7: tests wait on events for at most this long, so a hang fails the test
@@ -53,6 +54,16 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "ollama-0.40.16.jso
 # Resolved from this file, so the same path works when mutmut copies tests/ and contract/ into
 # node/ (tools/ci/mutation.py).
 CONTRACT_PATH = Path(__file__).resolve().parents[2] / "contract" / "openapi.yaml"
+
+
+def timer_slack(n: int = 1) -> float:
+    """How much earlier than its delay, by perf_counter, a chain of `n` event-loop timers can
+    end: (n + 1) ticks. Each timer's deadline is loop.time() + delay, and loop.time() lags real
+    time by up to a tick, so the chain's first deadline is up to one tick early. Then the loop
+    runs any timer due within one tick of loop.time(), so each timer can fire one tick early
+    again. Each bound is strict, so no extra margin is added for delays that aren't a whole
+    number of ticks."""
+    return (n + 1) * TICK_S
 
 
 def refused_post(url: str, **kw: Any) -> httpx.Response:
