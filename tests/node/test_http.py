@@ -65,6 +65,7 @@ from harness import (
     stall_body,
     stall_headers,
     status,
+    timer_slack,
     wait_for,
 )
 from openapi_spec_validator import OpenAPIV31SpecValidator, validate
@@ -2272,7 +2273,7 @@ def test_read_body_limit_and_total_timeout():
     started = time.perf_counter()
     with pytest.raises(proxy_module.BodyTimeout):
         anyio.run(lambda: read([part(b"a")], timeout_s=0.2))
-    assert 0.2 * 0.9 <= time.perf_counter() - started < 0.2 + TIMING_BOUND_S
+    assert 0.2 - timer_slack() <= time.perf_counter() - started < 0.2 + TIMING_BOUND_S
 
 
 @pytest.mark.td("E3")
@@ -3136,7 +3137,7 @@ def test_h14_a_full_ungated_pool_saturates_only_ungated_traffic(
     car, resp, elapsed, hold, held = _saturated(fake_ollama, sidecar)
     assert resp.status_code == 503
     assert resp.json()["error_code"] == "NODE_SATURATED"
-    assert POOL_WAIT_S <= elapsed < POOL_WAIT_S + TIMING_BOUND_S  # the pool's own timeout
+    assert POOL_WAIT_S - timer_slack() <= elapsed < POOL_WAIT_S + TIMING_BOUND_S  # pool timeout
     assert hold.entered == UNGATED_SLOTS  # the 17th never reached Ollama
     chat = _chat(car)  # gated: its own client, never the shared pool
     assert (chat.status_code, chat.headers["x-seriatim-gate"]) == (200, "acquired")
@@ -3201,7 +3202,7 @@ def test_h26_a_stall_before_the_headers_is_a_502(fake_ollama, sidecar, envelope_
     assert resp.status_code == 502
     _error_doc(resp.content, ErrorCode.UPSTREAM_PROTOCOL_ERROR, envelope_validator)
     assert resp.headers.get_list("x-seriatim-gate") == ["ungated"]
-    assert UNGATED_READ_S <= elapsed < UNGATED_READ_S + TIMING_BOUND_S
+    assert UNGATED_READ_S - timer_slack() <= elapsed < UNGATED_READ_S + TIMING_BOUND_S
     _ungated_case(car, capsys, "upstream_error")
     assert acquired == [] and all_free(gate)
 
@@ -3220,7 +3221,7 @@ def test_h26_a_stall_after_the_headers_aborts(fake_ollama, sidecar, capsys):
                 got += chunk
     elapsed = time.perf_counter() - started
     assert (resp.status_code, got) == (200, b'{"a":')  # a content-length: no record
-    assert UNGATED_READ_S <= elapsed < UNGATED_READ_S + TIMING_BOUND_S
+    assert UNGATED_READ_S - timer_slack() <= elapsed < UNGATED_READ_S + TIMING_BOUND_S
     _ungated_case(car, capsys, "upstream_error")
     assert acquired == [] and all_free(gate)
 
@@ -3320,8 +3321,10 @@ def test_h26_a_blocked_close_of_the_shared_response_is_bounded(end, fake_ollama,
     fault_s = 0 if end == "clean" else UNGATED_READ_S  # when the exchange ended
     assert got == (b'{"models":[]}' if end == "clean" else b'{"a":')
     # Step (a) gave up on the close after close_timeout_s; the client was then answered or
-    # aborted well within 2 x close_timeout_s of the exchange's end.
-    assert fault_s + CLOSE_S <= elapsed < fault_s + 2 * CLOSE_S
+    # aborted well within 2 x close_timeout_s of the exchange's end. On an abort two timers
+    # run in turn (the read timeout, then the close timeout), so the lower bound allows for a
+    # chain of two (`timer_slack`); a clean end runs only the second.
+    assert fault_s + CLOSE_S - timer_slack(2) <= elapsed < fault_s + 2 * CLOSE_S
     assert (line["level"], line["upstream_close_failed"], line["slot_end"]) == (
         "ERROR",
         True,
@@ -3483,7 +3486,7 @@ def test_first_chunk():
     started = time.perf_counter()
     with pytest.raises(proxy_module.BodyTimeout):
         anyio.run(first, [_part(b"")], 0.2)  # empty chunks are not the first chunk
-    assert 0.2 * 0.9 <= time.perf_counter() - started < 0.2 + TIMING_BOUND_S
+    assert 0.2 - timer_slack() <= time.perf_counter() - started < 0.2 + TIMING_BOUND_S
 
 
 def _stream(messages, first=b"f", more=True, *, timeout_s=WAIT_S, every_s=0.0):
@@ -3524,7 +3527,7 @@ def test_body_stream_interruptions():
     assert events == [b"f", b"a"] and error.gone and str(error) == "the client left"
     started = time.perf_counter()
     events, error = _stream([_part(b"a")], timeout_s=0.2)
-    assert 0.2 * 0.9 <= time.perf_counter() - started < 0.2 + TIMING_BOUND_S
+    assert 0.2 - timer_slack() <= time.perf_counter() - started < 0.2 + TIMING_BOUND_S
     assert events == [b"f", b"a"] and not error.gone and str(error) == "the upload stalled"
 
 
