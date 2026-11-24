@@ -198,6 +198,7 @@ def assert_refused(
     assert values(resp, "x-seriatim-gate") == ["ungated"]
     assert values(resp, "x-seriatim-node") == ["node-a"]
     assert (line["status"], line["outcome"], line["level"]) == (*want, "INFO")
+    assert line["method"] == method
     assert line["client"] == client and line["slot_end"] == "none"
     assert "error_code" not in line
     if method == "HEAD":
