@@ -1,4 +1,10 @@
-"""TD-slice-1 §8.1: configuration (C1 to C11; C8 is `main()`)."""
+"""TD-slice-1 §8.1: configuration (C1 to C11; C8 is `main()`).
+
+From S2 the sidecar refuses to start with no keys unless `ALLOW_UNAUTHENTICATED` is set
+(TD-slice-2 Q13). So wherever these tests load settings with neither, `load` and `refused`
+add a baseline file with one key, and a refusal they assert is still the one they test
+(TD-slice-2 Appendix B).
+"""
 
 from __future__ import annotations
 
@@ -10,23 +16,38 @@ from pathlib import Path
 
 import anyio
 import pytest
+from harness import key_tables
 
 from seriatim_node import app, config
+from seriatim_node.auth import new_key
 from seriatim_node.config import ConfigError, Settings, default_lock_dir, load_settings
 
 P = "SERIATIM_NODE_"
 # The tests feed this to the validator to check it is refused; nothing binds to it.
 ALL_INTERFACES = "0.0.0.0"  # nosec B104 # a test input for the listen-address check, never bound
 FLOAT_FIELDS = [name for name, f in Settings.model_fields.items() if f.annotation is float]
+BASELINE: dict[str, str] = {}  # SERIATIM_NODE_CONFIG: a file with one key (`_baseline`)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _baseline(tmp_path_factory):
+    path = tmp_path_factory.mktemp("baseline") / "node.toml"
+    path.write_text(key_tables([("base", "infer", new_key())]), encoding="utf-8")
+    BASELINE[P + "CONFIG"] = str(path)
 
 
 def env(**kw: object) -> dict[str, str]:
     return {P + k.upper(): str(v) for k, v in kw.items()}
 
 
+def load(environ: dict[str, str]) -> Settings:
+    """`load_settings` with the one-key baseline file, unless `environ` names its own."""
+    return load_settings(BASELINE | environ)
+
+
 def refused(environ: dict[str, str], var: str) -> ConfigError:
     with pytest.raises(ConfigError) as e:
-        load_settings(environ)
+        load(environ)
     assert var in str(e.value)
     return e.value
 
@@ -39,7 +60,8 @@ def toml_file(tmp_path: Path, text: str) -> str:
 
 @pytest.mark.td("C1")
 def test_defaults():
-    s = load_settings({})
+    # Every default but the flag, without which no keys refuses to start (TD-slice-2 Q13).
+    s = load_settings(env(allow_unauthenticated="true"))
     assert s.model_dump() == {
         "listen_host": "127.0.0.1",
         "listen_port": 11434,
@@ -55,10 +77,12 @@ def test_defaults():
         "max_body_bytes": 67108864,
         "body_timeout_s": 30,
         "health_probe_timeout_s": 2,
-        "allow_unauthenticated": False,
+        "allow_unauthenticated": True,
         "lock_dir": default_lock_dir(),
         "log_level": "INFO",
+        "keys": (),
     }
+    assert Settings.model_fields["allow_unauthenticated"].default is False
     assert str(s.ollama_url) == "http://127.0.0.1:11435/"
 
 
@@ -82,7 +106,8 @@ def test_default_lock_dir_per_os(monkeypatch, platform, program_data, expected):
 
 @pytest.mark.td("C2")
 def test_file_then_environment(tmp_path):
-    path = toml_file(tmp_path, 'slots = 2\nid = "node-b"\nretry_after_s = 30\n')
+    keys = key_tables([("base", "infer", new_key())])
+    path = toml_file(tmp_path, 'slots = 2\nid = "node-b"\nretry_after_s = 30\n' + keys)
     s = load_settings({P + "CONFIG": path, P + "SLOTS": "3"})
     assert (s.slots, s.id, s.retry_after_s) == (3, "node-b", 30)
 
@@ -155,7 +180,7 @@ def test_ollama_url_refused(url):
     ],
 )
 def test_ollama_url_accepted(url):
-    s = load_settings({P + "OLLAMA_URL": url})
+    s = load({P + "OLLAMA_URL": url})
     assert str(s.ollama_url).rstrip("/") == url.rstrip("/")
 
 
@@ -168,18 +193,29 @@ def test_ollama_url_in_the_file_is_checked_too(tmp_path):
 @pytest.mark.td("C4")
 def test_the_real_environment_is_never_read(monkeypatch):
     monkeypatch.setenv(P + "SLOTS", "5")
-    assert load_settings({}).slots == 1
+    assert load({}).slots == 1
+
+
+def warnings_in(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 @pytest.mark.td("C5")
-def test_non_loopback_listen_needs_allow_unauthenticated(caplog):
+def test_non_loopback_listen_is_refused_even_with_allow_unauthenticated(caplog):
+    # The flag never relaxes the listen address (TD-slice-2 S2-R2), and settings that a step
+    # refuses log no startup warning.
     refused(env(listen_host=ALL_INTERFACES), P + "LISTEN_HOST")
     with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
-        s = load_settings(env(listen_host=ALL_INTERFACES, allow_unauthenticated="true"))
-    assert s.listen_host == ALL_INTERFACES
+        refused(env(listen_host=ALL_INTERFACES, allow_unauthenticated="true"), P + "LISTEN_HOST")
+    assert warnings_in(caplog) == []
+
+
+@pytest.mark.td("C5")
+def test_allow_unauthenticated_logs_a_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
+        s = load_settings(env(allow_unauthenticated="true"))
     assert s.allow_unauthenticated is True
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert [w.getMessage() for w in warnings] == [
+    assert warnings_in(caplog) == [
         "SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true: the sidecar has no authentication"
         " (PPE and test mode only)"
     ]
@@ -188,8 +224,8 @@ def test_non_loopback_listen_needs_allow_unauthenticated(caplog):
 @pytest.mark.td("C5")
 def test_no_warning_by_default(caplog):
     with caplog.at_level(logging.DEBUG, logger="seriatim_node.config"):
-        load_settings({})
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        load({})
+    assert warnings_in(caplog) == []
 
 
 @pytest.mark.td("C5")
@@ -206,7 +242,7 @@ def test_lock_dir_needs_allow_unauthenticated(tmp_path):
 
 @pytest.mark.td("C5")
 def test_the_default_lock_dir_may_be_named():
-    assert load_settings(env(lock_dir=default_lock_dir())).lock_dir == default_lock_dir()
+    assert load(env(lock_dir=default_lock_dir())).lock_dir == default_lock_dir()
 
 
 @pytest.mark.td("C6")
@@ -217,7 +253,7 @@ def test_unknown_node_variable(key):
 
 @pytest.mark.td("C6")
 def test_other_seriatim_variables_are_ignored():
-    s = load_settings(
+    s = load(
         {
             "SERIATIM_APP_ID": "1",
             "SERIATIM_CONFIG_DIR": "/x",
@@ -225,7 +261,7 @@ def test_other_seriatim_variables_are_ignored():
             "SERIATIM_NODEX": "1",
         }
     )
-    assert s == load_settings({})
+    assert s == load({})
 
 
 @pytest.mark.td("C7")
@@ -333,7 +369,7 @@ def test_float_fields_are_the_seven_in_the_td():
     ],
 )
 def test_boundaries_accepted(key, value, attr, expected):
-    assert getattr(load_settings({P + key: value}), attr) == expected
+    assert getattr(load({P + key: value}), attr) == expected
 
 
 @pytest.mark.td("C10")
@@ -354,25 +390,26 @@ def test_unreadable_config_file(tmp_path):
 def test_dotenv_is_ignored(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text(P + "SLOTS=5\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    assert load_settings({}).slots == 1
+    assert load({}).slots == 1
 
 
 @pytest.mark.td("C11")
+@pytest.mark.parametrize("allow", ["false", "true"])
 @pytest.mark.parametrize(
     "host", ["192.0.2.10", "::", "example.com", "localhost", ALL_INTERFACES, "::ffff:127.0.0.1", ""]
 )
-def test_listen_host_refused(host):
-    err = refused(env(listen_host=host), P + "LISTEN_HOST")
+def test_listen_host_refused(host, allow):
+    err = refused(env(listen_host=host, allow_unauthenticated=allow), P + "LISTEN_HOST")
     assert str(err) == (
         f"SERIATIM_NODE_LISTEN_HOST: {host!r} is not a loopback IP literal;"
-        " a non-loopback address needs SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true"
+        " a non-loopback address needs keys and the exposure check (S4a)"
     )
 
 
 @pytest.mark.td("C11")
 @pytest.mark.parametrize("host", ["::1", "127.0.0.2", "127.0.0.1"])
 def test_listen_host_loopback_accepted(host):
-    assert load_settings(env(listen_host=host)).listen_host == host
+    assert load(env(listen_host=host)).listen_host == host
 
 
 def test_settings_reads_no_source_but_its_arguments(monkeypatch):

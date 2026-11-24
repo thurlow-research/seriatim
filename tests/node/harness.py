@@ -26,9 +26,10 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -43,6 +44,7 @@ from seriatim_node.config import Settings, load_settings
 from seriatim_node.gate import Gate, SlotState
 
 LOOPBACK = "127.0.0.1"
+READY_PATH = "/seriatim/ready"  # not a Seriatim route: the sidecar answers it 404 itself
 # TD §7 "Timing": an elapsed-time assertion may overrun its target by this much.
 TIMING_BOUND_S = 0.5 if os.environ.get("CI") == "true" else 0.1
 # The asyncio loop's clock is time.monotonic(); its tick is TICK_S (about 15.6 ms on Windows up
@@ -638,10 +640,32 @@ def all_free(gate: Gate) -> bool:
     return all(s.state is SlotState.FREE for s in gate.slots())
 
 
-def make_settings(ollama_url: str, **overrides: object) -> Settings:
+def key_tables(keys: Sequence[tuple[str, str, str]]) -> str:
+    """`[[keys]]` tables for `(id, scope, key)` triples, each with the key's SHA-256, as
+    `keygen` prints them (TD-slice-2 §6, §7)."""
+    return "".join(
+        f'[[keys]]\nid = "{id}"\nscope = "{scope}"\n'
+        f'sha256 = "{hashlib.sha256(key.encode("ascii")).hexdigest()}"\n\n'
+        for id, scope, key in keys
+    )
+
+
+def make_settings(
+    ollama_url: str, *, keys: Sequence[tuple[str, str, str]] = (), **overrides: object
+) -> Settings:
+    """Settings for a test sidecar. With no `keys`, unauthenticated test mode, S1's behaviour
+    (TD-slice-2 Q12). With `keys`, `(id, scope, key)` triples, written as `[[keys]]` to a
+    temporary `SERIATIM_NODE_CONFIG` file, and the flag is not set (TD-slice-2 Appendix B)."""
     env = {"SERIATIM_NODE_OLLAMA_URL": ollama_url, "SERIATIM_NODE_ID": "node-a"}
+    if not keys:
+        env["SERIATIM_NODE_ALLOW_UNAUTHENTICATED"] = "true"
     env |= {f"SERIATIM_NODE_{k.upper()}": str(v) for k, v in overrides.items()}
-    return load_settings(env)
+    if not keys:
+        return load_settings(env)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "node.toml"
+        path.write_text(key_tables(keys), encoding="utf-8")
+        return load_settings(env | {"SERIATIM_NODE_CONFIG": str(path)})
 
 
 @dataclass
@@ -789,15 +813,21 @@ class SidecarProcess:
         return self.stderr_path.read_text(encoding="utf-8", errors="replace")
 
     def wait_listening(self, timeout: float = PROCESS_S) -> None:
-        """Wait until the sidecar accepts connections; fail if it exits first."""
+        """Wait until the sidecar answers HTTP; fail if it exits first.
+
+        An accepted connection is not enough: on Windows, straight after a restart on the same
+        port, one can be accepted and then reset (#107). `READY_PATH` is answered 404 by the
+        sidecar itself, so it never reaches the upstream or the gate.
+        """
         deadline = time.monotonic() + timeout
         while True:
             if self.proc.poll() is not None:
                 raise AssertionError(f"the sidecar exited {self.proc.returncode}: {self.stderr()}")
             try:
-                socket.create_connection((LOOPBACK, self.port), timeout=1).close()
+                resp = httpx.get(self.url + READY_PATH, timeout=1)
+                assert resp.headers.get("x-seriatim-node"), resp  # the sidecar, not another server
                 return
-            except OSError:
+            except httpx.TransportError:
                 if time.monotonic() > deadline:
                     raise AssertionError("the sidecar did not start listening") from None
                 time.sleep(0.01)

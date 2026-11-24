@@ -4763,16 +4763,27 @@ def test_hl8_health_under_load_while_ollama_stalls(
 ):
     _room_for_sockets(HEALTH_LOAD)
     handled: list[float] = []
+    handled_at: list[float] = []  # when each health handler returned, in the sidecar
+    chat_served: list[float] = []  # when the sidecar finished the chat
     inner = _Dispatcher._health
+    dispatch = _Dispatcher.__call__
 
     async def timed(self, request):
         started = time.perf_counter()
         try:
             return await inner(self, request)
         finally:
-            handled.append(time.perf_counter() - started)
+            ended = time.perf_counter()
+            handled.append(ended - started)
+            handled_at.append(ended)
+
+    async def timed_dispatch(self, scope, receive, send):
+        await dispatch(self, scope, receive, send)
+        if scope["type"] == "http" and scope["path"] == "/api/chat":
+            chat_served.append(time.perf_counter())
 
     monkeypatch.setattr(_Dispatcher, "_health", timed)
+    monkeypatch.setattr(_Dispatcher, "__call__", timed_dispatch)
     fake_ollama.script("GET", "/api/version", stall_headers())
     fake_ollama.script("POST", "/api/chat", status(200, b'{"done":true}'))
     car = sidecar(fake_ollama.url, gate=ready_gate()[0], health_probe_timeout_s=HL8_PROBE_S)
@@ -4791,7 +4802,10 @@ def test_hl8_health_under_load_while_ollama_stalls(
     # probe ever waits for another's budget: that would take 200 of them.
     assert max(elapsed for _, _, elapsed, _ in health) < 2 * HL8_PROBE_S + TIMING_BOUND_S
     assert chat["status"] == 200  # a gated request is served meanwhile,
-    assert chat["done"] < min(end for *_, end in health)  # before any stalled probe gave up
+    # before any stalled probe gave up. Both are timed in the sidecar, so the client's own
+    # queue for 200 responses doesn't count (#105).
+    assert len(chat_served) == 1
+    assert chat_served[0] < min(handled_at)
 
 
 @pytest.mark.td("HL8")

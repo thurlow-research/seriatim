@@ -24,8 +24,9 @@ delivered, as §9 lists them.)
 - TLS (S11).
 
 **Exposure before S4a.** Until S2 and S4a land, the sidecar has no authentication and no
-exposure check. It therefore refuses a non-loopback listen address unless
-`SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` is set (SPEC REQ-15), and only the PPE sets that.
+exposure check. In S1 it therefore refused a non-loopback listen address unless
+`SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` was set, which only the PPE set. From S2 it refuses
+one whatever that flag says, until S4a (SPEC REQ-15; TD-slice-2 S2-R2).
 Slices S1 to S3 are not deployed to GPU nodes. The first node deploy needs S4a, because REQ-19
 must pass before anything is admitted.
 
@@ -121,10 +122,13 @@ in `gate.py` and checked against the route probe (K3).
    - the host is an IP literal in `127.0.0.0/8`, or `::1`.
 
    `localhost` is a name, not a literal, so it is refused. No name resolution ever happens.
-5. **Listen address.** If `listen_host` is not a loopback literal and `allow_unauthenticated`
-   is false, raise `ConfigError`. When it is true, `load_settings` logs a `WARNING`, so it
-   appears at startup. As for `ollama_url`, a name is not a literal: `localhost` is refused
-   too, and so is any non-loopback IPv6 address, including `::` (C11).
+5. **Listen address.** If `listen_host` is not a loopback literal, raise `ConfigError`. From
+   S2 this holds whatever `allow_unauthenticated` says (TD-slice-2 §2.2, S2-R2); in S1 the
+   flag allowed it. As for `ollama_url`, a name is not a literal: `localhost` is refused too,
+   and so is any non-loopback IPv6 address, including `::` (C11). When `allow_unauthenticated`
+   is true, `load_settings` logs a `WARNING`, so it appears at startup. S1 logged it here; S2
+   moves it to a last step, after the keys are checked, so settings that are refused log no
+   warning (TD-slice-2 §2.2, step 8).
 6. **Lock directory.** A `lock_dir` other than `default_lock_dir()` is accepted only when
    `allow_unauthenticated` is true, which is the PPE and test mode. Otherwise it raises
    `ConfigError`. Two production sidecars therefore always meet at the same lock file, and
@@ -676,6 +680,9 @@ far.
     event loop's queue for 200 requests at once comes on top: about 0.1 s locally, and more on
     a slow runner. That isn't the probe's time, so the client-side check is looser: every
     answer within twice the timeout plus the bound. No probe waits for another's budget.
+    "A gated `/api/chat` sent meanwhile gets 200" is checked in the sidecar too: the
+    dispatcher finishes the chat before any health handler returns. Timed from the client,
+    the chat can lose by a few ms to the client's own queue on a slow runner (#105).
   - **Answering.** The 200 probes queue for the health client's one connection, and each
     probe's budget includes that wait (§3.4). So the case sets `health_probe_timeout_s=20`
     to show that load alone never causes an error. With a slow Ollama and the default 2 s, a
@@ -1177,7 +1184,7 @@ can be set in the TOML file named by `SERIATIM_NODE_CONFIG`.
 
 | variable | default | rule |
 |---|---|---|
-| `SERIATIM_NODE_LISTEN_HOST` | `127.0.0.1` | if not loopback, needs `ALLOW_UNAUTHENTICATED` (S1–S3) |
+| `SERIATIM_NODE_LISTEN_HOST` | `127.0.0.1` | loopback literal only, whatever `ALLOW_UNAUTHENTICATED` says (S1–S3; TD-slice-2 S2-R2) |
 | `SERIATIM_NODE_LISTEN_PORT` | `11434` | 1–65535 |
 | `SERIATIM_NODE_OLLAMA_URL` | `http://127.0.0.1:11435` | `http`, loopback literal, no path, query or user info |
 | `SERIATIM_NODE_ID` | `node` | `^[a-z0-9][a-z0-9-]{0,31}$` |
@@ -1197,11 +1204,13 @@ can be set in the TOML file named by `SERIATIM_NODE_CONFIG`.
 | `SERIATIM_NODE_CONFIG` | unset | path to TOML; must exist if set |
 
 In the PPE, the compose file sets these, inside the container's network namespace:
-- `LISTEN_HOST=0.0.0.0` and `ALLOW_UNAUTHENTICATED=true`;
+- `LISTEN_HOST=127.0.0.1` and `ALLOW_UNAUTHENTICATED=true`, with no keys (TD-slice-2 §6);
 - `LOCK_DIR=/run/seriatim`, on a tmpfs;
-- `LISTEN_PORT=11436`, `ID=node-a` and `DRAIN_S=10` (S1-14, §8.6).
+- `LISTEN_PORT=11437`, `ID=node-a` and `DRAIN_S=10` (S1-14, §8.6).
 
-The published port is bound to `127.0.0.1` on the host.
+A forwarder in the same namespace, `fwd-a`, publishes the sidecar on port 11436, bound to
+`127.0.0.1` on the host (TD-slice-2 §6, S2-R2, S2-R8). S1-14 had the sidecar itself listen on
+`0.0.0.0:11436`, which S2's loopback rule refuses.
 
 ## 7. Test harness (`tests/node/conftest.py`)
 
@@ -1251,17 +1260,17 @@ also run on `windows-latest` and `macos-latest`.
 
 | id | test | REQ |
 |---|---|---|
-| C1 | `load_settings({})` gives the defaults in §6 exactly, including the per-OS lock directory | 23 |
+| C1 | `load_settings` gives the defaults in §6 exactly, including the per-OS lock directory, and `keys: ()`. From S2 it is called with `ALLOW_UNAUTHENTICATED=true`, since no keys without it refuses to start (TD-slice-2 Q13); the flag's default is still `false`. C2 to C11 load with a one-key baseline file wherever they set neither (TD-slice-2 Appendix B) | 23 |
 | C2 | A TOML file sets `slots=2` and the environment sets `SERIATIM_NODE_SLOTS=3` → 3; keys set only in the file are applied; an unknown key in the file → `ConfigError` naming it | 23 |
 | C3 | Out of range or wrong type → `ConfigError` whose message contains the variable name. Cases: `SLOTS` = `abc`, `0`, `-1`, `65`; `RETRY_AFTER_S=0`; `DRAIN_S` = `0` or `0.5`; `MAX_HOLD_S=0`; `CLOSE_TIMEOUT_S=0` | 23, 2, 10 |
 | C4 | `OLLAMA_URL` → `ConfigError` for: `http://192.0.2.5:11435`, `http://example.com:11435`, `http://localhost:11435`, `http://0.0.0.0:11435`, `https://127.0.0.1:11435`, `http://127.0.0.1:11435/x`, `http://127.0.0.1:11435/?a`, `http://127.0.0.1:11435/#f`, `http://u:p@127.0.0.1:11435`, `http://127.0.0.1` (no port). Accepted: `http://[::1]:11435` and `http://127.0.0.2:11435`. `load_settings({})` with `SERIATIM_NODE_SLOTS=5` set in the real `os.environ` still gives `slots == 1` | 1, 23 |
-| C5 | `LISTEN_HOST=0.0.0.0` without `ALLOW_UNAUTHENTICATED` → `ConfigError`; with it, accepted, and a `WARNING` is captured. `LOCK_DIR=/tmp/x` without `ALLOW_UNAUTHENTICATED` → `ConfigError`; with it, accepted | 15, 12b |
+| C5 | `LISTEN_HOST=0.0.0.0` → `ConfigError`, without `ALLOW_UNAUTHENTICATED` and, from S2, with it too (TD-slice-2 S2-R2), and no `WARNING` is logged for the refused settings. `ALLOW_UNAUTHENTICATED=true` with a loopback host → accepted, and a `WARNING` is captured; without it, no warning. `LOCK_DIR=/tmp/x` without `ALLOW_UNAUTHENTICATED` → `ConfigError`; with it, accepted | 15, 12b |
 | C6 | `SERIATIM_NODE_SLOTZ=1` → `ConfigError` naming it. `SERIATIM_APP_ID=1`, `SERIATIM_CONFIG_DIR=/x` and `SERIATIM_GW_FOO=1` are ignored | 23 |
 | C7 | `SERIATIM_NODE_CONFIG=/nonexistent.toml` → `ConfigError`; a malformed TOML file, including one that is not valid UTF-8 (TOML must be), → `ConfigError` naming `SERIATIM_NODE_CONFIG` | 23 |
 | C8 | `main()` with invalid config exits 2 and prints the key. With valid config it calls `uvicorn.run` with `workers=1` and `http="h11"` (monkeypatched) | 21, 23 |
 | C9 | Ranges and types C3 doesn't cover → `ConfigError` naming the variable. `LISTEN_PORT` = `0`, `65536`, `x`; `ID` = `Node`, `-a`, 33 characters, empty; `CONNECT_TIMEOUT_S` and `CLOSE_TIMEOUT_S` = `0`, `61`; `UNGATED_READ_TIMEOUT_S` = `0`, `3601`; `MAX_BODY_BYTES=1023`; `BODY_TIMEOUT_S` = `0`, `3601`; `HEALTH_PROBE_TIMEOUT_S` = `0`, `31`; `LOG_LEVEL` = `debug`, `TRACE`. Every float field also refuses `nan`, `inf` and `-inf`. The boundary values (`1`, `65535`, `60`, `3600`, `1024`, `30`) are accepted | 23 |
 | C10 | `SERIATIM_NODE_CONFIG` names a file that exists but can't be read (POSIX, mode `000`; skipped on Windows and as root) → `ConfigError` naming `SERIATIM_NODE_CONFIG`. A `.env` file in the working directory with `SERIATIM_NODE_SLOTS=5` → ignored: `slots == 1` | 23 |
-| C11 | `LISTEN_HOST` = `192.0.2.10`, `::`, `example.com` or `localhost`, without `ALLOW_UNAUTHENTICATED` → `ConfigError` naming it; `::1` and `127.0.0.2` are accepted | 15 |
+| C11 | `LISTEN_HOST` = `192.0.2.10`, `::`, `example.com` or `localhost` → `ConfigError` naming it, with or without `ALLOW_UNAUTHENTICATED` (the flag never relaxes it from S2, TD-slice-2 S2-R2); `::1` and `127.0.0.2` are accepted | 15 |
 
 ### 8.2 `test_gate.py`
 
@@ -1419,6 +1428,10 @@ also run on `windows-latest` and `macos-latest`.
   one is admitted, and that one arrives at least `drain_s` after the spawn and at most
   `drain_s` plus the poll interval and `TIMING_BOUND_S` after the port first accepted.
 - **R2's "same port"** is the same listen port, upstream and lock directory.
+- **"Listening" (`SidecarProcess.wait_listening`)** means the sidecar answers HTTP: a GET of
+  `/seriatim/ready`, which is no route, so the sidecar answers it 404 itself, without the gate
+  or the upstream. An accepted connection is not enough. On Windows, straight after R2's
+  restart on the same port, one was accepted and then reset (#107).
 - **R8** does not assert an exit code: after a graceful stop uvicorn re-raises the `SIGTERM`
   it caught. On Windows `Popen.terminate()` is `TerminateProcess`, so R8 there checks the file
   after a hard stop.
@@ -1460,12 +1473,16 @@ tests and `Enforced: yes`.
     host runs the same script first. Before writing, it refuses a `ppe/data` or
     `ppe/data/node` that is a symlink or resolves outside ppe/, with the guard's own check.
     `tests/tools/test_ppe_stage_node.py` checks its commands and that refusal.
-  - **Ports.** The sidecar listens on 11436, published as `127.0.0.1:11436` on `ollama-a`,
-    because `dbg-a` already has 11434 in the namespace. 11434 stays plain Ollama, so S0b's
-    checks and `capture_fixtures.py` are unchanged. The tests get `SERIATIM_BASE_URL` (the
-    sidecar) and `SERIATIM_PPE_URL` (plain Ollama) from the job.
-  - **Limits.** cap-a drops to 0.25 CPU / 256 MiB, and node-a gets 0.5 CPU / 384 MiB. The
-    sum is 4 CPUs and 5.75 GiB, inside the guard's bound.
+  - **Ports.** The sidecar (node-a) listens on `127.0.0.1:11437` in `ollama-a`'s namespace.
+    `fwd-a`, a `socat` forwarder in the same namespace, listens on 11436 and passes each
+    connection to it; 11436 is published as `127.0.0.1:11436` on `ollama-a` (TD-slice-2 §6,
+    S2-R2). The sidecar can't take 11434, because `dbg-a` already has it in the namespace.
+    11434 stays plain Ollama, so S0b's checks and `capture_fixtures.py` are unchanged. The
+    tests get `SERIATIM_BASE_URL` (the sidecar, through `fwd-a`) and `SERIATIM_PPE_URL`
+    (plain Ollama) from the job.
+  - **Limits.** cap-a drops to 0.25 CPU / 256 MiB, node-a gets 0.5 CPU / 384 MiB, `fwd-a`
+    0.1 CPU / 64 MiB, and dbg-a drops to 0.15 CPU. The sum is 4.0 CPUs and 5,952 MiB,
+    inside the guard's bound.
   - **`BODY_TIMEOUT_S=300`** for node-a, so that P4's hold (below) covers a slow download.
   - **No `user`, `read_only` or `security_opt`.** None is on the guard's allowlist, and
     `security_opt` is one of the keys SPEC §8.3 refuses, so adding them would widen it.
@@ -1521,8 +1538,8 @@ tests and `Enforced: yes`.
   loads the model. The probe and the cancelled generation use the same model and context, so
   Ollama doesn't reload between them. The client disconnects after three records. The result
   goes into the job summary (`GITHUB_STEP_SUMMARY`) and the log.
-- **P7.** While node-a is down, the host's port forwarder still accepts on 11436 and then
-  drops the connection, so "the moment it accepts" means the first gated request that gets
+- **P7.** While node-a is down, `fwd-a` (the `socat` forwarder, which keeps running) still
+  accepts on 11436, and then drops the connection when it can't reach node-a, so "the moment it accepts" means the first gated request that gets
   an HTTP answer. That answer must be 503 `NODE_STARTING` with `X-Seriatim-Gate: refused`.
   Every answer after it is also `NODE_STARTING`, until a 200 arrives. Before the kill, the
   first record must not be the final one, so the kill lands mid-generation.

@@ -272,6 +272,53 @@ needs keys and the exposure check (S4a)`. Step 5 no longer logs the startup `WAR
 moves to step 8 (above). The flag's other test-mode relaxations are unchanged (another lock directory, REQ-12b; from S4b the probe fixture, REQ-16). The PPE
 therefore reaches its sidecar through container networking (§6).
 
+**Details fixed by the code (S2-2).** S2-2 adds the keys to `config.py`, the startup refusals,
+and the PPE layout of §6. Nothing enforces the keys until S2-3.
+- **Where an error is.** Step 3 names `loc[0]` as S1 does, then each further part of `loc`:
+  an index as `[<i>]`, a name as `.<name>`. So a bad table gives
+  `SERIATIM_NODE_KEYS[1].sha256: String should match pattern …`, an unknown field gives
+  `SERIATIM_NODE_KEYS[1].<unknown field>: Extra inputs are not permitted` (the field's name
+  comes from the file and could be a hash, so it is never echoed; `UNKNOWN_FIELD` in
+  `config.py`, and A3 has a case whose unknown field is named with a digest), and
+  `keys = "x"` gives
+  `SERIATIM_NODE_KEYS: Input should be a valid tuple`. pydantic's `msg` never holds the
+  input, so no message holds a configured `sha256`.
+- **Step 2** tests for `SERIATIM_NODE_KEYS` before the unknown-variable rule, so any value,
+  valid JSON or not, gets the one message: `SERIATIM_NODE_KEYS: keys are set in the
+  SERIATIM_NODE_CONFIG file only`.
+- **Step 5's message** drops S1's "needs `ALLOW_UNAUTHENTICATED=true`", as §2.2 says.
+- **Step 7's messages** are `SERIATIM_NODE_KEYS: at most 256 keys, not <n>`,
+  `SERIATIM_NODE_KEYS: the id '<id>' is repeated`, and `SERIATIM_NODE_KEYS: '<first>' and
+  '<repeat>' have the same sha256`, followed by §2.2's no-keys message. The count is checked
+  first. Then one pass, in configuration order, compares each key's id and then its digest
+  with the keys before it, and reports the first repeat it finds.
+- **Constants.** `KEYS_VAR`, `ALLOW_WITH_KEYS_WARNING` and `NO_KEYS` (the no-keys message)
+  are in `config.py`, beside `ALLOW_WARNING`. S2-5's hourly task can import both warnings
+  from there.
+- **`keyring()`** builds each entry with `Scope(key.scope)` and `bytes.fromhex(key.sha256)`.
+  Step 7 has already refused repeated ids and digests, so `Keyring`'s own `ValueError` can
+  come only from `Settings` built directly, which S2-3's `create_app` check handles.
+- **The S2-2 guard** (§9) is in `main()`, in the same `try` as `load_settings`: it raises
+  `ConfigError(app.KEYS_NOT_ENFORCED)`, so it prints `seriatim-node: <message>` on stderr and
+  exits 2 before the lock is taken. With the flag set, step 8's warning is logged first. Its
+  test also checks the load-level half of "keys with the flag": `keyring` gives a `Keyring`,
+  and the warning is the "keys are enforced" one. S2-3's A4 case for keys starting takes
+  that over when it removes the guard.
+- **`harness.make_settings(…, keys=…)`** takes `(id, scope, key)` triples. `key_tables()`
+  writes them as `[[keys]]` with each key's SHA-256, as `keygen` will print them. The file is
+  in a temporary directory that is removed once the settings are loaded. Overrides are
+  applied after the default flag, so a test can still pass `allow_unauthenticated=False`.
+- **Where the tests are.** A3 and A4 are in `test_auth.py`, as §1 says, with their own copy
+  of `test_config.py`'s `node_env` fixture. `test_config.py`'s one-key baseline is a
+  module-scoped file. `load()` and `refused()` add it unless a test names its own
+  `SERIATIM_NODE_CONFIG`. C5's warning case uses a loopback host with the flag now, because a
+  refused host logs no warning.
+- **`tests/tools/test_ppe_guard.py`** is changed as well, though §9's row doesn't list it.
+  Its committed-compose test asserts the service set and `node-a`'s listen address, so it now
+  checks `fwd-a` (its namespace, `cap_drop` and `socat` command) and `node-a` on
+  `127.0.0.1:11437`. The guard itself is unchanged, and it accepts the new file (4.0 CPUs,
+  5,952 MiB).
+
 ### 2.3 `gate.py`
 
 `classify()` is unchanged for every Ollama route. For `/seriatim/*`, the scope it returns

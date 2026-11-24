@@ -1,5 +1,5 @@
 """`auth.py` (TD-slice-2 §2.1, §4, §7): reading credentials (A1), the keyring, scopes and keys
-(A2), and `authorise`.
+(A2), and `authorise`; keys in the configuration (A3) and the startup refusals (A4).
 
 Keys come from `new_key()`, never from a literal, so nothing that looks like a key is committed
 (TD-slice-2 §8).
@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import logging
+import os
 import re
+from pathlib import Path
 
 import pytest
+from harness import key_tables
 from hypothesis import given
 from hypothesis import strategies as st
 
 import seriatim_node.auth as auth
+from seriatim_node import app
 from seriatim_node.auth import (
     MAX_KEYS,
     Ambiguous,
@@ -30,6 +36,15 @@ from seriatim_node.auth import (
     authorise,
     new_key,
     read_credentials,
+)
+from seriatim_node.config import (
+    ALLOW_WARNING,
+    ALLOW_WITH_KEYS_WARNING,
+    NO_KEYS,
+    UNKNOWN_FIELD,
+    ConfigError,
+    keyring,
+    load_settings,
 )
 from seriatim_node.gate import Kind, Route, Scope, classify
 
@@ -432,3 +447,262 @@ def test_authorise_notes_x_api_key() -> None:
     assert authorise(INFER_ROUTE, bearer(new_key(), api_key), ring).api_key_seen is True
     assert authorise(HEALTH_ROUTE, [api_key], ring).api_key_seen is False
     assert authorise(INFER_ROUTE, [api_key], None).api_key_seen is False
+
+
+# --- Keys in the configuration (A3) ----------------------------------------------------------
+
+P = "SERIATIM_NODE_"
+CONFIG = P + "CONFIG"
+KEYS = P + "KEYS"
+
+
+def sha(key: str) -> str:
+    return hashlib.sha256(key.encode("ascii")).hexdigest()
+
+
+def table(**fields: str) -> str:
+    return "[[keys]]\n" + "".join(f'{name} = "{value}"\n' for name, value in fields.items())
+
+
+def config_file(tmp_path: Path, text: str) -> dict[str, str]:
+    path = tmp_path / "node.toml"
+    path.write_text(text, encoding="utf-8")
+    return {CONFIG: str(path)}
+
+
+def refused(environ: dict[str, str]) -> str:
+    with pytest.raises(ConfigError) as e:
+        load_settings(environ)
+    return str(e.value)
+
+
+def hidden(message: str, *hashes: str) -> bool:
+    """True when no hash in `hashes` is in `message`, in either case."""
+    return not any(h.lower() in message.lower() for h in hashes)
+
+
+@pytest.mark.td("A3")
+def test_keys_load_in_order_and_match(tmp_path) -> None:
+    infer_key, admin_key = new_key(), new_key()
+    tables = key_tables([("client-a", "infer", infer_key), ("ops", "admin", admin_key)])
+    settings = load_settings(config_file(tmp_path, tables))
+    assert [(k.id, k.scope, k.sha256) for k in settings.keys] == [
+        ("client-a", "infer", sha(infer_key)),
+        ("ops", "admin", sha(admin_key)),
+    ]
+    ring = keyring(settings)
+    assert isinstance(ring, Keyring) and len(ring) == 2
+    assert ring.match(infer_key.encode("ascii")) == Principal("client-a", Scope.INFER)
+    assert ring.match(admin_key.encode("ascii")) == Principal("ops", Scope.ADMIN)
+    assert ring.match(new_key().encode("ascii")) is None
+
+
+@pytest.mark.td("A3")
+def test_an_upper_case_sha256_is_the_same_key(tmp_path) -> None:
+    key = new_key()
+    upper = load_settings(
+        config_file(tmp_path, table(id="a", scope="infer", sha256=sha(key).upper()))
+    )
+    lower = load_settings(config_file(tmp_path, table(id="a", scope="infer", sha256=sha(key))))
+    assert upper.keys[0].sha256 == sha(key).upper()
+    assert bytes.fromhex(upper.keys[0].sha256) == bytes.fromhex(lower.keys[0].sha256)
+    assert keyring(upper).match(key.encode("ascii")) == Principal("a", Scope.INFER)
+
+
+MISSING = object()  # a field left out of the table
+
+A3_BAD_FIELDS = [
+    ("id", MISSING),
+    ("scope", MISSING),
+    ("sha256", MISSING),
+    ("scope", "read"),
+    ("id", "Client"),
+    ("id", "-a"),
+    ("id", "a" * 33),
+    ("id", ""),
+    ("sha256", "0" * 63),
+    ("sha256", "0" * 65),
+    ("sha256", "g" + "0" * 63),
+]
+
+
+@pytest.mark.td("A3")
+@pytest.mark.parametrize(("field", "value"), A3_BAD_FIELDS)
+def test_a_bad_table_names_its_index_and_field(tmp_path, field, value) -> None:
+    good, bad = sha(new_key()), sha(new_key())
+    fields = {"id": "b", "scope": "infer", "sha256": bad}
+    if value is MISSING:
+        del fields[field]
+    else:
+        fields[field] = value  # type: ignore[assignment]
+    text = table(id="a", scope="admin", sha256=good) + table(**fields)
+    message = refused(config_file(tmp_path, text))
+    assert message.startswith(f"{KEYS}[1].{field}: "), message
+    configured = [good, bad] + ([value] if field == "sha256" and value is not MISSING else [])
+    assert hidden(message, *configured)  # type: ignore[arg-type]
+
+
+@pytest.mark.td("A3")
+@pytest.mark.parametrize("name", ["note", "digest"])
+def test_an_unknown_field_is_refused_without_its_name(tmp_path, name) -> None:
+    # The name comes from the file, so it could be a key's hash: the message never echoes it.
+    good, bad = sha(new_key()), sha(new_key())
+    field = name if name == "note" else sha(new_key())
+    text = table(id="a", scope="admin", sha256=good) + table(
+        id="b", scope="infer", sha256=bad, **{field: "x"}
+    )
+    message = refused(config_file(tmp_path, text))
+    assert message.startswith(f"{KEYS}[1].{UNKNOWN_FIELD}: "), message
+    assert field not in message
+    assert hidden(message, good, bad, field)
+
+
+@pytest.mark.td("A3")
+def test_keys_must_be_tables(tmp_path) -> None:
+    message = refused(config_file(tmp_path, 'keys = "x"\n'))
+    assert message.startswith(f"{KEYS}: "), message
+
+
+def tables_of(n: int) -> str:
+    return "".join(table(id=f"k{i}", scope="infer", sha256=sha(str(i))) for i in range(n))
+
+
+@pytest.mark.td("A3")
+def test_at_most_256_keys(tmp_path) -> None:
+    assert len(keyring(load_settings(config_file(tmp_path, tables_of(256))))) == 256
+    assert refused(config_file(tmp_path, tables_of(257))) == f"{KEYS}: at most 256 keys, not 257"
+
+
+@pytest.mark.td("A3")
+def test_a_repeated_id_is_refused(tmp_path) -> None:
+    first, second = sha(new_key()), sha(new_key())
+    text = table(id="dup", scope="infer", sha256=first) + table(
+        id="dup", scope="admin", sha256=second
+    )
+    message = refused(config_file(tmp_path, text))
+    assert message == f"{KEYS}: the id 'dup' is repeated"
+
+
+@pytest.mark.td("A3")
+def test_a_repeated_sha256_in_any_case_is_refused(tmp_path) -> None:
+    digest = sha(new_key())
+    text = (
+        table(id="c", scope="infer", sha256=sha(new_key()))
+        + table(id="a", scope="infer", sha256=digest.lower())
+        + table(id="b", scope="admin", sha256=digest.upper())
+    )
+    message = refused(config_file(tmp_path, text))
+    assert message == f"{KEYS}: 'a' and 'b' have the same sha256"
+    assert hidden(message, digest)
+
+
+@pytest.mark.td("A3")
+@pytest.mark.parametrize("valid_json", [True, False])
+def test_keys_in_the_environment_are_refused(tmp_path, valid_json) -> None:
+    key = new_key()
+    value = json.dumps([{"id": "a", "scope": "infer", "sha256": sha(key)}]) if valid_json else "x"
+    environ = config_file(tmp_path, key_tables([("base", "infer", new_key())])) | {KEYS: value}
+    message = refused(environ)
+    assert message == f"{KEYS}: keys are set in the {CONFIG} file only"
+    assert hidden(message, sha(key))
+
+
+# --- The startup refusals (A4) ---------------------------------------------------------------
+
+NON_LOOPBACK = [".".join(["0"] * 4), "::", "192.0.2.10"]  # built: a literal trips Bandit B104
+
+
+@pytest.fixture
+def node_env(monkeypatch):
+    """A real `os.environ` without any `SERIATIM_NODE_*`, for `main()`; uvicorn never runs
+    (the fake records its call), and a lock that `main()` takes is closed afterwards."""
+    for name in list(os.environ):
+        if name.startswith(P):
+            monkeypatch.delenv(name)
+    monkeypatch.setattr(app, "_SINGLETON_FD", None)
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(app.uvicorn, "run", lambda *a, **kw: calls.append((a, kw)))
+    yield calls
+    if app._SINGLETON_FD is not None:
+        os.close(app._SINGLETON_FD)
+
+
+def warnings_in(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.td("A4")
+def test_no_keys_and_no_flag_refuses_to_start(node_env, capsys) -> None:
+    assert refused({}) == NO_KEYS
+    assert NO_KEYS.startswith(f"{KEYS}: ")
+    assert app.main() == 2
+    assert capsys.readouterr().err == f"seriatim-node: {NO_KEYS}\n"
+    assert node_env == [] and app._SINGLETON_FD is None
+
+
+@pytest.mark.td("A4")
+def test_no_keys_with_the_flag_starts_in_test_mode(node_env, monkeypatch, tmp_path, caplog) -> None:
+    environ = {P + "ALLOW_UNAUTHENTICATED": "true", P + "LOCK_DIR": str(tmp_path)}
+    with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
+        settings = load_settings(environ)
+    assert settings.keys == () and keyring(settings) is None
+    assert warnings_in(caplog) == [ALLOW_WARNING]
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
+        assert app.main() == 0
+    assert len(node_env) == 1
+    assert warnings_in(caplog) == [ALLOW_WARNING]
+
+
+@pytest.mark.td("A4")
+@pytest.mark.parametrize("with_keys", [False, True])
+@pytest.mark.parametrize("allow", [False, True])
+@pytest.mark.parametrize("host", NON_LOOPBACK)
+def test_a_non_loopback_listen_host_is_always_refused(
+    node_env, monkeypatch, tmp_path, capsys, caplog, host, allow, with_keys
+) -> None:
+    """S2-R2: the flag never relaxes the listen address, with keys or without."""
+    environ = {P + "LISTEN_HOST": host}
+    if allow:
+        environ[P + "ALLOW_UNAUTHENTICATED"] = "true"
+    if with_keys:
+        environ |= config_file(tmp_path, key_tables([("client-a", "infer", new_key())]))
+    expected = (
+        f"{P}LISTEN_HOST: {host!r} is not a loopback IP literal;"
+        " a non-loopback address needs keys and the exposure check (S4a)"
+    )
+    with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
+        assert refused(environ) == expected
+    assert warnings_in(caplog) == []  # a refused start logs no startup warning
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+    assert app.main() == 2
+    assert capsys.readouterr().err == f"seriatim-node: {expected}\n"
+    assert node_env == [] and app._SINGLETON_FD is None
+
+
+# --- Until S2-3: configured keys refuse to start (TD-slice-2 §9; no TD ID) -------------------
+
+
+@pytest.mark.parametrize("allow", [False, True])
+def test_main_refuses_configured_keys_until_they_are_enforced(
+    node_env, monkeypatch, tmp_path, capsys, caplog, allow
+) -> None:
+    """S2-2 never serves with keys it does not check. S2-3 removes this guard and this test."""
+    environ = config_file(tmp_path, key_tables([("client-a", "infer", new_key())]))
+    if allow:
+        environ |= {P + "ALLOW_UNAUTHENTICATED": "true", P + "LOCK_DIR": str(tmp_path)}
+    with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
+        settings = load_settings(environ)
+    assert isinstance(keyring(settings), Keyring)  # configured keys are always kept (S2-R1)
+    assert warnings_in(caplog) == ([ALLOW_WITH_KEYS_WARNING] if allow else [])
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+    assert app.main() == 2
+    assert capsys.readouterr().err == (
+        "seriatim-node: SERIATIM_NODE_KEYS: keys are configured, but this build does not"
+        " enforce them yet (TD-slice-2 S2-3)\n"
+    )
+    assert node_env == [] and app._SINGLETON_FD is None
