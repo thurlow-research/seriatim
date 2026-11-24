@@ -35,8 +35,13 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route as StarletteRoute
 
-from seriatim_node.config import ConfigError, Settings, load_settings
+from seriatim_node.config import KEYS_VAR, ConfigError, Settings, load_settings
 from seriatim_node.gate import SERIATIM_ROUTES, Gate, Kind, PathError, check_raw_path, classify
+
+# Until S2-3 enforces keys, `main()` refuses to start with any keys configured (TD-slice-2 §9).
+KEYS_NOT_ENFORCED = (
+    f"{KEYS_VAR}: keys are configured, but this build does not enforce them yet (TD-slice-2 S2-3)"
+)
 
 
 class ErrorCode(StrEnum):
@@ -671,6 +676,8 @@ def main() -> int:
     stopped."""
     try:
         settings = load_settings()
+        if settings.keys:  # never serve with keys this build does not check (TD-slice-2 §9)
+            raise ConfigError(KEYS_NOT_ENFORCED)
     except ConfigError as e:
         print(f"seriatim-node: {e}", file=sys.stderr)
         return 2

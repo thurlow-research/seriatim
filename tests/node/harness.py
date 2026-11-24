@@ -26,9 +26,10 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -638,10 +639,32 @@ def all_free(gate: Gate) -> bool:
     return all(s.state is SlotState.FREE for s in gate.slots())
 
 
-def make_settings(ollama_url: str, **overrides: object) -> Settings:
+def key_tables(keys: Sequence[tuple[str, str, str]]) -> str:
+    """`[[keys]]` tables for `(id, scope, key)` triples, each with the key's SHA-256, as
+    `keygen` prints them (TD-slice-2 §6, §7)."""
+    return "".join(
+        f'[[keys]]\nid = "{id}"\nscope = "{scope}"\n'
+        f'sha256 = "{hashlib.sha256(key.encode("ascii")).hexdigest()}"\n\n'
+        for id, scope, key in keys
+    )
+
+
+def make_settings(
+    ollama_url: str, *, keys: Sequence[tuple[str, str, str]] = (), **overrides: object
+) -> Settings:
+    """Settings for a test sidecar. With no `keys`, unauthenticated test mode, S1's behaviour
+    (TD-slice-2 Q12). With `keys`, `(id, scope, key)` triples, written as `[[keys]]` to a
+    temporary `SERIATIM_NODE_CONFIG` file, and the flag is not set (TD-slice-2 Appendix B)."""
     env = {"SERIATIM_NODE_OLLAMA_URL": ollama_url, "SERIATIM_NODE_ID": "node-a"}
+    if not keys:
+        env["SERIATIM_NODE_ALLOW_UNAUTHENTICATED"] = "true"
     env |= {f"SERIATIM_NODE_{k.upper()}": str(v) for k, v in overrides.items()}
-    return load_settings(env)
+    if not keys:
+        return load_settings(env)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "node.toml"
+        path.write_text(key_tables(keys), encoding="utf-8")
+        return load_settings(env | {"SERIATIM_NODE_CONFIG": str(path)})
 
 
 @dataclass
