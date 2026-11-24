@@ -277,7 +277,10 @@ and the PPE layout of §6. Nothing enforces the keys until S2-3.
 - **Where an error is.** Step 3 names `loc[0]` as S1 does, then each further part of `loc`:
   an index as `[<i>]`, a name as `.<name>`. So a bad table gives
   `SERIATIM_NODE_KEYS[1].sha256: String should match pattern …`, an unknown field gives
-  `SERIATIM_NODE_KEYS[1].<field>: Extra inputs are not permitted`, and `keys = "x"` gives
+  `SERIATIM_NODE_KEYS[1].<unknown field>: Extra inputs are not permitted` (the field's name
+  comes from the file and could be a hash, so it is never echoed; `UNKNOWN_FIELD` in
+  `config.py`, and A3 has a case whose unknown field is named with a digest), and
+  `keys = "x"` gives
   `SERIATIM_NODE_KEYS: Input should be a valid tuple`. pydantic's `msg` never holds the
   input, so no message holds a configured `sha256`.
 - **Step 2** tests for `SERIATIM_NODE_KEYS` before the unknown-variable rule, so any value,

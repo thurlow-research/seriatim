@@ -113,10 +113,20 @@ def _var(field: object) -> str:
     return PREFIX + str(field).upper()
 
 
-def _where(loc: tuple[int | str, ...]) -> str:
-    """The variable an error's `loc` is about: `SERIATIM_NODE_KEYS[0].sha256` inside `keys`."""
-    where = _var(loc[0])
-    for part in loc[1:]:
+UNKNOWN_FIELD = "<unknown field>"  # stands for an unknown field's name, which the user chose
+
+
+def _where(err: Mapping[str, Any]) -> str:
+    """The variable an error is about: `SERIATIM_NODE_KEYS[0].sha256` inside `keys`.
+
+    An unknown field's name comes from the file, so it could be a key or its hash: it is
+    replaced with `UNKNOWN_FIELD`, never echoed.
+    """
+    first, *rest = err["loc"]
+    if err["type"] == "extra_forbidden":
+        rest[-1] = UNKNOWN_FIELD
+    where = _var(first)
+    for part in rest:
         where += f"[{part}]" if isinstance(part, int) else f".{part}"
     return where
 
@@ -187,7 +197,7 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         settings = Settings(**values)
     except ValidationError as e:
         err = e.errors()[0]
-        raise ConfigError(f"{_where(err['loc'])}: {err['msg']}") from None
+        raise ConfigError(f"{_where(err)}: {err['msg']}") from None
 
     # 4. The upstream URL.
     _check_ollama_url(str(values.get("ollama_url", DEFAULT_OLLAMA_URL)))

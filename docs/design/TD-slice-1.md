@@ -1466,12 +1466,16 @@ tests and `Enforced: yes`.
     host runs the same script first. Before writing, it refuses a `ppe/data` or
     `ppe/data/node` that is a symlink or resolves outside ppe/, with the guard's own check.
     `tests/tools/test_ppe_stage_node.py` checks its commands and that refusal.
-  - **Ports.** The sidecar listens on 11436, published as `127.0.0.1:11436` on `ollama-a`,
-    because `dbg-a` already has 11434 in the namespace. 11434 stays plain Ollama, so S0b's
-    checks and `capture_fixtures.py` are unchanged. The tests get `SERIATIM_BASE_URL` (the
-    sidecar) and `SERIATIM_PPE_URL` (plain Ollama) from the job.
-  - **Limits.** cap-a drops to 0.25 CPU / 256 MiB, and node-a gets 0.5 CPU / 384 MiB. The
-    sum is 4 CPUs and 5.75 GiB, inside the guard's bound.
+  - **Ports.** The sidecar (node-a) listens on `127.0.0.1:11437` in `ollama-a`'s namespace.
+    `fwd-a`, a `socat` forwarder in the same namespace, listens on 11436 and passes each
+    connection to it; 11436 is published as `127.0.0.1:11436` on `ollama-a` (TD-slice-2 §6,
+    S2-R2). The sidecar can't take 11434, because `dbg-a` already has it in the namespace.
+    11434 stays plain Ollama, so S0b's checks and `capture_fixtures.py` are unchanged. The
+    tests get `SERIATIM_BASE_URL` (the sidecar, through `fwd-a`) and `SERIATIM_PPE_URL`
+    (plain Ollama) from the job.
+  - **Limits.** cap-a drops to 0.25 CPU / 256 MiB, node-a gets 0.5 CPU / 384 MiB, `fwd-a`
+    0.1 CPU / 64 MiB, and dbg-a drops to 0.15 CPU. The sum is 4.0 CPUs and 5,952 MiB,
+    inside the guard's bound.
   - **`BODY_TIMEOUT_S=300`** for node-a, so that P4's hold (below) covers a slow download.
   - **No `user`, `read_only` or `security_opt`.** None is on the guard's allowlist, and
     `security_opt` is one of the keys SPEC §8.3 refuses, so adding them would widen it.
@@ -1527,8 +1531,8 @@ tests and `Enforced: yes`.
   loads the model. The probe and the cancelled generation use the same model and context, so
   Ollama doesn't reload between them. The client disconnects after three records. The result
   goes into the job summary (`GITHUB_STEP_SUMMARY`) and the log.
-- **P7.** While node-a is down, the host's port forwarder still accepts on 11436 and then
-  drops the connection, so "the moment it accepts" means the first gated request that gets
+- **P7.** While node-a is down, `fwd-a` (the `socat` forwarder, which keeps running) still
+  accepts on 11436, and then drops the connection when it can't reach node-a, so "the moment it accepts" means the first gated request that gets
   an HTTP answer. That answer must be 503 `NODE_STARTING` with `X-Seriatim-Gate: refused`.
   Every answer after it is also `NODE_STARTING`, until a 200 arrives. Before the kill, the
   first record must not be the final one, so the kill lands mid-generation.

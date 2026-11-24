@@ -41,6 +41,7 @@ from seriatim_node.config import (
     ALLOW_WARNING,
     ALLOW_WITH_KEYS_WARNING,
     NO_KEYS,
+    UNKNOWN_FIELD,
     ConfigError,
     keyring,
     load_settings,
@@ -514,7 +515,6 @@ A3_BAD_FIELDS = [
     ("id", MISSING),
     ("scope", MISSING),
     ("sha256", MISSING),
-    ("note", "x"),  # an unknown field
     ("scope", "read"),
     ("id", "Client"),
     ("id", "-a"),
@@ -540,6 +540,21 @@ def test_a_bad_table_names_its_index_and_field(tmp_path, field, value) -> None:
     assert message.startswith(f"{KEYS}[1].{field}: "), message
     configured = [good, bad] + ([value] if field == "sha256" and value is not MISSING else [])
     assert hidden(message, *configured)  # type: ignore[arg-type]
+
+
+@pytest.mark.td("A3")
+@pytest.mark.parametrize("name", ["note", "digest"])
+def test_an_unknown_field_is_refused_without_its_name(tmp_path, name) -> None:
+    # The name comes from the file, so it could be a key's hash: the message never echoes it.
+    good, bad = sha(new_key()), sha(new_key())
+    field = name if name == "note" else sha(new_key())
+    text = table(id="a", scope="admin", sha256=good) + table(
+        id="b", scope="infer", sha256=bad, **{field: "x"}
+    )
+    message = refused(config_file(tmp_path, text))
+    assert message.startswith(f"{KEYS}[1].{UNKNOWN_FIELD}: "), message
+    assert field not in message
+    assert hidden(message, good, bad, field)
 
 
 @pytest.mark.td("A3")
