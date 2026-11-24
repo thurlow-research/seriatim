@@ -190,8 +190,10 @@ Methods are compared in upper case as h11 delivers them. Because h11 keeps the m
 `post` is not `POST`, so it falls to rule 5 and is gated.
 
 **Details fixed by the code (S1-3).**
-- **`SERIATIM` routes** have scope `none`, and `known` is true only with status 200. A 404 or
-  405 is `known=False`.
+- **`SERIATIM` routes:** `known` is true only with status 200. A 404 or 405 is
+  `known=False`. In S1 every `SERIATIM` route had scope `none`; from S2 only
+  `GET /seriatim/health` does, and a 404 or 405 has scope `admin`, the contract's
+  unknown-endpoint rule, so it needs an `admin` key (TD-slice-2 §2.3, S2-R3).
 - **`BLOB_RE` is used with `fullmatch`.** With `match` or `search`, its `$` would also match
   before a trailing `\n`. `check_raw_path` refuses that byte anyway, but `classify` doesn't
   rely on that, so a digest followed by `\n` is never classified as a blob.
@@ -1276,7 +1278,7 @@ also run on `windows-latest` and `macos-latest`.
 
 | id | test | REQ |
 |---|---|---|
-| K1 | Table-driven `classify`, with the expected (kind, scope, known) for every pair in §2.2 rules 2 to 4, including `POST /api/create` → gated, admin, known. Also gated + admin + `known=False`: `OPTIONS /api/tags`, `GET /api/chat`, `POST /api/chat/`, `POST /API/CHAT`, `post /api/chat`, `PUT /api/chat`, `POST /api/blobs`, `POST /api/blobs/sha256:XYZ`, `GET /api/unknown`, `POST /api/new-feature`. `SERIATIM` gives 200 for `GET /seriatim/health`, 405 for `POST /seriatim/health`, 404 for `GET /seriatim/nope` and `GET /seriatim` | 5 |
+| K1 | Table-driven `classify`, with the expected (kind, scope, known) for every pair in §2.2 rules 2 to 4, including `POST /api/create` → gated, admin, known. Also gated + admin + `known=False`: `OPTIONS /api/tags`, `GET /api/chat`, `POST /api/chat/`, `POST /API/CHAT`, `post /api/chat`, `PUT /api/chat`, `POST /api/blobs`, `POST /api/blobs/sha256:XYZ`, `GET /api/unknown`, `POST /api/new-feature`. `SERIATIM` gives 200 with scope `none` for `GET /seriatim/health`, and, with scope `admin` from S2 (TD-slice-2 S2-R3), 405 for `POST` and `HEAD /seriatim/health` and 404 for `GET /seriatim/nope`, `GET /seriatim` and `GET /seriatim/` | 5 |
 | K2 | `check_raw_path` raises for: `/api/chat/../show`, `/api/./chat`, `/api//chat`, `/api/%2e%2e/show`, `/api/%2E%2e/show`, `/api%2fchat`, `/api%2Fchat`, `/api%5cchat`, `/api\chat`, `/api/chat%00`, `/api/chat\x01`, `api/chat` and `//api/chat`. It accepts `/api/blobs/sha256:<hex>` and `/api/show%20x`. Hypothesis: any path containing a `.`/`..` segment or a listed escape raises | 20a |
 | K3 | The pairs in `UNGATED_INFER`, `UNGATED_ADMIN` and `GATED_INFER` equal `tests/fixtures/route-pairs.json`, and equal the contract's paths. Every pair is marked `exists: true` in the route probe in `tests/fixtures/ollama-0.40.16.json` (see Appendix B for what "exists" means) | 5 |
 | K4 | Every forbidden byte, not one sample: `/api/chat` followed by each of `0x00`–`0x1f` and `0x7f` (33 cases) → `PathError`. Allowed escapes pass unchanged and are classified by their raw bytes: `/api/chat%41`, `/api/chat%252e`, `/api/%252e%252e/show` and `/api/chat%20` pass `check_raw_path` and are gated, admin, `known=False` (never `/api/chat`) | 20a, 5 |
@@ -1360,7 +1362,7 @@ also run on `windows-latest` and `macos-latest`.
 | HL7 | Normal use is not a fault: slots 2, one `HELD` within its limit and one `DRAINING` → 200 `{"status":"ok"}` | 18 |
 | HL8 | Two cases. **Stalled:** 200 concurrent health requests while the fake stalls `/api/version` past `health_probe_timeout_s` → **every** response is 503 `["ollama_unreachable"]` within `health_probe_timeout_s` plus the bound; none is 200 and none is 500. **Not stalled:** 200 concurrent health requests on a fake that answers → every response is 200. In both cases, a gated `/api/chat` sent meanwhile gets 200 | 18 |
 | HL9 | Health requests are logged at `DEBUG` only: at `LOG_LEVEL=INFO`, 10 health requests add no log line; at `DEBUG`, each adds exactly one | 22 |
-| L1 | After H1, B1, E1 and S4: one JSON log line each, with the fields in Appendix A. No line contains the body marker string, the `Authorization` value or the `X-API-Key` value | 22, 13 |
+| L1 | After H1, B1, E1 and S4: one JSON log line each, with the fields in Appendix A, and from S2 `client` after `known` (null in test mode; TD-slice-2 §2.4). No line contains the body marker string, the `Authorization` value or the `X-API-Key` value | 22, 13 |
 | L2 | Exactly one log line per request, with the `status`, `outcome`, `bytes_in`, `bytes_out` and `slot_end` of §5, on every path: 400, 404, 405, 413 before and after admission, 408, 429, 503 `NODE_STARTING`, a disconnect while sending the body (E7), `upload_interrupted` (E12), `hold_exceeded` (S7), a stuck close (F4) and a shutdown (S11) | 22 |
 | L3 | Nothing secret reaches the log: the request has `Cookie: c=<marker>` and the query `?key=<marker>&token=<marker>`; the response has `Set-Cookie: s=<marker>`; and an internal error (E15) is raised while the body holds the marker; and an upstream error on a request with `?key=<marker>` (E1's closed port), since an exception message can carry the URL → no log line contains the marker, **traceback included**. The query string is never logged (`path` is the path only) | 22, 13 |
 | K-OAS1 | `contract/openapi.yaml` passes `openapi-spec-validator` (OpenAPI 3.1), and every `$ref` resolves (checked separately, because the validator accepts an unresolved one). Every Ollama path's `x-seriatim-gate` and `x-seriatim-scope` agree with `classify()` (Seriatim's own `/seriatim/*` and `/models/select` paths are not Ollama routes and have no `x-seriatim-gate`, but each must declare `x-seriatim-scope`: `none`, `infer` or `admin`, and the ones S1 serves must agree with `classify()`); `x-seriatim-unknown-endpoint` agrees with rule 5 | 5, G7 |
