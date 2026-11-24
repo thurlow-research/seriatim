@@ -24,8 +24,9 @@ delivered, as §9 lists them.)
 - TLS (S11).
 
 **Exposure before S4a.** Until S2 and S4a land, the sidecar has no authentication and no
-exposure check. It therefore refuses a non-loopback listen address unless
-`SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` is set (SPEC REQ-15), and only the PPE sets that.
+exposure check. In S1 it therefore refused a non-loopback listen address unless
+`SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` was set, which only the PPE set. From S2 it refuses
+one whatever that flag says, until S4a (SPEC REQ-15; TD-slice-2 S2-R2).
 Slices S1 to S3 are not deployed to GPU nodes. The first node deploy needs S4a, because REQ-19
 must pass before anything is admitted.
 
@@ -121,10 +122,13 @@ in `gate.py` and checked against the route probe (K3).
    - the host is an IP literal in `127.0.0.0/8`, or `::1`.
 
    `localhost` is a name, not a literal, so it is refused. No name resolution ever happens.
-5. **Listen address.** If `listen_host` is not a loopback literal and `allow_unauthenticated`
-   is false, raise `ConfigError`. When it is true, `load_settings` logs a `WARNING`, so it
-   appears at startup. As for `ollama_url`, a name is not a literal: `localhost` is refused
-   too, and so is any non-loopback IPv6 address, including `::` (C11).
+5. **Listen address.** If `listen_host` is not a loopback literal, raise `ConfigError`. From
+   S2 this holds whatever `allow_unauthenticated` says (TD-slice-2 §2.2, S2-R2); in S1 the
+   flag allowed it. As for `ollama_url`, a name is not a literal: `localhost` is refused too,
+   and so is any non-loopback IPv6 address, including `::` (C11). When `allow_unauthenticated`
+   is true, `load_settings` logs a `WARNING`, so it appears at startup. S1 logged it here; S2
+   moves it to a last step, after the keys are checked, so settings that are refused log no
+   warning (TD-slice-2 §2.2, step 8).
 6. **Lock directory.** A `lock_dir` other than `default_lock_dir()` is accepted only when
    `allow_unauthenticated` is true, which is the PPE and test mode. Otherwise it raises
    `ConfigError`. Two production sidecars therefore always meet at the same lock file, and
@@ -1177,7 +1181,7 @@ can be set in the TOML file named by `SERIATIM_NODE_CONFIG`.
 
 | variable | default | rule |
 |---|---|---|
-| `SERIATIM_NODE_LISTEN_HOST` | `127.0.0.1` | if not loopback, needs `ALLOW_UNAUTHENTICATED` (S1–S3) |
+| `SERIATIM_NODE_LISTEN_HOST` | `127.0.0.1` | loopback literal only, whatever `ALLOW_UNAUTHENTICATED` says (S1–S3; TD-slice-2 S2-R2) |
 | `SERIATIM_NODE_LISTEN_PORT` | `11434` | 1–65535 |
 | `SERIATIM_NODE_OLLAMA_URL` | `http://127.0.0.1:11435` | `http`, loopback literal, no path, query or user info |
 | `SERIATIM_NODE_ID` | `node` | `^[a-z0-9][a-z0-9-]{0,31}$` |
@@ -1197,11 +1201,13 @@ can be set in the TOML file named by `SERIATIM_NODE_CONFIG`.
 | `SERIATIM_NODE_CONFIG` | unset | path to TOML; must exist if set |
 
 In the PPE, the compose file sets these, inside the container's network namespace:
-- `LISTEN_HOST=0.0.0.0` and `ALLOW_UNAUTHENTICATED=true`;
+- `LISTEN_HOST=127.0.0.1` and `ALLOW_UNAUTHENTICATED=true`, with no keys (TD-slice-2 §6);
 - `LOCK_DIR=/run/seriatim`, on a tmpfs;
-- `LISTEN_PORT=11436`, `ID=node-a` and `DRAIN_S=10` (S1-14, §8.6).
+- `LISTEN_PORT=11437`, `ID=node-a` and `DRAIN_S=10` (S1-14, §8.6).
 
-The published port is bound to `127.0.0.1` on the host.
+A forwarder in the same namespace, `fwd-a`, publishes the sidecar on port 11436, bound to
+`127.0.0.1` on the host (TD-slice-2 §6, S2-R2, S2-R8). S1-14 had the sidecar itself listen on
+`0.0.0.0:11436`, which S2's loopback rule refuses.
 
 ## 7. Test harness (`tests/node/conftest.py`)
 
@@ -1251,17 +1257,17 @@ also run on `windows-latest` and `macos-latest`.
 
 | id | test | REQ |
 |---|---|---|
-| C1 | `load_settings({})` gives the defaults in §6 exactly, including the per-OS lock directory | 23 |
+| C1 | `load_settings` gives the defaults in §6 exactly, including the per-OS lock directory, and `keys: ()`. From S2 it is called with `ALLOW_UNAUTHENTICATED=true`, since no keys without it refuses to start (TD-slice-2 Q13); the flag's default is still `false`. C2 to C11 load with a one-key baseline file wherever they set neither (TD-slice-2 Appendix B) | 23 |
 | C2 | A TOML file sets `slots=2` and the environment sets `SERIATIM_NODE_SLOTS=3` → 3; keys set only in the file are applied; an unknown key in the file → `ConfigError` naming it | 23 |
 | C3 | Out of range or wrong type → `ConfigError` whose message contains the variable name. Cases: `SLOTS` = `abc`, `0`, `-1`, `65`; `RETRY_AFTER_S=0`; `DRAIN_S` = `0` or `0.5`; `MAX_HOLD_S=0`; `CLOSE_TIMEOUT_S=0` | 23, 2, 10 |
 | C4 | `OLLAMA_URL` → `ConfigError` for: `http://192.0.2.5:11435`, `http://example.com:11435`, `http://localhost:11435`, `http://0.0.0.0:11435`, `https://127.0.0.1:11435`, `http://127.0.0.1:11435/x`, `http://127.0.0.1:11435/?a`, `http://127.0.0.1:11435/#f`, `http://u:p@127.0.0.1:11435`, `http://127.0.0.1` (no port). Accepted: `http://[::1]:11435` and `http://127.0.0.2:11435`. `load_settings({})` with `SERIATIM_NODE_SLOTS=5` set in the real `os.environ` still gives `slots == 1` | 1, 23 |
-| C5 | `LISTEN_HOST=0.0.0.0` without `ALLOW_UNAUTHENTICATED` → `ConfigError`; with it, accepted, and a `WARNING` is captured. `LOCK_DIR=/tmp/x` without `ALLOW_UNAUTHENTICATED` → `ConfigError`; with it, accepted | 15, 12b |
+| C5 | `LISTEN_HOST=0.0.0.0` → `ConfigError`, without `ALLOW_UNAUTHENTICATED` and, from S2, with it too (TD-slice-2 S2-R2), and no `WARNING` is logged for the refused settings. `ALLOW_UNAUTHENTICATED=true` with a loopback host → accepted, and a `WARNING` is captured; without it, no warning. `LOCK_DIR=/tmp/x` without `ALLOW_UNAUTHENTICATED` → `ConfigError`; with it, accepted | 15, 12b |
 | C6 | `SERIATIM_NODE_SLOTZ=1` → `ConfigError` naming it. `SERIATIM_APP_ID=1`, `SERIATIM_CONFIG_DIR=/x` and `SERIATIM_GW_FOO=1` are ignored | 23 |
 | C7 | `SERIATIM_NODE_CONFIG=/nonexistent.toml` → `ConfigError`; a malformed TOML file, including one that is not valid UTF-8 (TOML must be), → `ConfigError` naming `SERIATIM_NODE_CONFIG` | 23 |
 | C8 | `main()` with invalid config exits 2 and prints the key. With valid config it calls `uvicorn.run` with `workers=1` and `http="h11"` (monkeypatched) | 21, 23 |
 | C9 | Ranges and types C3 doesn't cover → `ConfigError` naming the variable. `LISTEN_PORT` = `0`, `65536`, `x`; `ID` = `Node`, `-a`, 33 characters, empty; `CONNECT_TIMEOUT_S` and `CLOSE_TIMEOUT_S` = `0`, `61`; `UNGATED_READ_TIMEOUT_S` = `0`, `3601`; `MAX_BODY_BYTES=1023`; `BODY_TIMEOUT_S` = `0`, `3601`; `HEALTH_PROBE_TIMEOUT_S` = `0`, `31`; `LOG_LEVEL` = `debug`, `TRACE`. Every float field also refuses `nan`, `inf` and `-inf`. The boundary values (`1`, `65535`, `60`, `3600`, `1024`, `30`) are accepted | 23 |
 | C10 | `SERIATIM_NODE_CONFIG` names a file that exists but can't be read (POSIX, mode `000`; skipped on Windows and as root) → `ConfigError` naming `SERIATIM_NODE_CONFIG`. A `.env` file in the working directory with `SERIATIM_NODE_SLOTS=5` → ignored: `slots == 1` | 23 |
-| C11 | `LISTEN_HOST` = `192.0.2.10`, `::`, `example.com` or `localhost`, without `ALLOW_UNAUTHENTICATED` → `ConfigError` naming it; `::1` and `127.0.0.2` are accepted | 15 |
+| C11 | `LISTEN_HOST` = `192.0.2.10`, `::`, `example.com` or `localhost` → `ConfigError` naming it, with or without `ALLOW_UNAUTHENTICATED` (the flag never relaxes it from S2, TD-slice-2 S2-R2); `::1` and `127.0.0.2` are accepted | 15 |
 
 ### 8.2 `test_gate.py`
 
