@@ -86,7 +86,7 @@ class KeyEntry:
     digest: bytes                      # 32 bytes: bytes.fromhex(the configured sha256)
 
 class Keyring:
-    def __init__(self, entries: Sequence[KeyEntry]) -> None   # 1..256 entries, unique ids and digests
+    def __init__(self, entries: Sequence[KeyEntry]) -> None   # 1..MAX_KEYS entries, unique ids and digests
     def __len__(self) -> int
     def match(self, token: bytes) -> Principal | None         # every digest compared; no early exit
 
@@ -177,6 +177,40 @@ and a slow hash would only add latency.
 So an ambiguous header is refused even when one of its values is a valid key, and a missing or
 wrong key is refused before the route's scope is looked at.
 
+**Details fixed by the code (S2-1).** S2-1 adds `auth.py` without `keygen` (S2-4); nothing
+calls `authorise` until S2-3.
+- **`MAX_KEYS` lives in `auth.py`**, because `Keyring` refuses more than 256 entries and
+  `auth.py` cannot import `config.py`. S2-2's `config.py` uses `auth.MAX_KEYS` (§2.2) rather
+  than a second constant.
+- **`Keyring` also refuses** an entry whose scope is not `INFER` or `ADMIN`, and one whose
+  digest is not 32 bytes, with `ValueError`, as it does 0 or 257 entries, a repeated id and a
+  repeated digest. Each message names the key id, never a digest. It keeps the entries as a
+  tuple, in the order given.
+- **`sha256` and `compare_digest` are imported by name** (`from hashlib import sha256`,
+  `from hmac import compare_digest`), so A2 patches `auth.sha256` and `auth.compare_digest`
+  to count calls without touching `hashlib` or `hmac` for the rest of the process. The loop
+  is §2.1's, unchanged.
+- **Health, in step 2, is `route == Route(Kind.SERIATIM, Scope.NONE, True, 200)`**, the value
+  `classify("GET", b"/seriatim/health")` returns, all four fields compared. A `/seriatim/*`
+  404 or 405, and a known `/seriatim/*` route with another scope (as `/seriatim/status` will
+  be in S4a), have their credentials read. Until S2-3 gives the 404 and 405 the `admin` scope
+  (§2.3), any valid key passes them, since `allows(_, NONE)` is true.
+- **Header names are compared exactly** with `b"authorization"` and `b"x-api-key"`: ASGI
+  gives them in lower case. Values are not stripped, since h11 already strips them. So a
+  hand-built value with leading whitespace has an empty scheme (`a scheme other than
+  Bearer`), and one with trailing whitespace has whitespace in the key. A separator that
+  contains a tab is ambiguous even with no token after it.
+- **The token rule refuses only bytes below `0x21`**, as step 4 says. `0x7F` and bytes from
+  `0x80` are part of the token and hashed. The `b64token` form is never checked (§7).
+- **The three types.** `Missing` is a frozen dataclass with no fields, so `Missing() ==
+  Missing()`. `Missing`, `Ambiguous` and `Presented` all use `slots=True`. The three reasons
+  are the constants `TWO_HEADERS`, `OTHER_SCHEME` and `WHITESPACE`.
+- **`api_key_seen`** is true when any header is named `x-api-key`, for every verdict of steps
+  3 to 6. It is false in test mode and on health, where the headers are not read.
+- **`authorise`'s unit tests carry no TD ID.** Its IDs are the http tests of S2-3 (A6 to
+  A10). `test_auth.py` tests its six steps directly, so `auth.py`'s mutation score does not
+  wait for S2-3.
+
 ### 2.2 `config.py`
 
 ```python
@@ -191,7 +225,7 @@ class Settings(BaseSettings):
     keys: tuple[KeyConfig, ...] = ()    # from the TOML file only (S2-R4)
 
 KEYS_VAR = "SERIATIM_NODE_KEYS"
-MAX_KEYS = 256                          # Q3
+MAX_KEYS = auth.MAX_KEYS                # 256 (Q3); defined in auth.py, which Keyring needs (S2-1)
 
 def keyring(settings: Settings) -> Keyring | None   # None in unauthenticated test mode
 ```
