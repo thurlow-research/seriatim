@@ -680,6 +680,9 @@ far.
     event loop's queue for 200 requests at once comes on top: about 0.1 s locally, and more on
     a slow runner. That isn't the probe's time, so the client-side check is looser: every
     answer within twice the timeout plus the bound. No probe waits for another's budget.
+    "A gated `/api/chat` sent meanwhile gets 200" is checked in the sidecar too: the
+    dispatcher finishes the chat before any health handler returns. Timed from the client,
+    the chat can lose by a few ms to the client's own queue on a slow runner (#105).
   - **Answering.** The 200 probes queue for the health client's one connection, and each
     probe's budget includes that wait (§3.4). So the case sets `health_probe_timeout_s=20`
     to show that load alone never causes an error. With a slow Ollama and the default 2 s, a
@@ -1425,6 +1428,10 @@ also run on `windows-latest` and `macos-latest`.
   one is admitted, and that one arrives at least `drain_s` after the spawn and at most
   `drain_s` plus the poll interval and `TIMING_BOUND_S` after the port first accepted.
 - **R2's "same port"** is the same listen port, upstream and lock directory.
+- **"Listening" (`SidecarProcess.wait_listening`)** means the sidecar answers HTTP: a GET of
+  `/seriatim/ready`, which is no route, so the sidecar answers it 404 itself, without the gate
+  or the upstream. An accepted connection is not enough. On Windows, straight after R2's
+  restart on the same port, one was accepted and then reset (#107).
 - **R8** does not assert an exit code: after a graceful stop uvicorn re-raises the `SIGTERM`
   it caught. On Windows `Popen.terminate()` is `TerminateProcess`, so R8 there checks the file
   after a hard stop.

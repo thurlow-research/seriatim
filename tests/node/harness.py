@@ -44,6 +44,7 @@ from seriatim_node.config import Settings, load_settings
 from seriatim_node.gate import Gate, SlotState
 
 LOOPBACK = "127.0.0.1"
+READY_PATH = "/seriatim/ready"  # not a Seriatim route: the sidecar answers it 404 itself
 # TD §7 "Timing": an elapsed-time assertion may overrun its target by this much.
 TIMING_BOUND_S = 0.5 if os.environ.get("CI") == "true" else 0.1
 # The asyncio loop's clock is time.monotonic(); its tick is TICK_S (about 15.6 ms on Windows up
@@ -812,15 +813,21 @@ class SidecarProcess:
         return self.stderr_path.read_text(encoding="utf-8", errors="replace")
 
     def wait_listening(self, timeout: float = PROCESS_S) -> None:
-        """Wait until the sidecar accepts connections; fail if it exits first."""
+        """Wait until the sidecar answers HTTP; fail if it exits first.
+
+        An accepted connection is not enough: on Windows, straight after a restart on the same
+        port, one can be accepted and then reset (#107). `READY_PATH` is answered 404 by the
+        sidecar itself, so it never reaches the upstream or the gate.
+        """
         deadline = time.monotonic() + timeout
         while True:
             if self.proc.poll() is not None:
                 raise AssertionError(f"the sidecar exited {self.proc.returncode}: {self.stderr()}")
             try:
-                socket.create_connection((LOOPBACK, self.port), timeout=1).close()
+                resp = httpx.get(self.url + READY_PATH, timeout=1)
+                assert resp.headers.get("x-seriatim-node"), resp  # the sidecar, not another server
                 return
-            except OSError:
+            except httpx.TransportError:
                 if time.monotonic() > deadline:
                     raise AssertionError("the sidecar did not start listening") from None
                 time.sleep(0.01)
