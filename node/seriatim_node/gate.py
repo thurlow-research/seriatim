@@ -122,11 +122,13 @@ def classify(method: str, raw_path: bytes) -> Route:
     delivers them, so `post` is not `POST` and falls to rule 5.
     """
     if raw_path == b"/seriatim" or raw_path.startswith(b"/seriatim/"):
+        # An unlisted `/seriatim/*` pair takes the contract's unknown-endpoint scope, `admin`
+        # (TD-slice-2 §2.3, S2-R3); health needs none.
         methods = SERIATIM_ROUTES.get(raw_path)
         if methods is None:
-            return Route(Kind.SERIATIM, Scope.NONE, False, 404)
+            return Route(Kind.SERIATIM, Scope.ADMIN, False, 404)
         if method not in methods:
-            return Route(Kind.SERIATIM, Scope.NONE, False, 405)
+            return Route(Kind.SERIATIM, Scope.ADMIN, False, 405)
         return Route(Kind.SERIATIM, Scope.NONE, True, 200)
     pair = (method, raw_path)
     if pair in UNGATED_INFER:

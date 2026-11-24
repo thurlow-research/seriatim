@@ -53,6 +53,7 @@ from harness import (
     drip_body,
     exchange,
     exchange_body,
+    log_lines,
     make_settings,
     raw_connect,
     raw_exchange,
@@ -544,13 +545,15 @@ REFUSALS = [
      {}),
     ("GET", b"/a//b", "1.1", ErrorCode.BAD_PATH, "the path contains //", [], "INFO", "rejected",
      {}),
+    # After `classify`, `client` follows `known` (null in test mode); TD-slice-2 §2.3 gives
+    # these two `admin` (S2-R3)
     ("GET", b"/seriatim/nope", "1.1", ErrorCode.NOT_FOUND, "no such path", [], "INFO",
-     "rejected", {"path": "/seriatim/nope", "kind": "seriatim", "scope": "none",
-                  "known": False}),
+     "rejected", {"path": "/seriatim/nope", "kind": "seriatim", "scope": "admin",
+                  "known": False, "client": None}),
     ("POST", b"/seriatim/health", "1.1", ErrorCode.METHOD_NOT_ALLOWED, "method not allowed",
      [(b"allow", b"GET")], "INFO", "rejected", {"path": "/seriatim/health",
-                                                "kind": "seriatim", "scope": "none",
-                                                "known": False}),
+                                                "kind": "seriatim", "scope": "admin",
+                                                "known": False, "client": None}),
 ]  # fmt: skip
 
 
@@ -573,7 +576,7 @@ def test_dispatcher_refusals_exactly(
         {"type": "http.response.start", "status": status_, "headers": headers + extra},
         {"type": "http.response.body", "body": body, "more_body": False},
     ]
-    (line,) = _log_lines(capsys.readouterr().out)
+    (line,) = log_lines(capsys.readouterr().out)
     del line["ts"]
     assert line == {
         "level": level,
@@ -641,10 +644,6 @@ APPENDIX_A_TAIL = [
 ]  # fmt: skip
 
 
-def _log_lines(text: str) -> list[dict]:
-    return [json.loads(line) for line in text.splitlines() if line.startswith('{"ts"')]
-
-
 def test_request_log_line_exactly(capsys):
     RequestLog("INFO", "node-a", wall=lambda: 1763287200.1239).emit(request_id="r", status=200)
     assert capsys.readouterr().out == (
@@ -655,7 +654,7 @@ def test_request_log_line_exactly(capsys):
 
 def test_request_log_uses_the_wall_clock(capsys):
     RequestLog("INFO", "n").emit()
-    (doc,) = _log_lines(capsys.readouterr().out)
+    (doc,) = log_lines(capsys.readouterr().out)
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", doc["ts"])
     assert (
         abs(
@@ -701,7 +700,7 @@ def test_request_log_threshold(threshold, written, capsys):
     log = RequestLog(threshold, "n")
     for level in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
         log.emit(level=level)
-    assert [d["level"] for d in _log_lines(capsys.readouterr().out)] == written
+    assert [d["level"] for d in log_lines(capsys.readouterr().out)] == written
 
 
 def test_rejections_are_logged_at_info(fake_ollama, sidecar, capsys):
@@ -710,7 +709,7 @@ def test_rejections_are_logged_at_info(fake_ollama, sidecar, capsys):
     httpx.get(car.url + "/seriatim/nope", headers={"x-request-id": "r1"})
     raw_exchange(car.port, b"GET /api/tags HTTP/1.0\r\n\r\n")
     raw_exchange(car.port, b"GET /a//b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-    lines = _log_lines(capsys.readouterr().out)
+    lines = log_lines(capsys.readouterr().out)
     assert [(d["level"], d["status"], d["outcome"], d["slot_end"]) for d in lines] == [
         ("INFO", 404, "rejected", "none"),
         ("INFO", 505, "rejected", "none"),
@@ -918,7 +917,7 @@ def test_hl9_health_is_logged_at_debug(level, lines, fake_ollama, sidecar, capsy
     capsys.readouterr()
     for i in range(10):
         httpx.get(car.url + "/seriatim/health", headers={"x-request-id": f"h{i}"})
-    logged = _log_lines(capsys.readouterr().out)
+    logged = log_lines(capsys.readouterr().out)
     assert len(logged) == lines
     for i, d in enumerate(logged):
         del d["ts"]
@@ -935,6 +934,7 @@ def _health_line(rid: str, outcome: str, status_: int, body: bytes) -> dict:
         "kind": "seriatim",
         "scope": "none",
         "known": True,
+        "client": None,
         "outcome": outcome,
         "status": status_,
         "slot_end": "none",
@@ -954,7 +954,7 @@ def test_hl9_a_degraded_health_line(sidecar, capsys):
         car = sidecar(f"http://127.0.0.1:{closed.getsockname()[1]}", gate=gate, log_level="DEBUG")
         capsys.readouterr()
         httpx.get(car.url + "/seriatim/health", headers={"x-request-id": "d1"}, timeout=30)
-        (line,) = _log_lines(capsys.readouterr().out)
+        (line,) = log_lines(capsys.readouterr().out)
         del line["ts"]
         degraded = b'{"status":"degraded","reasons":["ollama_unreachable"]}'
         assert line == _health_line("d1", "degraded", 503, degraded)
@@ -1380,7 +1380,7 @@ def _ok(request):
 
 
 def _one_line(capsys) -> dict:
-    (line,) = _log_lines(capsys.readouterr().out)
+    (line,) = log_lines(capsys.readouterr().out)
     return line
 
 
@@ -1860,7 +1860,7 @@ def _wait_log_lines(capsys, n: int) -> list[dict]:
     lines: list[dict] = []
 
     def enough() -> bool:
-        lines.extend(_log_lines(capsys.readouterr().out))
+        lines.extend(log_lines(capsys.readouterr().out))
         return len(lines) >= n
 
     wait_for(enough)
@@ -4163,7 +4163,7 @@ def _the_line(path: _Path, capsys) -> dict:
     seen: list[dict] = []
 
     def read(rid: str) -> bool:
-        seen.extend(_log_lines(capsys.readouterr().out))
+        seen.extend(log_lines(capsys.readouterr().out))
         return any(d["request_id"] == rid for d in seen)
 
     if path.car is None:  # in process: the proxy has returned, so its line is written
@@ -4342,7 +4342,7 @@ def test_l2_a_refusal_whose_write_fails_still_logs_one_line(path, fail_on, capsy
     capsys.readouterr()
     sent, send = _send_failing_on(fail_on)
     anyio.run(call, send)  # a failed write is noted on the line; it never escapes the app
-    (line,) = _log_lines(capsys.readouterr().out)
+    (line,) = log_lines(capsys.readouterr().out)
     assert (line["request_id"], line["outcome"], line["status"]) == ("rid", outcome, status_)
     assert (line["slot_end"], line["bytes_in"]) == ("none", 0)
     if fail_on is None:
@@ -4385,7 +4385,7 @@ def test_a_health_check_that_breaks_still_logs_its_line_and_raises(monkeypatch, 
     with pytest.raises(RuntimeError, match="bug"):
         anyio.run(app, scope, _never_received, send)
     assert sent[0]["status"] == 500  # Starlette's own answer
-    (line,) = _log_lines(capsys.readouterr().out)
+    (line,) = log_lines(capsys.readouterr().out)
     assert (line["level"], line["outcome"], line["status"]) == ("ERROR", "internal_error", None)
     assert line["bytes_out"] == len(sent[1]["body"])
     assert "client_write_failed" not in line
@@ -4417,7 +4417,7 @@ def test_a_health_check_that_breaks_and_whose_500_fails_keeps_its_error(
         chain.append(exc)
         exc = exc.__cause__ or exc.__context__
     assert any(isinstance(e, DistinctiveError) for e in chain), chain
-    (line,) = _log_lines(capsys.readouterr().out)
+    (line,) = log_lines(capsys.readouterr().out)
     assert (line["level"], line["outcome"], line["status"]) == ("ERROR", "internal_error", None)
     assert (line["client_write_failed"], line["client_write_failed_reason"]) == (True, "OSError")
 
@@ -4429,7 +4429,7 @@ def test_a_health_check_whose_client_left_is_still_swallowed(capsys, fail_on):
     capsys.readouterr()
     _sent, send = _send_failing_on(fail_on)
     anyio.run(call, send)
-    (line,) = _log_lines(capsys.readouterr().out)
+    (line,) = log_lines(capsys.readouterr().out)
     assert (line["level"], line["outcome"], line["status"]) == ("DEBUG", "ok", 200)
     assert (line["client_write_failed"], line["client_write_failed_reason"]) == (True, "OSError")
 
@@ -4489,7 +4489,7 @@ def test_k_oas2_a_record_must_be_one_line_or_one_event(contract_schemas):
 # --- S1-13: L1, one line each with Appendix A's fields, and no secret ------------------------
 
 APPENDIX_A_KEYS = [
-    "ts", "level", "event", "request_id", "method", "path", "kind", "scope", "known",
+    "ts", "level", "event", "request_id", "method", "path", "kind", "scope", "known", "client",
     *APPENDIX_A_TAIL, "node",
 ]  # fmt: skip
 BODY_MARK = "l1-body-mark-7f3a"
@@ -4505,7 +4505,7 @@ def _captured(capsys, prefix: str, n: int) -> tuple[list[dict], str]:
     text: list[str] = []
 
     def mine() -> list[dict]:
-        return [d for d in _log_lines("".join(text)) if d["request_id"].startswith(prefix)]
+        return [d for d in log_lines("".join(text)) if d["request_id"].startswith(prefix)]
 
     def enough() -> bool:
         out, err = capsys.readouterr()
@@ -4596,6 +4596,7 @@ def test_l1_one_line_each_with_appendix_a_fields_and_no_secret(
         assert (d["method"], d["path"], d["kind"], d["scope"], d["known"]) == (
             "POST", "/api/chat", "gated", "infer", True,
         )  # fmt: skip
+        assert d["client"] is None  # test mode: no key was authenticated (TD-slice-2 §2.4)
         assert _number(d["wait_ms"]) and d["wait_ms"] < WAIT_S * 1000  # each asked the gate
         if d["slot_end"] == "none":
             assert d["hold_ms"] is None

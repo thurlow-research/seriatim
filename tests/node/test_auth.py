@@ -43,6 +43,8 @@ from seriatim_node.config import (
     NO_KEYS,
     UNKNOWN_FIELD,
     ConfigError,
+    KeyConfig,
+    Settings,
     keyring,
     load_settings,
 )
@@ -683,26 +685,53 @@ def test_a_non_loopback_listen_host_is_always_refused(
     assert node_env == [] and app._SINGLETON_FD is None
 
 
-# --- Until S2-3: configured keys refuse to start (TD-slice-2 §9; no TD ID) -------------------
-
-
+@pytest.mark.td("A4")
 @pytest.mark.parametrize("allow", [False, True])
-def test_main_refuses_configured_keys_until_they_are_enforced(
-    node_env, monkeypatch, tmp_path, capsys, caplog, allow
+def test_configured_keys_start_with_a_keyring(
+    node_env, monkeypatch, tmp_path, caplog, allow
 ) -> None:
-    """S2-2 never serves with keys it does not check. S2-3 removes this guard and this test."""
-    environ = config_file(tmp_path, key_tables([("client-a", "infer", new_key())]))
+    """Keys, with the flag or without, start the sidecar, and its app enforces them (S2-R1);
+    with the flag, the startup warning is the "keys are enforced" one."""
+    key = new_key()
+    environ = config_file(tmp_path, key_tables([("client-a", "infer", key)]))
     if allow:
         environ |= {P + "ALLOW_UNAUTHENTICATED": "true", P + "LOCK_DIR": str(tmp_path)}
     with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
         settings = load_settings(environ)
-    assert isinstance(keyring(settings), Keyring)  # configured keys are always kept (S2-R1)
+    ring = keyring(settings)
+    assert isinstance(ring, Keyring)  # configured keys are always kept (S2-R1)
+    assert ring.match(key.encode("ascii")) == Principal("client-a", Scope.INFER)
     assert warnings_in(caplog) == ([ALLOW_WITH_KEYS_WARNING] if allow else [])
     for name, value in environ.items():
         monkeypatch.setenv(name, value)
-    assert app.main() == 2
-    assert capsys.readouterr().err == (
-        "seriatim-node: SERIATIM_NODE_KEYS: keys are configured, but this build does not"
-        " enforce them yet (TD-slice-2 S2-3)\n"
-    )
-    assert node_env == [] and app._SINGLETON_FD is None
+    built: list[object] = []
+    create_app = app.create_app
+    monkeypatch.setattr(app, "create_app", lambda s: built.append(create_app(s)) or built[-1])
+    locked: list[object] = []  # without the flag the lock is the system one, so it is faked
+    monkeypatch.setattr(app, "acquire_singleton", locked.append)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
+        assert app.main() == 0
+    assert len(locked) == 1 and len(node_env) == 1  # the lock, then uvicorn.run: it serves
+    assert warnings_in(caplog) == ([ALLOW_WITH_KEYS_WARNING] if allow else [])
+    (served,) = built
+    assert served.keyring.match(key.encode("ascii")) == Principal("client-a", Scope.INFER)
+
+
+@pytest.mark.td("A4")
+def test_create_app_refuses_no_keys_without_the_flag() -> None:
+    """Fail closed (§2.4): `Settings` built directly, which `load_settings` never builds."""
+    with pytest.raises(ConfigError) as e:
+        app.create_app(Settings(keys=(), allow_unauthenticated=False))
+    assert str(e.value) == NO_KEYS
+    assert app.create_app(Settings(keys=(), allow_unauthenticated=True)).keyring is None
+
+
+def test_create_app_refuses_keys_the_keyring_refuses() -> None:
+    """`Settings` built directly with a repeated key: the keyring's refusal, as a
+    `ConfigError` that names the id and never the hash (§2.2)."""
+    key = KeyConfig(id="a", scope="infer", sha256=sha(new_key()))
+    with pytest.raises(ConfigError) as e:
+        app.create_app(Settings(keys=(key, key)))
+    assert str(e.value) == f"{KEYS}: key 'a': the id is repeated"
+    assert hidden(str(e.value), key.sha256)

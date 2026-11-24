@@ -5,7 +5,8 @@ is the source of truth, and K-OAS3 checks that this table equals its `x-seriatim
 S1-5 adds `RequestLog`, `create_app` (the dispatcher and `/seriatim/health`) and the health
 client. S1-6 hands every other route to the proxy (`proxy.py`). S1-12 adds the singleton
 lock (`acquire_singleton`) and `main()`. S1-13 completes the log line (TD Appendix A): each
-line has `wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`.
+line has `wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`. TD-slice-2's S2-3 adds the auth
+step (`auth.authorise`, `refuse_auth`), `PRINCIPAL_KEY` and the log line's `client`.
 """
 
 from __future__ import annotations
@@ -35,13 +36,9 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route as StarletteRoute
 
-from seriatim_node.config import KEYS_VAR, ConfigError, Settings, load_settings
+from seriatim_node.auth import Decision, Verdict, authorise
+from seriatim_node.config import KEYS_VAR, NO_KEYS, ConfigError, Settings, keyring, load_settings
 from seriatim_node.gate import SERIATIM_ROUTES, Gate, Kind, PathError, check_raw_path, classify
-
-# Until S2-3 enforces keys, `main()` refuses to start with any keys configured (TD-slice-2 §9).
-KEYS_NOT_ENFORCED = (
-    f"{KEYS_VAR}: keys are configured, but this build does not enforce them yet (TD-slice-2 S2-3)"
-)
 
 
 class ErrorCode(StrEnum):
@@ -305,6 +302,9 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 _REQUEST_ID_RE = re.compile(rb"[A-Za-z0-9._-]{1,128}")  # used with fullmatch
 _RID_KEY = "seriatim.request_id"  # where the dispatcher leaves the request id in the scope
+# Where the dispatcher leaves the request's `auth.Principal` (None in test mode and on health)
+# once auth has passed, for the handlers after it (TD-slice-2 §2.4).
+PRINCIPAL_KEY = "seriatim.principal"
 _HEALTH_KEY = "seriatim.health_status"  # where `_health` leaves its status for the log line
 _HEALTH_OUTCOMES: Mapping[int | None, str] = MappingProxyType({200: "ok", 503: "degraded"})
 # The log line's gate timing for a request no gate was asked about (TD Appendix A).
@@ -318,6 +318,34 @@ def request_id_from(headers: list[tuple[bytes, bytes]]) -> str:
     if len(values) == 1 and _REQUEST_ID_RE.fullmatch(values[0]):
         return values[0].decode()
     return uuid.uuid4().hex
+
+
+def client_of(scope: Scope) -> str | None:
+    """The log line's `client`: the id of the key the request was authenticated with, or None
+    (test mode, health, or a scope the dispatcher has not authorised) (TD-slice-2 §2.4)."""
+    principal = scope.get(PRINCIPAL_KEY)
+    return None if principal is None else principal.id
+
+
+# Each refused verdict's code and log `outcome`, all at INFO (TD-slice-2 §2.4, Q15).
+_AUTH_REFUSALS: Mapping[Verdict, tuple[ErrorCode, str]] = MappingProxyType(
+    {
+        Verdict.AMBIGUOUS: (ErrorCode.AUTH_AMBIGUOUS, "rejected"),
+        Verdict.MISSING: (ErrorCode.AUTH_MISSING, "unauthenticated"),
+        Verdict.INVALID: (ErrorCode.AUTH_INVALID, "unauthenticated"),
+        Verdict.FORBIDDEN: (ErrorCode.FORBIDDEN_SCOPE, "forbidden"),
+    }
+)
+# Fixed strings only: a refusal never echoes a header, a key, its hash or a scheme.
+_AUTH_MESSAGES: Mapping[Verdict, str] = MappingProxyType(
+    {
+        Verdict.MISSING: "a Bearer key is required",
+        Verdict.INVALID: "the key is not valid",
+        Verdict.FORBIDDEN: "this route needs the admin scope",
+    }
+)
+X_API_KEY_HINT = "X-API-Key is not accepted; send Authorization: Bearer <key>"  # Q11
+_WWW_AUTHENTICATE = (b"www-authenticate", b"Bearer")  # the contract's `Unauthorized` response
 
 
 class SentBytes:
@@ -360,6 +388,10 @@ class _Dispatcher:
         self, settings: Settings, gate: Gate | None, client: httpx.AsyncClient | None
     ) -> None:
         self.settings = settings
+        try:  # None only in unauthenticated test mode (TD-slice-2 §2.4)
+            self.keyring = keyring(settings)
+        except ValueError as e:  # only from `Settings` built directly: names ids, never hashes
+            raise ConfigError(f"{KEYS_VAR}: {e}") from None
         self.gate = gate
         self.client = client  # the shared ungated client; the lifespan creates it if None
         self.health_client: httpx.AsyncClient | None = None
@@ -402,13 +434,15 @@ class _Dispatcher:
         log_level: str = "INFO",
         outcome: str = "rejected",
         extra_headers: list[tuple[bytes, bytes]] | None = None,
+        envelope: Mapping[str, object] | None = None,
         **log_fields: object,
     ) -> None:
         """Send an ungated error response and log it (`slot_end` is `none`: no slot). The
         dispatcher never reads the body, and no gate was asked. The line is written whatever
-        the write does, with the body bytes actually sent (L2)."""
+        the write does, with the body bytes actually sent (L2). `envelope` holds optional
+        `ErrorEnvelope` fields, such as the 401's `hint`."""
         status, headers, body = self.errors.response(
-            code, message, gate_value="ungated", request_id=request_id
+            code, message, gate_value="ungated", request_id=request_id, **(envelope or {})
         )
         sent = SentBytes(send)
         try:
@@ -428,6 +462,49 @@ class _Dispatcher:
                 bytes_in=0,
                 bytes_out=sent.count,
             )
+
+    async def refuse_auth(
+        self,
+        send: Send,
+        decision: Decision,
+        *,
+        request_id: str,
+        method: str,
+        headers: list[tuple[bytes, bytes]],
+        where: Mapping[str, object],
+    ) -> None:
+        """The 400, 401 or 403 for a refused `decision` (TD-slice-2 §2.4), through `reply`: one
+        response, one line. It is sent before the body is read, so a request with a body gets
+        `Connection: close` (TD-slice-1 H29). The line's `client` is the refused key's id on a
+        403, and null on a 400 or 401, where no key was accepted."""
+        # proxy.py imports this module, so it is imported here rather than at the top.
+        from seriatim_node.proxy import has_body
+
+        verdict = decision.verdict
+        code, outcome = _AUTH_REFUSALS[verdict]
+        # Each 401 challenges for a Bearer key; the 400 and the 403 do not.
+        extra = [_WWW_AUTHENTICATE] if ERROR_TABLE[code].status == 401 else []
+        if verdict is Verdict.AMBIGUOUS:
+            message = f"ambiguous credentials: {decision.reason}"  # one of auth.py's 3 reasons
+        else:
+            message = _AUTH_MESSAGES[verdict]
+        hinted = verdict is Verdict.MISSING and decision.api_key_seen
+        envelope = {"hint": X_API_KEY_HINT} if hinted else None
+        if has_body(headers):
+            extra.append((b"connection", b"close"))
+        principal = decision.principal
+        await self.reply(
+            send,
+            code,
+            message,
+            request_id=request_id,
+            method=method,
+            outcome=outcome,
+            extra_headers=extra,
+            envelope=envelope,
+            **where,
+            client=None if principal is None else principal.id,
+        )
 
     async def _health_route(self, scope: Scope, receive: Receive, send: Send) -> None:
         """`GET /seriatim/health` through Starlette, then its one line, at `DEBUG`, once the
@@ -458,6 +535,7 @@ class _Dispatcher:
                 kind="seriatim",
                 scope="none",
                 known=True,
+                client=None,  # health reads no credentials (TD-slice-2 S2-R5)
                 **fields,
                 outcome=result,
                 status=status,
@@ -514,12 +592,26 @@ class _Dispatcher:
             await self.reply(send, ErrorCode.BAD_PATH, str(e), request_id=rid, method=method)
             return
         route = classify(method, raw_path)
-        where = {
+        where: dict[str, object] = {
             "path": raw_path.decode("latin-1"),
             "kind": route.kind.value,
             "scope": route.scope.value,
             "known": route.known,
         }
+        # Auth (TD-slice-2 §3 step 6): before every route-specific answer, the body, the gate.
+        decision = authorise(route, scope["headers"], self.keyring)
+        if decision.verdict is not Verdict.ALLOW:
+            await self.refuse_auth(
+                send,
+                decision,
+                request_id=rid,
+                method=method,
+                headers=scope["headers"],
+                where=where,
+            )
+            return
+        scope[PRINCIPAL_KEY] = decision.principal
+        where["client"] = client_of(scope)
         if route.kind is not Kind.SERIATIM:
             assert self.proxy is not None  # set by the lifespan
             await self.proxy(scope, receive, send, route, rid)
@@ -608,6 +700,10 @@ def create_app(
     if a handler is ever added."""
     for name in _QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+    # Fail closed (TD-slice-2 §2.4): `load_settings` never builds these, but `Settings` can be
+    # built directly, and the app must never serve them.
+    if not settings.keys and not settings.allow_unauthenticated:
+        raise ConfigError(NO_KEYS)
     return _Dispatcher(settings, gate, client)
 
 
@@ -676,8 +772,6 @@ def main() -> int:
     stopped."""
     try:
         settings = load_settings()
-        if settings.keys:  # never serve with keys this build does not check (TD-slice-2 §9)
-            raise ConfigError(KEYS_NOT_ENFORCED)
     except ConfigError as e:
         print(f"seriatim-node: {e}", file=sys.stderr)
         return 2

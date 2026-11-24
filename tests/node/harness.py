@@ -44,7 +44,9 @@ from seriatim_node.config import Settings, load_settings
 from seriatim_node.gate import Gate, SlotState
 
 LOOPBACK = "127.0.0.1"
-READY_PATH = "/seriatim/ready"  # not a Seriatim route: the sidecar answers it 404 itself
+# Not a Seriatim route: the sidecar answers it itself, 404 in test mode and 401 with keys
+# (an unknown `/seriatim/*` path needs `admin`, TD-slice-2 §2.3), never through Ollama.
+READY_PATH = "/seriatim/ready"
 # TD §7 "Timing": an elapsed-time assertion may overrun its target by this much.
 TIMING_BOUND_S = 0.5 if os.environ.get("CI") == "true" else 0.1
 # The asyncio loop's clock is time.monotonic(); its tick is TICK_S (about 15.6 ms on Windows up
@@ -640,6 +642,14 @@ def all_free(gate: Gate) -> bool:
     return all(s.state is SlotState.FREE for s in gate.slots())
 
 
+def log_lines(text: str) -> list[dict]:
+    """The request lines in captured stdout: JSON lines with `event: "request"` only, so
+    another event's line (TD-slice-2's hourly warning) is never counted as a request
+    (TD-slice-2 Appendix B)."""
+    docs = [json.loads(line) for line in text.splitlines() if line.startswith('{"ts"')]
+    return [doc for doc in docs if doc["event"] == "request"]
+
+
 def key_tables(keys: Sequence[tuple[str, str, str]]) -> str:
     """`[[keys]]` tables for `(id, scope, key)` triples, each with the key's SHA-256, as
     `keygen` prints them (TD-slice-2 §6, §7)."""
@@ -816,8 +826,8 @@ class SidecarProcess:
         """Wait until the sidecar answers HTTP; fail if it exits first.
 
         An accepted connection is not enough: on Windows, straight after a restart on the same
-        port, one can be accepted and then reset (#107). `READY_PATH` is answered 404 by the
-        sidecar itself, so it never reaches the upstream or the gate.
+        port, one can be accepted and then reset (#107). `READY_PATH` is answered by the
+        sidecar itself (404, or 401 with keys), so it never reaches the upstream or the gate.
         """
         deadline = time.monotonic() + timeout
         while True:
