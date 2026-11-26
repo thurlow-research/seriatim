@@ -722,6 +722,13 @@ before Starlette sees it. That is what lets it check the raw path first. For eac
    500 `INTERNAL` (fail closed). Uvicorn with h11 always sets it.
 4. `check_raw_path(raw_path)`. A `PathError` gives 400 `BAD_PATH`.
 5. `route = classify(method, raw_path)`.
+
+   **Since S2-3, the auth step comes next** (TD-slice-2 §3, step 6). `auth.authorise`
+   checks the request's credentials against the route's scope, so a keyed sidecar answers
+   400 `AUTH_AMBIGUOUS`, 401 or 403 before steps 6 and 7. That includes a `/seriatim/*` 404
+   or 405, which has scope `admin` (S2-R3). `GET /seriatim/health` has scope `none` and
+   passes. In unauthenticated test mode the step lets every request through. TD-slice-2 §3
+   gives the detail.
 6. For `SERIATIM` routes, a status of 404 or 405 gives `NOT_FOUND` or `METHOD_NOT_ALLOWED`
    (405 also carries `Allow`). Otherwise the request goes to the Starlette router, which
    holds only `/seriatim/health` in S1.
