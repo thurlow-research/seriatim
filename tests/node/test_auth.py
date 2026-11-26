@@ -850,20 +850,26 @@ def test_the_printed_table_loads_and_its_key_is_accepted(fake_ollama, tmp_path, 
     assert (line["client"], line["scope"], line["status"]) == ("client-a", "infer", 200)
 
 
-REPEATED = "given more than once"
+ID_TWICE = "argument --id: given more than once\n"
+SCOPE_TWICE = "argument --scope: given more than once\n"
+
+
+def bad_id(value: str) -> str:
+    return f"argument --id: {value!r} does not match {auth.KEY_ID_PATTERN}\n"
+
 
 KEYGEN_REFUSED = [
-    (["--id", "client-a", "--scope", "read"], "invalid choice"),
-    (["--id", "Bad", "--scope", "infer"], "does not match"),
-    (["--id", "a\n", "--scope", "infer"], "does not match"),
-    (["--id", "a" * 33, "--scope", "infer"], "does not match"),
+    (["--id", "client-a", "--scope", "read"], "argument --scope: invalid choice: "),
+    (["--id", "Bad", "--scope", "infer"], bad_id("Bad")),
+    (["--id", "a\n", "--scope", "infer"], bad_id("a\n")),
+    (["--id", "a" * 33, "--scope", "infer"], bad_id("a" * 33)),
     (["--scope", "infer"], "required: --id"),
     (["--id", "client-a"], "required: --scope"),
     ([], "required: --id, --scope"),
-    (["--id", "a", "--id", "b", "--scope", "infer"], REPEATED),
-    (["--id", "a", "--id", "a", "--scope", "infer"], REPEATED),
-    (["--id", "a", "--scope", "infer", "--scope", "admin"], REPEATED),
-    (["--id", "a", "--scope", "infer", "--scope", "infer"], REPEATED),
+    (["--id", "a", "--id", "b", "--scope", "infer"], ID_TWICE),
+    (["--id", "a", "--id", "a", "--scope", "infer"], ID_TWICE),
+    (["--id", "a", "--scope", "infer", "--scope", "admin"], SCOPE_TWICE),
+    (["--id", "a", "--scope", "infer", "--scope", "infer"], SCOPE_TWICE),
     (["--id", "a", "--scope", "infer", "extra"], "unrecognized arguments: extra"),
     (["--id", "a", "--scope", "infer", "--help"], "unrecognized arguments: --help"),
     (["--i", "a", "--scope", "infer"], "required: --id"),
@@ -878,6 +884,8 @@ def test_keygen_refuses_bad_arguments(keygen_only, capsys, argv, error) -> None:
     assert out == ""  # no key
     assert err.startswith("usage: seriatim-node keygen --id ID --scope {infer,admin}\n"), err
     assert "seriatim-node keygen: error: " in err and error in err, err
+    if error.endswith("\n"):  # the messages keygen writes itself are checked whole
+        assert err.endswith(f"seriatim-node keygen: error: {error}"), err
     assert not re.search("seriatim_", err)
     keygen_only.untouched()
 
@@ -885,8 +893,11 @@ def test_keygen_refuses_bad_arguments(keygen_only, capsys, argv, error) -> None:
 @pytest.mark.td("A5")
 @pytest.mark.parametrize("argv", [["nope"], ["serve"], ["--id", "a"], ["", "keygen"]])
 def test_main_refuses_any_other_command(keygen_only, capsys, argv) -> None:
+    usage = "usage: seriatim-node [keygen --id <id> --scope infer|admin]\n"
+    assert app.USAGE + "\n" == usage
+    assert capsys.readouterr() == ("", "")
     assert app.main(argv) == 2
-    assert capsys.readouterr() == ("", app.USAGE + "\n")
+    assert capsys.readouterr() == ("", usage)
     keygen_only.untouched()
 
 

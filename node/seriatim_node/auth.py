@@ -248,7 +248,6 @@ def _key_id(value: str) -> str:
 def _keygen_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="seriatim-node keygen",
-        description="Print a new sidecar key and the [[keys]] table for the node's config file.",
         add_help=False,  # §7: any argument but --id and --scope is refused
         allow_abbrev=False,
     )
