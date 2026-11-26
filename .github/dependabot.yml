@@ -24,3 +24,9 @@ updates:
     groups:
       docker-compose:
         patterns: ["*"]
+    # node-a's python image tracks UV_PYTHON in the workflows (3.12), so it takes only patch
+    # and digest bumps. A new Python is a migration, done in one PR across CI, the release and
+    # the PPE, not a Dependabot merge (#112). Ollama and the other images are not ignored.
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
