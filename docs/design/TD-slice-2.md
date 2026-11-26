@@ -693,6 +693,39 @@ seriatim-node keygen --id <id> --scope infer|admin
 - **Where it runs.** On the operator's machine or on the node. The key goes to the client
   (or, from S7, into the gateway's config), and the table into the node's config file.
 
+**Details fixed by the code (S2-4).** S2-4 adds `keygen` to `auth.py`, `main(argv)` to
+`app.py`, and `.gitleaks.toml`.
+- **The parser.** `prog` is `seriatim-node keygen`, so the usage line is `usage:
+  seriatim-node keygen --id ID --scope {infer,admin}`. It has `add_help=False`, since `-h` and
+  `--help` are "any other argument" and exit 2 like one, and `allow_abbrev=False`, so `--i` is
+  not taken for `--id`. `Once`'s error is `argument --id: given more than once` (or
+  `--scope`). `keygen` catches the `SystemExit` that argparse's `error` raises and returns 2,
+  so it never exits the process itself.
+- **The id rule.** `auth.py` cannot import `config.py`, so it keeps its own copy of
+  `KeyConfig.id`'s pattern, `KEY_ID_PATTERN`; a test checks that the two are the same. The id
+  is checked with `re.fullmatch`, so an id with a trailing newline is refused, as pydantic
+  refuses it (Python's `$` alone would accept one).
+- **The output** is written to `out` in one `write`: the key, a blank line, and the table in
+  exactly the form `harness.key_tables()` writes.
+- **`main(argv)`** dispatches on `argv[:1] == ["keygen"]`. Any other non-empty `argv`,
+  including an empty first argument, prints `USAGE` (`usage: seriatim-node [keygen --id <id>
+  --scope infer|admin]`, in `app.py`) on stderr and returns 2. `keygen` gets `sys.stdout` as
+  it is at the call, so pytest's `capsys` sees it.
+- **`main()` under pytest.** With no argument, `main()` reads `sys.argv[1:]`, which under
+  pytest is pytest's own command line. So the A4 and C8 tests call `main([])`, and A5 sets
+  `sys.argv` when it tests the default. `test_package.py`'s `runpy` test of
+  `python -m seriatim_node` (outside §9's S2-4 files) still calls `main()` with pytest's
+  arguments: it still exits 2, but run as `pytest -m …` that 2 is the usage message, not the
+  invalid `SLOTS` it sets. The subprocess test beside it is unaffected.
+- **Where the tests are.** A5 is in `test_auth.py`. Its `keygen_only` fixture runs `main()`
+  in an empty working directory, with `SLOTS=0`, `CONFIG` naming a directory, a `LOCK_DIR`
+  that must stay absent, and `load_settings`, `acquire_singleton`, `create_app` and
+  `uvicorn.run` patched to fail the test if reached. The http request is A13's form: the
+  printed table written to a file under `tmp_path`, `load_settings`, then `ThreadServer`,
+  and one `GET /api/tags` whose log line has `client: client-a`. The id-pattern test carries
+  no TD ID.
+- **`.gitleaks.toml`** is the block above, with a comment at its head.
+
 ## 8. Tests to write (exact)
 
 Each test names the requirement it proves. All run in CI on `ubuntu-latest`, and also on

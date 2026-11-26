@@ -7,16 +7,21 @@ both import it without a cycle.
 
 A key is never logged, echoed or kept: the keyring holds SHA-256 digests only, and a request's
 key is hashed once and compared with every digest in constant time (REQ-13; ADR-001 D6, T4).
+`keygen` (§7) prints a new key and its `[[keys]]` table, and nothing else: it reads no
+configuration and writes no file.
 """
 
 from __future__ import annotations
 
+import argparse
+import re
 import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
 from hmac import compare_digest
+from typing import Any, TextIO
 
 from .gate import Kind, Route, Scope
 
@@ -209,3 +214,64 @@ def authorise(
 def new_key() -> str:
     """A new key: `seriatim_` and 43 base64url characters, 32 random bytes (Q2; §7)."""
     return KEY_PREFIX + secrets.token_urlsafe(32)
+
+
+# --- keygen (§7) ------------------------------------------------------------------------------
+
+# `config.KeyConfig.id`'s pattern (Q3), copied because this module cannot import config.py;
+# test_auth.py checks that the two are the same.
+KEY_ID_PATTERN = r"^[a-z0-9][a-z0-9-]{0,31}$"
+SCOPES = ("infer", "admin")
+
+
+class Once(argparse.Action):
+    """argparse's `store`, except that a repeated option is an error, never the last value."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        if getattr(namespace, self.dest) is not None:
+            parser.error(f"argument {option_string}: given more than once")
+        setattr(namespace, self.dest, values)
+
+
+def _key_id(value: str) -> str:
+    if re.fullmatch(KEY_ID_PATTERN, value) is None:
+        raise argparse.ArgumentTypeError(f"{value!r} does not match {KEY_ID_PATTERN}")
+    return value
+
+
+def _keygen_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="seriatim-node keygen",
+        description="Print a new sidecar key and the [[keys]] table for the node's config file.",
+        add_help=False,  # §7: any argument but --id and --scope is refused
+        allow_abbrev=False,
+    )
+    parser.add_argument("--id", required=True, type=_key_id, action=Once)
+    parser.add_argument("--scope", required=True, choices=SCOPES, action=Once)
+    return parser
+
+
+def keygen(argv: Sequence[str], out: TextIO) -> int:
+    """`seriatim-node keygen --id <id> --scope infer|admin` (TD-slice-2 §7).
+
+    Writes the new key, a blank line and its `[[keys]]` table to `out`, once, and returns 0.
+    A bad, missing, repeated or extra argument prints argparse's usage on stderr and returns 2,
+    with no key. It opens no file, reads no `SERIATIM_NODE_*` variable or config file, takes no
+    lock and starts no server, so it works on a node whose configuration is not yet valid.
+    """
+    try:
+        args = _keygen_parser().parse_args(list(argv))
+    except SystemExit:  # argparse has printed its usage and the error on stderr
+        return 2
+    key = new_key()
+    out.write(
+        f'{key}\n\n[[keys]]\nid = "{args.id}"\nscope = "{args.scope}"\n'
+        f'sha256 = "{sha256(key.encode("ascii")).hexdigest()}"\n'
+    )
+    return 0

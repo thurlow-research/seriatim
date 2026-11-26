@@ -1,5 +1,6 @@
 """`auth.py` (TD-slice-2 §2.1, §4, §7): reading credentials (A1), the keyring, scopes and keys
-(A2), and `authorise`; keys in the configuration (A3) and the startup refusals (A4).
+(A2), and `authorise`; keys in the configuration (A3), the startup refusals (A4), and `keygen`
+with `main(argv)` (A5).
 
 Keys come from `new_key()`, never from a literal, so nothing that looks like a key is committed
 (TD-slice-2 §8).
@@ -9,14 +10,18 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import logging
 import os
 import re
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 import pytest
-from harness import key_tables
+from harness import WAIT_S, ThreadServer, key_tables, log_lines, ready_gate, reserve_socket, status
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -637,7 +642,7 @@ def warnings_in(caplog) -> list[str]:
 def test_no_keys_and_no_flag_refuses_to_start(node_env, capsys) -> None:
     assert refused({}) == NO_KEYS
     assert NO_KEYS.startswith(f"{KEYS}: ")
-    assert app.main() == 2
+    assert app.main([]) == 2
     assert capsys.readouterr().err == f"seriatim-node: {NO_KEYS}\n"
     assert node_env == [] and app._SINGLETON_FD is None
 
@@ -653,7 +658,7 @@ def test_no_keys_with_the_flag_starts_in_test_mode(node_env, monkeypatch, tmp_pa
         monkeypatch.setenv(name, value)
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
-        assert app.main() == 0
+        assert app.main([]) == 0
     assert len(node_env) == 1
     assert warnings_in(caplog) == [ALLOW_WARNING]
 
@@ -680,7 +685,7 @@ def test_a_non_loopback_listen_host_is_always_refused(
     assert warnings_in(caplog) == []  # a refused start logs no startup warning
     for name, value in environ.items():
         monkeypatch.setenv(name, value)
-    assert app.main() == 2
+    assert app.main([]) == 2
     assert capsys.readouterr().err == f"seriatim-node: {expected}\n"
     assert node_env == [] and app._SINGLETON_FD is None
 
@@ -711,7 +716,7 @@ def test_configured_keys_start_with_a_keyring(
     monkeypatch.setattr(app, "acquire_singleton", locked.append)
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="seriatim_node.config"):
-        assert app.main() == 0
+        assert app.main([]) == 0
     assert len(locked) == 1 and len(node_env) == 1  # the lock, then uvicorn.run: it serves
     assert warnings_in(caplog) == ([ALLOW_WITH_KEYS_WARNING] if allow else [])
     (served,) = built
@@ -735,3 +740,157 @@ def test_create_app_refuses_keys_the_keyring_refuses() -> None:
         app.create_app(Settings(keys=(key, key)))
     assert str(e.value) == f"{KEYS}: key 'a': the id is repeated"
     assert hidden(str(e.value), key.sha256)
+
+
+# --- keygen (A5) -------------------------------------------------------------------------------
+
+KEYGEN = ["keygen", "--id", "client-a", "--scope", "infer"]
+
+
+@dataclass
+class KeygenOnly:
+    """The places `keygen` must leave alone (§7)."""
+
+    cwd: Path
+    lock_dir: Path
+
+    def untouched(self) -> None:
+        assert list(self.cwd.iterdir()) == []
+        assert not self.lock_dir.exists()
+
+
+@pytest.fixture
+def keygen_only(monkeypatch, tmp_path) -> KeygenOnly:
+    """`main()` as `keygen` runs: an empty working directory, an environment the sidecar
+    refuses (an invalid `SLOTS`, a `CONFIG` that is a directory), and every serving step
+    patched to fail the test if it is reached."""
+    cwd, lock_dir, config_dir = tmp_path / "cwd", tmp_path / "lock", tmp_path / "config.d"
+    cwd.mkdir()
+    config_dir.mkdir()
+    monkeypatch.chdir(cwd)
+    for name in list(os.environ):
+        if name.startswith(P):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv(P + "SLOTS", "0")
+    monkeypatch.setenv(CONFIG, str(config_dir))
+    monkeypatch.setenv(P + "LOCK_DIR", str(lock_dir))
+    with pytest.raises(ConfigError):
+        load_settings()  # the environment is one the sidecar would refuse
+
+    def never(*args: object, **kwargs: object) -> None:
+        raise AssertionError("keygen reached a step that serves")
+
+    for name in ("load_settings", "acquire_singleton", "create_app"):
+        monkeypatch.setattr(app, name, never)
+    monkeypatch.setattr(app.uvicorn, "run", never)
+    return KeygenOnly(cwd, lock_dir)
+
+
+def printed_key(out: str, id: str, scope: str) -> str:
+    """The key in `keygen`'s output, checked to be the whole of it: the key, a blank line and
+    the table, with the key's SHA-256 (§7, Appendix A)."""
+    key = out.split("\n", 1)[0]
+    assert KEY_RE.fullmatch(key), out
+    assert len(base64.urlsafe_b64decode(key.removeprefix("seriatim_") + "=")) == 32
+    assert out == f'{key}\n\n[[keys]]\nid = "{id}"\nscope = "{scope}"\nsha256 = "{sha(key)}"\n'
+    return key
+
+
+@pytest.mark.td("A5")
+def test_keygen_prints_a_key_and_its_table(keygen_only, capsys) -> None:
+    assert app.main(KEYGEN) == 0
+    first, err = capsys.readouterr()
+    assert err == ""
+    key = printed_key(first, "client-a", "infer")
+    assert first == key + "\n\n" + key_tables([("client-a", "infer", key)]).removesuffix("\n")
+    assert app.main(["keygen", "--scope", "admin", "--id", "ops"]) == 0
+    second = printed_key(capsys.readouterr().out, "ops", "admin")
+    assert second != key  # two runs, two keys
+    keygen_only.untouched()
+
+
+@pytest.mark.td("A5")
+def test_keygen_writes_to_the_stream_it_is_given(keygen_only, capsys) -> None:
+    out = io.StringIO()
+    assert auth.keygen(["--id=ops", "--scope=admin"], out) == 0
+    printed_key(out.getvalue(), "ops", "admin")
+    assert capsys.readouterr() == ("", "")
+    keygen_only.untouched()
+
+
+@pytest.mark.td("A5")
+def test_main_reads_its_arguments_from_sys_argv(keygen_only, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["seriatim-node", *KEYGEN])
+    assert app.main() == 0
+    printed_key(capsys.readouterr().out, "client-a", "infer")
+    keygen_only.untouched()
+
+
+@pytest.mark.td("A5")
+def test_the_printed_table_loads_and_its_key_is_accepted(fake_ollama, tmp_path, capsys) -> None:
+    fake_ollama.script("GET", "/api/tags", status(200, b'{"models":[]}'))
+    assert auth.keygen(KEYGEN[1:], sys.stdout) == 0
+    out = capsys.readouterr().out
+    key = printed_key(out, "client-a", "infer")
+    path = tmp_path / "node.toml"
+    path.write_text(out.split("\n\n", 1)[1], encoding="utf-8")  # the table, as an operator would
+    environ = {CONFIG: str(path), P + "OLLAMA_URL": fake_ollama.url, P + "ID": "node-a"}
+    settings = load_settings(environ)
+    assert keyring(settings).match(key.encode("ascii")) == Principal("client-a", Scope.INFER)
+    server = ThreadServer(
+        app.create_app(settings, gate=ready_gate()[0]), reserve_socket(), lifespan="on"
+    ).start()
+    try:
+        url = f"http://127.0.0.1:{server.port}/api/tags"
+        headers = {"authorization": f"Bearer {key}", "x-request-id": "a5"}
+        assert httpx.get(url, headers=headers, timeout=WAIT_S).status_code == 200
+    finally:
+        server.stop()
+    (line,) = [line for line in log_lines(capsys.readouterr().out) if line["request_id"] == "a5"]
+    assert (line["client"], line["scope"], line["status"]) == ("client-a", "infer", 200)
+
+
+REPEATED = "given more than once"
+
+KEYGEN_REFUSED = [
+    (["--id", "client-a", "--scope", "read"], "invalid choice"),
+    (["--id", "Bad", "--scope", "infer"], "does not match"),
+    (["--id", "a\n", "--scope", "infer"], "does not match"),
+    (["--id", "a" * 33, "--scope", "infer"], "does not match"),
+    (["--scope", "infer"], "required: --id"),
+    (["--id", "client-a"], "required: --scope"),
+    ([], "required: --id, --scope"),
+    (["--id", "a", "--id", "b", "--scope", "infer"], REPEATED),
+    (["--id", "a", "--id", "a", "--scope", "infer"], REPEATED),
+    (["--id", "a", "--scope", "infer", "--scope", "admin"], REPEATED),
+    (["--id", "a", "--scope", "infer", "--scope", "infer"], REPEATED),
+    (["--id", "a", "--scope", "infer", "extra"], "unrecognized arguments: extra"),
+    (["--id", "a", "--scope", "infer", "--help"], "unrecognized arguments: --help"),
+    (["--i", "a", "--scope", "infer"], "required: --id"),
+]
+
+
+@pytest.mark.td("A5")
+@pytest.mark.parametrize(("argv", "error"), KEYGEN_REFUSED)
+def test_keygen_refuses_bad_arguments(keygen_only, capsys, argv, error) -> None:
+    assert app.main(["keygen", *argv]) == 2
+    out, err = capsys.readouterr()
+    assert out == ""  # no key
+    assert err.startswith("usage: seriatim-node keygen --id ID --scope {infer,admin}\n"), err
+    assert "seriatim-node keygen: error: " in err and error in err, err
+    assert not re.search("seriatim_", err)
+    keygen_only.untouched()
+
+
+@pytest.mark.td("A5")
+@pytest.mark.parametrize("argv", [["nope"], ["serve"], ["--id", "a"], ["", "keygen"]])
+def test_main_refuses_any_other_command(keygen_only, capsys, argv) -> None:
+    assert app.main(argv) == 2
+    assert capsys.readouterr() == ("", app.USAGE + "\n")
+    keygen_only.untouched()
+
+
+def test_keygen_ids_follow_the_key_id_rule() -> None:
+    """auth.py's copy of the key-id pattern is `KeyConfig.id`'s (Q3)."""
+    assert auth.KEY_ID_PATTERN == KeyConfig.model_json_schema()["properties"]["id"]["pattern"]
+    assert auth.SCOPES == ("infer", "admin")
