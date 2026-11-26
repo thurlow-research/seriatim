@@ -424,18 +424,19 @@ def test_k1_unlisted_pairs_are_gated_admin_unknown(method, path):
 
 @pytest.mark.td("K1")
 @pytest.mark.parametrize(
-    ("method", "path", "status", "known"),
+    ("method", "path", "scope", "status", "known"),
     [
-        ("GET", b"/seriatim/health", 200, True),
-        ("POST", b"/seriatim/health", 405, False),
-        ("HEAD", b"/seriatim/health", 405, False),
-        ("GET", b"/seriatim/nope", 404, False),
-        ("GET", b"/seriatim", 404, False),
-        ("GET", b"/seriatim/", 404, False),
+        ("GET", b"/seriatim/health", Scope.NONE, 200, True),
+        # TD-slice-2 §2.3 (S2-R3): every other `/seriatim/*` pair needs `admin`
+        ("POST", b"/seriatim/health", Scope.ADMIN, 405, False),
+        ("HEAD", b"/seriatim/health", Scope.ADMIN, 405, False),
+        ("GET", b"/seriatim/nope", Scope.ADMIN, 404, False),
+        ("GET", b"/seriatim", Scope.ADMIN, 404, False),
+        ("GET", b"/seriatim/", Scope.ADMIN, 404, False),
     ],
 )
-def test_k1_seriatim_paths(method, path, status, known):
-    assert classify(method, path) == Route(Kind.SERIATIM, Scope.NONE, known, status)
+def test_k1_seriatim_paths(method, path, scope, status, known):
+    assert classify(method, path) == Route(Kind.SERIATIM, scope, known, status)
 
 
 START = "the path must start with /"

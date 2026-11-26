@@ -13,7 +13,8 @@ close by `close_timeout_s` (the body is read from `resp.stream`, so no close hap
 the exchange) and logs a failed final write. S1-11 streams blob uploads (`first_chunk`,
 `body_stream`): no size limit, an idle timeout between chunks, and 408 `UPLOAD_INTERRUPTED`
 once bytes may have reached Ollama. S1-13 completes the request's log line (TD Appendix A):
-`wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`, on every path.
+`wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`, on every path. TD-slice-2's S2-3 adds
+`client`, the id of the key the dispatcher authenticated.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from typing import Any, Literal
 import anyio
 import httpx
 
-from seriatim_node.app import ErrorCode, ErrorFactory, RequestLog, new_client
+from seriatim_node.app import ErrorCode, ErrorFactory, RequestLog, client_of, new_client
 from seriatim_node.config import Settings
 from seriatim_node.gate import BLOB_RE, Busy, Gate, Kind, Lease, Route, Starting
 
@@ -515,6 +516,7 @@ class Proxy:
             "kind": route.kind.value,
             "scope": route.scope.value,
             "known": route.known,
+            "client": client_of(scope),  # the authenticated key's id (TD-slice-2 §2.5)
         }
         outcome = Outcome(body_pending=has_body(scope["headers"]))
         receive, send = _counted(receive, send, outcome)

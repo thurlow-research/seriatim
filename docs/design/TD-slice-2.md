@@ -447,6 +447,50 @@ log line carries it (§2.4). Nothing else in the proxy changes:
   header from Ollama's responses (TD-slice-1 §4), and `ErrorFactory` and health never add
   one. S2 adds A14, which checks every response class for it, the auth refusals included.
 
+**Details fixed by the code (S2-3).** S2-3 enforces the keys: `gate.py`'s S2-R3 scopes, the
+dispatcher's auth step, `refuse_auth`, `PRINCIPAL_KEY` and the `client` field, and removes
+S2-2's `main()` guard (`KEYS_NOT_ENFORCED`) and its test.
+- **`refuse_auth` also takes `headers`**, the request's, for `has_body` (§2.4's
+  `Connection: close`). `has_body` is `proxy.py`'s; `proxy.py` imports `app.py`, so
+  `refuse_auth` imports it inside the function, as the lifespan imports `Proxy`. The code and
+  `outcome` of each verdict are one table, `_AUTH_REFUSALS`, and the three fixed messages
+  another, `_AUTH_MESSAGES`; the 400's message is `ambiguous credentials: <reason>`.
+  `WWW-Authenticate: Bearer` is added exactly when the code's status is 401.
+- **`reply` gains `envelope`**, the optional `ErrorEnvelope` fields it passes to
+  `ErrorFactory.response`: the 401's `hint`, `X_API_KEY_HINT`, only on `AUTH_MISSING` with
+  `api_key_seen`.
+- **`client_of(scope)`** in `app.py` gives the `client` field: the id of
+  `scope[PRINCIPAL_KEY]`, or null when it is None or absent. The dispatcher adds it to
+  `where` after auth, for its 404 and 405 lines, and `Proxy.__call__` adds it to its own
+  `where`, so a proxy called without the dispatcher (S1's in-process tests) logs null. A
+  refusal's `client` comes from the `Decision` (set only on a 403), since nothing is put in the
+  scope for a refused request. Health's line has a literal null: health never reads the
+  credentials (S2-R5).
+- **Fail closed in two places.** `create_app` raises `ConfigError(NO_KEYS)` (S2-2's constant)
+  for no keys without the flag, before building the dispatcher. `_Dispatcher.__init__` builds
+  `self.keyring = keyring(settings)` and turns a `Keyring` `ValueError` (only possible for
+  `Settings` built directly, §2.2's S2-2 details) into `ConfigError("SERIATIM_NODE_KEYS:
+  <message>")`; `Keyring`'s messages name ids, never digests.
+- **`classify`** gives a `/seriatim/*` 404 or 405 `Scope.ADMIN`; health keeps `NONE`. The
+  log line's `scope` for those is therefore `admin` (S1's `REFUSALS` table in
+  `test_http.py` changes with it).
+- **The harness.** `harness.log_lines(text)` keeps only `event: "request"` lines and replaces
+  `test_http.py`'s `_log_lines`. `READY_PATH` (`/seriatim/ready`) is an unknown `/seriatim/*`
+  path, so a keyed sidecar answers it 401 instead of 404. Both carry `X-Seriatim-Node`, so
+  `SidecarProcess.wait_listening` works for keyed and unkeyed sidecars alike.
+- **Where the tests are.** A4's two cases are in `test_auth.py`, beside S2-2's A4 tests, where
+  the guard's test was: keys with and without the flag start (`main()` returns 0, and the app
+  it built has the keyring), and `create_app` refuses `Settings(keys=(),
+  allow_unauthenticated=False)`. The `Keyring` `ValueError` case carries no TD ID. A6 to
+  A11, A13 and A14 are in `test_http_auth.py`. A6's and A7's pairs are `route-pairs.json`'s
+  (with a real digest for the blob routes), §8's extra pairs, and the `/seriatim/*` and
+  exact-matching cases of A7 and §8.2's M1 and M12; `HEAD /seriatim/health` is among the
+  `admin` rows too. A10's "over `max_body_bytes`" case is its raw-socket
+  `Content-Length: 4096` case, with `max_body_bytes` at 1024. A13 builds its settings from a file under `tmp_path` and runs
+  them with `ThreadServer` directly, because `make_settings` removes its key file once loaded.
+  A11's "uvicorn's access log stays off" is asserted as no `uvicorn.access` record during its
+  requests.
+
 ## 3. Request flow and precedence
 
 For each request, in this order. The first rule that applies answers it:
