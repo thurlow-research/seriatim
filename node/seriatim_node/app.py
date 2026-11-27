@@ -6,7 +6,8 @@ S1-5 adds `RequestLog`, `create_app` (the dispatcher and `/seriatim/health`) and
 client. S1-6 hands every other route to the proxy (`proxy.py`). S1-12 adds the singleton
 lock (`acquire_singleton`) and `main()`. S1-13 completes the log line (TD Appendix A): each
 line has `wait_ms`, `hold_ms`, `bytes_in` and `bytes_out`. TD-slice-2's S2-3 adds the auth
-step (`auth.authorise`, `refuse_auth`), `PRINCIPAL_KEY` and the log line's `client`.
+step (`auth.authorise`, `refuse_auth`), `PRINCIPAL_KEY` and the log line's `client`. S2-5 adds
+test mode's hourly warning (`RequestLog.event`, `create_app`'s `warn_every_s`).
 """
 
 from __future__ import annotations
@@ -31,13 +32,23 @@ from typing import Any
 import anyio
 import httpx
 import uvicorn
+from anyio import sleep  # app's own binding, so A12 patches it without touching anyio.sleep
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route as StarletteRoute
 
 from seriatim_node.auth import Decision, Verdict, authorise, keygen
-from seriatim_node.config import KEYS_VAR, NO_KEYS, ConfigError, Settings, keyring, load_settings
+from seriatim_node.config import (
+    ALLOW_WARNING,
+    ALLOW_WITH_KEYS_WARNING,
+    KEYS_VAR,
+    NO_KEYS,
+    ConfigError,
+    Settings,
+    keyring,
+    load_settings,
+)
 from seriatim_node.gate import SERIATIM_ROUTES, Gate, Kind, PathError, check_raw_path, classify
 
 
@@ -229,10 +240,12 @@ _LEVELS: Mapping[str, int] = MappingProxyType(
 
 
 class RequestLog:
-    """One JSON line per request to stdout (REQ-22; TD Appendix A).
+    """One JSON line per request to stdout (REQ-22; TD Appendix A), and the lines of other
+    events in the same format (TD-slice-2 §2.4, Appendix A).
 
-    A line is written only when its `level` is at or above the configured one, so health
-    requests, logged at `DEBUG`, add nothing at the default `INFO` (HL9).
+    A request's line is written only when its `level` is at or above the configured one, so
+    health requests, logged at `DEBUG`, add nothing at the default `INFO` (HL9). An `event`
+    line is written whatever the level (test mode's warning, REQ-15; TD-slice-2 §2.4).
     """
 
     def __init__(self, level: str, node_id: str, wall: Callable[[], float] = time.time) -> None:
@@ -241,14 +254,20 @@ class RequestLog:
         self._wall = wall
 
     def emit(self, *, level: str = "INFO", **fields: object) -> None:
+        """A request's line, `event` set to `request`, if `level` reaches the threshold."""
         if _LEVELS[level] < self._threshold:
             return
+        self.event("request", level=level, **fields)
+
+    def event(self, name: str, *, level: str, **fields: object) -> None:
+        """One line with `event` set to `name`, whatever the configured level: `ts`, `level`,
+        `event`, then `fields`, then `node`."""
         ms = int(self._wall() * 1000)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms // 1000))
         line = {
             "ts": f"{stamp}.{ms % 1000:03d}Z",
             "level": level,
-            "event": "request",
+            "event": name,
             **fields,
             "node": self._node,
         }
@@ -385,9 +404,14 @@ class _Dispatcher:
     """The ASGI callable `create_app` returns. It sees every request before Starlette."""
 
     def __init__(
-        self, settings: Settings, gate: Gate | None, client: httpx.AsyncClient | None
+        self,
+        settings: Settings,
+        gate: Gate | None,
+        client: httpx.AsyncClient | None,
+        warn_every_s: float,
     ) -> None:
         self.settings = settings
+        self.warn_every_s = warn_every_s
         try:  # None only in unauthenticated test mode (TD-slice-2 §2.4)
             self.keyring = keyring(settings)
         except ValueError as e:  # only from `Settings` built directly: names ids, never hashes
@@ -417,11 +441,23 @@ class _Dispatcher:
         self.health_client = new_health_client(s)
         self.proxy = Proxy(s, self.gate, client, self.log, self.errors)
         try:
-            yield
+            async with anyio.create_task_group() as tasks:
+                if s.allow_unauthenticated:  # keys or not (TD-slice-2 S2-R1)
+                    tasks.start_soon(self._warn_allow_unauthenticated)
+                yield
+                tasks.cancel_scope.cancel()  # shutdown: no line after it
         finally:
             await self.health_client.aclose()
             if owned:
                 await client.aclose()
+
+    async def _warn_allow_unauthenticated(self) -> None:
+        """Test mode's `WARNING` line, at startup and then every `warn_every_s` until the
+        lifespan cancels it (REQ-15; TD-slice-2 §2.4, Q14). It never touches the gate."""
+        message = ALLOW_WARNING if self.keyring is None else ALLOW_WITH_KEYS_WARNING
+        while True:
+            self.log.event("allow_unauthenticated", level="WARNING", message=message)
+            await sleep(self.warn_every_s)
 
     async def reply(
         self,
@@ -688,11 +724,20 @@ class _Dispatcher:
         )
 
 
+WARN_EVERY_S = 3600.0  # test mode's warning, every hour (REQ-15; TD-slice-2 Q14)
+
+
 def create_app(
-    settings: Settings, *, client: httpx.AsyncClient | None = None, gate: Gate | None = None
+    settings: Settings,
+    *,
+    client: httpx.AsyncClient | None = None,
+    gate: Gate | None = None,
+    warn_every_s: float = WARN_EVERY_S,
 ) -> ASGIApp:
     """The sidecar's ASGI app (TD §2.4). Tests may inject the shared ungated `client` and the
     `gate`; otherwise the lifespan creates them (a new gate starts in its startup quarantine).
+    `warn_every_s` is how often test mode's `WARNING` line repeats: an argument for tests, not
+    a setting, so a deployment can't change it (TD-slice-2 §2.4).
 
     It also quiets the HTTP client's own loggers (L3): httpx logs each request's URL, query
     included, at INFO, and httpcore's DEBUG traces carry Ollama's response headers. Nothing
@@ -704,7 +749,7 @@ def create_app(
     # built directly, and the app must never serve them.
     if not settings.keys and not settings.allow_unauthenticated:
         raise ConfigError(NO_KEYS)
-    return _Dispatcher(settings, gate, client)
+    return _Dispatcher(settings, gate, client, warn_every_s)
 
 
 # Libraries whose own log records can carry a secret (a query string, a `Set-Cookie`).

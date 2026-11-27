@@ -1,4 +1,4 @@
-"""Sidecar authentication over real sockets (TD-slice-2 §8, the http tier): A6 to A11, A13 and A14.
+"""Sidecar authentication over real sockets (TD-slice-2 §8, the http tier): A6 to A14.
 
 The real sidecar on a loopback port, in front of `fake_ollama` (TD-slice-1 §7), with keys
 configured. Keys come from `new_key()`, never from a literal, so nothing that looks like a key
@@ -12,13 +12,18 @@ import base64
 import hashlib
 import json
 import logging
+import sys
+import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 from harness import (
+    TIMING_BOUND_S,
     WAIT_S,
     FakeClock,
     RawResponse,
@@ -27,6 +32,7 @@ from harness import (
     closed_port,
     key_tables,
     log_lines,
+    make_settings,
     raw_connect,
     raw_exchange,
     read_response,
@@ -35,12 +41,13 @@ from harness import (
     reserve_socket,
     sequence,
     status,
+    timer_slack,
     wait_for,
 )
 
 from seriatim_node.app import create_app
 from seriatim_node.auth import OTHER_SCHEME, TWO_HEADERS, WHITESPACE, new_key
-from seriatim_node.config import load_settings
+from seriatim_node.config import ALLOW_WARNING, ALLOW_WITH_KEYS_WARNING, Settings, load_settings
 from seriatim_node.gate import Gate, SlotState
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -125,6 +132,12 @@ class Log:
         wait_for(lambda: any(d["request_id"] == rid for d in self.lines()))
         (found,) = [d for d in self.lines() if d["request_id"] == rid]
         return found
+
+    def warnings(self) -> list[dict]:
+        """Test mode's warning lines (TD-slice-2 §2.4), which `log_lines` leaves out."""
+        self.lines()
+        docs = [json.loads(x) for x in self.text.splitlines() if x.startswith('{"ts"')]
+        return [d for d in docs if d["event"] == "allow_unauthenticated"]
 
 
 def call(
@@ -670,6 +683,186 @@ def test_a11_refused_or_ignored_secrets_are_never_logged_or_echoed(
     log.lines()
     assert not [m for m in marks if m in log.text or m in caplog.text]
     assert [r for r in caplog.records if r.name == "uvicorn.access"] == []  # L3: it stays off
+
+
+# --- A12: unauthenticated test mode and the hourly warning ----------------------------------
+
+EVERY_S = 0.2  # the warning's interval in A12's tests: `create_app(…, warn_every_s=…)`
+WARNING_KEYS = ["ts", "level", "event", "message", "node"]  # Appendix A, in order
+
+
+def serve(settings: Settings, **kwargs: object) -> ThreadServer:
+    """A sidecar run directly, so a test can pass `create_app` its `warn_every_s`."""
+    app = create_app(settings, gate=ready_gate()[0], **kwargs)
+    return ThreadServer(app, reserve_socket(), lifespan="on").start()
+
+
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+MS = timedelta(milliseconds=1)
+
+
+def ts_ms(ts: str) -> int:
+    """A line's `ts` as whole milliseconds since the epoch: an int, so the difference of two
+    is exact (as float seconds, two ~1.7e9 values lose the last digits when subtracted)."""
+    return (datetime.strptime(ts[:-1] + "+0000", "%Y-%m-%dT%H:%M:%S.%f%z") - EPOCH) // MS
+
+
+def gap_floor_ms(every_s: float) -> float:
+    """The least gap, in ms of `ts`, between two warning lines `every_s` apart. The sleep is
+    timed by the monotonic clock and `ts` is the wall clock, so the floor allows for:
+    - the sleep ending up to `timer_slack()` early, by the monotonic clock;
+    - the wall clock's own resolution, at each end, so twice;
+    - `ts` being truncated to the millisecond: two truncations differ by under 1 ms;
+    - the wall clock running slow against the monotonic one while NTP slews it, at most
+      500 ppm (the adjtime(2) limit).
+    A step of the wall clock during the test is not allowed for: it is the one thing that
+    could fail this, and the check would then be measuring the step, not the sidecar."""
+    wall = time.get_clock_info("time").resolution
+    slack_s = timer_slack() + 2 * wall + 0.001 + every_s * 500e-6
+    return (every_s - slack_s) * 1000
+
+
+@pytest.mark.td("A12")
+def test_a12_unauthenticated_test_mode_opens_every_route(fake_ollama, sidecar, capsys):
+    """Q12: with no keys and the flag, no request is authenticated, `admin` routes included,
+    and an ambiguous `Authorization` is not even read; Ollama never sees it."""
+    for method, path in [("POST", "/api/create"), ("OPTIONS", "/api/tags"), ("GET", "/api/tags")]:
+        fake_ollama.script(method, path, status(200, OK))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    assert car.settings.allow_unauthenticated and not car.settings.keys
+    log = Log(capsys)
+    # Both are gated, on the gate's one slot: each line is written once its lease has ended,
+    # so waiting for it keeps the next request from a 429 (TD-slice-1 §8.6, as A7 does).
+    assert call(car, "POST", "/api/create", "a12-create", content=b"{}").status_code == 200
+    log.line("a12-create")
+    assert call(car, "OPTIONS", "/api/tags", "a12-options").status_code == 200
+    log.line("a12-options")
+    two = b"Authorization: Bearer %s\r\nAuthorization: Basic x\r\n" % new_key().encode()
+    resp = raw_exchange(car.port, raw(b"/api/tags", "a12-two", two))
+    assert (resp.status, resp.body) == (200, OK)
+    assert [(r.method, r.raw_path) for r in fake_ollama.requests] == [
+        ("POST", b"/api/create"),
+        ("OPTIONS", b"/api/tags"),
+        ("GET", b"/api/tags"),
+    ]
+    for received in fake_ollama.requests:
+        assert b"authorization" not in {k.lower() for k, _ in received.headers}
+    for rid in ["a12-create", "a12-options", "a12-two"]:
+        line = log.line(rid)
+        assert (line["client"], line["outcome"], line["status"]) == (None, "ok", 200)
+    assert all_free(gate)
+
+
+@pytest.mark.td("A12")
+@pytest.mark.parametrize(
+    ("with_keys", "message"),
+    [(False, ALLOW_WARNING), (True, ALLOW_WITH_KEYS_WARNING)],
+    ids=["no-keys", "keys"],
+)
+def test_a12_the_warning_repeats_while_the_flag_is_set(
+    with_keys, message, fake_ollama, keys, capsys
+):
+    """REQ-15, S2-R1: a `WARNING` line at startup, then one every `warn_every_s`, keys or not,
+    with the message for the mode; none once the sidecar has stopped."""
+    tables = keys.tables if with_keys else []
+    settings = make_settings(fake_ollama.url, keys=tables, allow_unauthenticated=True)
+    log = Log(capsys)
+    server = serve(settings, warn_every_s=EVERY_S)
+    try:
+        wait_for(lambda: len(log.warnings()) >= 3)  # the startup line and two more
+    finally:
+        server.stop()
+    assert not server.thread.is_alive()  # its event loop has finished: nothing more can run
+    seen = log.warnings()
+    for doc in seen:
+        assert list(doc) == WARNING_KEYS  # no request fields
+        assert (doc["level"], doc["message"], doc["node"]) == ("WARNING", message, "node-a")
+    stamps = [ts_ms(doc["ts"]) for doc in seen]
+    gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False)]  # exact, in ms
+    assert all(gap >= gap_floor_ms(EVERY_S) for gap in gaps), gaps
+    assert log.lines() == []  # `log_lines` never counts them as requests
+    time.sleep(EVERY_S + TIMING_BOUND_S)  # a negative check: time for one more, had it run
+    assert log.warnings() == seen
+
+
+@pytest.mark.td("A12")
+def test_a12_the_warning_is_written_whatever_the_log_level(fake_ollama, capsys):
+    """REQ-15: with `LOG_LEVEL=ERROR` and the flag, the `WARNING` line is still written, while
+    request lines still obey the threshold (an `INFO` request line is not written)."""
+    fake_ollama.script("GET", "/api/tags", status(200, OK))
+    settings = make_settings(fake_ollama.url, log_level="ERROR")
+    assert settings.allow_unauthenticated and settings.log_level == "ERROR"
+    log = Log(capsys)
+    server = serve(settings, warn_every_s=EVERY_S)
+    try:
+        wait_for(lambda: log.warnings())  # the startup line
+        url = f"http://127.0.0.1:{server.port}/api/tags"
+        resp = httpx.get(url, headers=[("x-request-id", "a12-error")], timeout=WAIT_S)
+        assert resp.status_code == 200
+        # The request's line, had it been written, follows the response at once; two more
+        # warnings are at least one whole interval after it.
+        after = len(log.warnings())
+        wait_for(lambda: len(log.warnings()) >= after + 2)
+    finally:
+        server.stop()
+    for doc in log.warnings():
+        assert list(doc) == WARNING_KEYS
+        assert (doc["level"], doc["message"]) == ("WARNING", ALLOW_WARNING)
+    assert log.lines() == []  # the INFO request line is below the threshold
+
+
+@pytest.mark.td("A12")
+def test_a12_no_warning_without_the_flag(fake_ollama, keys, capsys):
+    """S2-R1: with keys and no flag there is no task, so not even the startup line."""
+    fake_ollama.script("GET", "/api/tags", status(200, OK))
+    settings = make_settings(fake_ollama.url, keys=keys.tables)
+    assert not settings.allow_unauthenticated
+    log = Log(capsys)
+    server = serve(settings, warn_every_s=EVERY_S)
+    try:
+        url = f"http://127.0.0.1:{server.port}/api/tags"
+        headers = [bearer(keys.infer), ("x-request-id", "a12-keys")]
+        assert httpx.get(url, headers=headers, timeout=WAIT_S).status_code == 200
+        assert log.line("a12-keys")["client"] == "client-a"
+        time.sleep(2 * EVERY_S + TIMING_BOUND_S)  # a negative check: two intervals and more
+    finally:
+        server.stop()
+    assert log.warnings() == []
+
+
+@pytest.mark.td("A12")
+def test_a12_the_warning_sleeps_an_hour_by_default(fake_ollama, capsys, monkeypatch):
+    """M8: without `warn_every_s`, the task sleeps 3600 s. `app.sleep`, app's own binding, is
+    patched to record its argument and then wait to be cancelled, so the loop never spins;
+    `anyio.sleep` itself is untouched."""
+    real_sleep = anyio.sleep
+    delays: list[float] = []
+
+    async def recording_sleep(delay: float) -> None:
+        delays.append(delay)
+        await anyio.sleep_forever()  # until the lifespan cancels the task
+
+    # The module `create_app` comes from, not the package's `app` attribute: test_package.py's
+    # runpy test rebinds that, and mutmut runs pytest twice in one process (conftest.py's
+    # import rule). Not `create_app.__globals__` either: under mutmut, `create_app` is a
+    # trampoline whose globals are mutmut's. The identity check proves it is the right one.
+    app_module = sys.modules[create_app.__module__]
+    assert app_module.create_app is create_app
+    monkeypatch.setattr(app_module, "sleep", recording_sleep)
+    settings = make_settings(fake_ollama.url)
+    log = Log(capsys)
+    server = serve(settings)
+    try:
+        wait_for(lambda: delays)
+        wait_for(lambda: log.warnings())  # written before the sleep, so already there
+    finally:
+        server.stop()
+    assert not server.thread.is_alive()
+    assert delays == [3600]
+    (doc,) = log.warnings()
+    assert (doc["level"], doc["message"]) == ("WARNING", ALLOW_WARNING)
+    assert anyio.sleep is real_sleep
 
 
 # --- A13: rotation ----------------------------------------------------------------------------
