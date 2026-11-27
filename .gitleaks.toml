@@ -9,7 +9,7 @@ useDefault = true
 [[rules]]
 id = "seriatim-node-key"
 description = "A Seriatim sidecar key (TD-slice-2 §7)"
-regex = '''(?:^|[^A-Za-z0-9_-])(seriatim_[A-Za-z0-9_-]{43})(?:[^A-Za-z0-9_-]|$)'''
+regex = '''(?m)(?:^|[^A-Za-z0-9_-])(seriatim_[A-Za-z0-9_-]{43})(?:$|[^A-Za-z0-9_-])'''
 secretGroup = 1
 entropy = 4.3
 keywords = ["seriatim_"]

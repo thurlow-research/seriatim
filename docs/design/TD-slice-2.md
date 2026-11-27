@@ -671,27 +671,37 @@ seriatim-node keygen --id <id> --scope infer|admin
   [[rules]]
   id = "seriatim-node-key"
   description = "A Seriatim sidecar key (TD-slice-2 §7)"
-  regex = '''(?:^|[^A-Za-z0-9_-])(seriatim_[A-Za-z0-9_-]{43})(?:[^A-Za-z0-9_-]|$)'''
+  regex = '''(?m)(?:^|[^A-Za-z0-9_-])(seriatim_[A-Za-z0-9_-]{43})(?:$|[^A-Za-z0-9_-])'''
   secretGroup = 1
   entropy = 4.3
   keywords = ["seriatim_"]
   ```
 
   The boundaries are explicit character classes, not `\b`, because a key may end in `-`,
-  where `\b` would not match before a newline. A short identifier such as `seriatim_node`
-  doesn't match the regex at all. The entropy floor keeps longer `snake_case` names that
-  happen to be 43 characters after the prefix from matching. gitleaks measures the Shannon
-  entropy of the secret group, prefix included. The floor is 4.3, not the 3.5 first written
-  here, because the maintainer ruled on #115 (option A). Measured over the whole match:
+  where `\b` would not match before a newline. `(?m)` makes `^` and `$` match at every line
+  break, and `$` comes first in the trailing group, so a match ends before a newline without
+  consuming it. Without that, a key at the start of the line after another match is missed:
+  two keys on consecutive lines matched once, and a low-entropy placeholder followed by a key
+  on the next line matched only the placeholder, which the floor then dropped (#115).
+
+  A short identifier such as `seriatim_node` doesn't match the regex at all. The entropy
+  floor keeps longer `snake_case` names that happen to be 43 characters after the prefix
+  from matching. gitleaks measures the Shannon entropy of the secret group, prefix included.
+  The floor is 4.3, not the 3.5 first written here, because the maintainer ruled on #115
+  (option A). Measured over the whole match:
   - 200,000 names of 43 characters, built from words in `seriatim_node`, reach at most 4.25
     (mean 3.8), and most exceed 3.5.
   - 2,000,000 `new_key()` outputs are at least 4.36 (mean 5.0). None was below 4.3.
 
-  The repository has no
-  test of its gitleaks configuration, so S2-4 adds none; its PR shows the rule working by
-  running gitleaks on a scratch directory outside the repository that holds one `new_key()`
-  output (the check fails) and one 43-character identifier (it passes). The regex is exactly
-  `new_key()`'s form.
+  The repository has no test of its gitleaks configuration, so S2-4 adds none. Its PR (#115)
+  shows the rule working with gitleaks 8.21.2, the version CI pins, on scratch directories
+  outside the repository:
+  - one `new_key()` output is flagged;
+  - a 43-character identifier after `seriatim_` passes;
+  - two keys on consecutive lines give two findings;
+  - a low-entropy placeholder followed by a key on the next line flags the key.
+
+  The regex is exactly `new_key()`'s form.
 - **The output**, on stdout only, once: the key on its own line, a blank line, then the
   `[[keys]]` table with `id`, `scope` and `sha256 = hashlib.sha256(key.encode("ascii")).hexdigest()`
   (Appendix A). That is the hash the sidecar computes for `Authorization: Bearer <key>`.
