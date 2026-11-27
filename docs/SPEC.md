@@ -2160,7 +2160,7 @@ The maintainer applies these settings; each slice's pull request says which rows
 | Immutable releases | on, so a published release's assets and tag can't be changed | S0a; applied |
 | Environment `release` | the maintainer as required reviewer; deployment limited to `v*` tags; the only environment whose job holds publish permissions (REQ-68) | S0a; applied |
 | GHCR package | linked to this repository; write access only from this repository's Actions (the `release` job); no personal access token | S10 |
-| Dependabot | `.github/dependabot.yml`: the `uv` and `github-actions` ecosystems, and `docker-compose` (`directory: "/ppe"`, the image digests pinned in `ppe/compose.yaml`, from S0b), each in one weekly grouped PR; never auto-merged (no auto-merge is enabled on Dependabot PRs; they pass the same checks and review as any PR) | S0a part 2 |
+| Dependabot | `.github/dependabot.yml`: the `uv` and `github-actions` ecosystems, and `docker-compose` (`directory: "/ppe"`, the image digests pinned in `ppe/compose.yaml`, from S0b; the `python` image's minor and major bumps are ignored, because it tracks `UV_PYTHON` and a new Python is a migration across CI, the release and the PPE, #112), each in one weekly grouped PR; never auto-merged (no auto-merge is enabled on Dependabot PRs; they pass the same checks and review as any PR) | S0a part 2 |
 | Auto-merge, delete branch on merge | on | now |
 
 ## 8. Test plan

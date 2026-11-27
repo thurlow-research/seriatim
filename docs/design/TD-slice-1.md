@@ -1470,7 +1470,8 @@ tests and `Enforced: yes`.
   question 1, how node-a gets its code, and question 2, P4's model. Option A is built for
   both, as below.
 - **node-a** (`ppe/compose.yaml`) runs a digest-pinned `python:3.12.16-slim-trixie`
-  (Dependabot's docker-compose ecosystem bumps it with the others) in `ollama-a`'s network
+  (Dependabot's docker-compose ecosystem bumps its 3.12 patch release and digest with the
+  others; Python minor and major bumps are ignored, #112) in `ollama-a`'s network
   namespace, with `cap_drop: [ALL]`, the §6 settings and its code mounted read-only from
   `ppe/data/node` (gitignored). No image is built, so the guard needs no `build` key and its
   allowlist is unchanged (#28).
