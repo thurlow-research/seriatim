@@ -671,19 +671,37 @@ seriatim-node keygen --id <id> --scope infer|admin
   [[rules]]
   id = "seriatim-node-key"
   description = "A Seriatim sidecar key (TD-slice-2 §7)"
-  regex = '''(?:^|[^A-Za-z0-9_-])(seriatim_[A-Za-z0-9_-]{43})(?:[^A-Za-z0-9_-]|$)'''
+  regex = '''(?m)(?:^|[^A-Za-z0-9_-])(seriatim_[A-Za-z0-9_-]{43})(?:$|[^A-Za-z0-9_-])'''
   secretGroup = 1
-  entropy = 3.5
+  entropy = 4.3
   keywords = ["seriatim_"]
   ```
 
   The boundaries are explicit character classes, not `\b`, because a key may end in `-`,
-  where `\b` would not match before a newline. The entropy floor keeps identifiers such as `seriatim_node` (and longer `snake_case` names
-  that happen to be 43 characters after the prefix) from matching. The repository has no
-  test of its gitleaks configuration, so S2-4 adds none; its PR shows the rule working by
-  running gitleaks on a scratch directory outside the repository that holds one `new_key()`
-  output (the check fails) and one 43-character identifier (it passes). The regex is exactly
-  `new_key()`'s form.
+  where `\b` would not match before a newline. `(?m)` makes `^` and `$` match at every line
+  break, and `$` comes first in the trailing group, so a match ends before a newline without
+  consuming it. Without that, a key at the start of the line after another match is missed:
+  two keys on consecutive lines matched once, and a low-entropy placeholder followed by a key
+  on the next line matched only the placeholder, which the floor then dropped (#115).
+
+  A short identifier such as `seriatim_node` doesn't match the regex at all. The entropy
+  floor keeps longer `snake_case` names that happen to be 43 characters after the prefix
+  from matching. gitleaks measures the Shannon entropy of the secret group, prefix included.
+  The floor is 4.3, not the 3.5 first written here, because the maintainer ruled on #115
+  (option A). Measured over the whole match:
+  - 200,000 names of 43 characters, built from words in `seriatim_node`, reach at most 4.25
+    (mean 3.8), and most exceed 3.5.
+  - 2,000,000 `new_key()` outputs are at least 4.36 (mean 5.0). None was below 4.3.
+
+  The repository has no test of its gitleaks configuration, so S2-4 adds none. Its PR (#115)
+  shows the rule working with gitleaks 8.21.2, the version CI pins, on scratch directories
+  outside the repository:
+  - one `new_key()` output is flagged;
+  - a 43-character identifier after `seriatim_` passes;
+  - two keys on consecutive lines give two findings;
+  - a low-entropy placeholder followed by a key on the next line flags the key.
+
+  The regex is exactly `new_key()`'s form.
 - **The output**, on stdout only, once: the key on its own line, a blank line, then the
   `[[keys]]` table with `id`, `scope` and `sha256 = hashlib.sha256(key.encode("ascii")).hexdigest()`
   (Appendix A). That is the hash the sidecar computes for `Authorization: Bearer <key>`.
@@ -692,6 +710,40 @@ seriatim-node keygen --id <id> --scope infer|admin
   starts no server. Its exit code is 0.
 - **Where it runs.** On the operator's machine or on the node. The key goes to the client
   (or, from S7, into the gateway's config), and the table into the node's config file.
+
+**Details fixed by the code (S2-4).** S2-4 adds `keygen` to `auth.py`, `main(argv)` to
+`app.py`, and `.gitleaks.toml`.
+- **The parser.** `prog` is `seriatim-node keygen`, so the usage line is `usage:
+  seriatim-node keygen --id ID --scope {infer,admin}`. It has `add_help=False`, since `-h` and
+  `--help` are "any other argument" and exit 2 like one, and `allow_abbrev=False`, so `--i` is
+  not taken for `--id`. `Once`'s error is `argument --id: given more than once` (or
+  `--scope`). `keygen` catches the `SystemExit` that argparse's `error` raises and returns 2,
+  so it never exits the process itself.
+- **The id rule.** `auth.py` cannot import `config.py`, so it keeps its own copy of
+  `KeyConfig.id`'s pattern, `KEY_ID_PATTERN`; a test checks that the two are the same. The id
+  is checked with `re.fullmatch`, so an id with a trailing newline is refused, as pydantic
+  refuses it (Python's `$` alone would accept one).
+- **The output** is written to `out` in one `write`: the key, a blank line, and the table in
+  exactly the form `harness.key_tables()` writes.
+- **`main(argv)`** dispatches on `argv[:1] == ["keygen"]`. Any other non-empty `argv`,
+  including an empty first argument, prints `USAGE` (`usage: seriatim-node [keygen --id <id>
+  --scope infer|admin]`, in `app.py`) on stderr and returns 2. `keygen` gets `sys.stdout` as
+  it is at the call, so pytest's `capsys` sees it.
+- **`main()` under pytest.** With no argument, `main()` reads `sys.argv[1:]`, which under
+  pytest is pytest's own command line. So the A4 and C8 tests call `main([])`, and A5 sets
+  `sys.argv` when it tests the default. `test_package.py`'s `runpy` test of
+  `python -m seriatim_node` (outside §9's S2-4 files) also sets `sys.argv`, so its exit 2
+  comes from the invalid `SLOTS` it sets, not from a usage message for pytest's arguments. It
+  now checks that `SERIATIM_NODE_SLOTS` is on stderr. The subprocess test beside it is
+  unaffected.
+- **Where the tests are.** A5 is in `test_auth.py`. Its `keygen_only` fixture runs `main()`
+  in an empty working directory, with `SLOTS=0`, `CONFIG` naming a directory, a `LOCK_DIR`
+  that must stay absent, and `load_settings`, `acquire_singleton`, `create_app` and
+  `uvicorn.run` patched to fail the test if reached. The http request is A13's form: the
+  printed table written to a file under `tmp_path`, `load_settings`, then `ThreadServer`,
+  and one `GET /api/tags` whose log line has `client: client-a`. The id-pattern test carries
+  no TD ID.
+- **`.gitleaks.toml`** is the block above, with a comment at its head.
 
 ## 8. Tests to write (exact)
 

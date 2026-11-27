@@ -21,7 +21,7 @@ import re
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -36,7 +36,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route as StarletteRoute
 
-from seriatim_node.auth import Decision, Verdict, authorise
+from seriatim_node.auth import Decision, Verdict, authorise, keygen
 from seriatim_node.config import KEYS_VAR, NO_KEYS, ConfigError, Settings, keyring, load_settings
 from seriatim_node.gate import SERIATIM_ROUTES, Gate, Kind, PathError, check_raw_path, classify
 
@@ -766,10 +766,23 @@ def acquire_singleton(settings: Settings) -> None:
     _SINGLETON_FD = fd
 
 
-def main() -> int:
-    """`seriatim-node` and `python -m seriatim_node` (TD §2.4). Returns the exit code: 2 for
-    invalid configuration, 3 if the singleton lock can't be taken, else 0 once uvicorn has
-    stopped."""
+USAGE = "usage: seriatim-node [keygen --id <id> --scope infer|admin]"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """`seriatim-node` and `python -m seriatim_node` (TD §2.4; TD-slice-2 §2.4). Returns the
+    exit code: 2 for invalid configuration, 3 if the singleton lock can't be taken, else 0 once
+    uvicorn has stopped.
+
+    `argv` defaults to `sys.argv[1:]`. With no arguments it serves; `keygen …` prints a new key
+    and never loads the settings, takes the lock or starts uvicorn (TD-slice-2 §7); anything
+    else prints `USAGE` on stderr and returns 2."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["keygen"]:
+        return keygen(args[1:], sys.stdout)
+    if args:
+        print(USAGE, file=sys.stderr)
+        return 2
     try:
         settings = load_settings()
     except ConfigError as e:

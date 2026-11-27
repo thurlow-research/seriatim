@@ -1,0 +1,15 @@
+# gitleaks configuration (TD-slice-2 §7; SPEC §9 S2-R7, S2-R8). gitleaks v8 reads this file
+# from the root of the scanned repository when no --config is given, so the pre-commit hook
+# and the secret-scan workflow both use it: gitleaks' default rules, plus one for the sidecar's
+# keys, `seriatim_` and 43 base64url characters (`seriatim_node.auth.new_key()`, Q2).
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "seriatim-node-key"
+description = "A Seriatim sidecar key (TD-slice-2 §7)"
+regex = '''(?m)(?:^|[^A-Za-z0-9_-])(seriatim_[A-Za-z0-9_-]{43})(?:$|[^A-Za-z0-9_-])'''
+secretGroup = 1
+entropy = 4.3
+keywords = ["seriatim_"]

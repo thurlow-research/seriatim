@@ -1,4 +1,4 @@
-"""TD-slice-1 §8.1: configuration (C1 to C11; C8 is `main()`).
+"""TD-slice-1 §8.1: configuration (C1 to C11; C8 is `main([])`, which serves as in S1).
 
 From S2 the sidecar refuses to start with no keys unless `ALLOW_UNAUTHENTICATED` is set
 (TD-slice-2 Q13). So wherever these tests load settings with neither, `load` and `refused`
@@ -458,7 +458,7 @@ async def _get(asgi, path: bytes) -> list[dict]:
 @pytest.mark.td("C8")
 def test_main_invalid_config_exits_2(node_env, monkeypatch, capsys):
     monkeypatch.setenv(P + "SLOTS", "0")
-    assert app.main() == 2
+    assert app.main([]) == 2
     assert "SERIATIM_NODE_SLOTS" in capsys.readouterr().err
     assert node_env == [] and app._SINGLETON_FD is None
 
@@ -482,7 +482,7 @@ def test_main_runs_uvicorn_with_one_h11_worker(node_env, monkeypatch, tmp_path):
         return recording
 
     monkeypatch.setattr(app, "create_app", create_app)
-    assert app.main() == 0
+    assert app.main([]) == 0
     ((args, kwargs),) = node_env
     assert kwargs == {
         "host": "127.0.0.1",
@@ -513,7 +513,7 @@ def test_main_exits_3_when_it_cannot_lock(node_env, monkeypatch, tmp_path, capsy
     parent.write_text("x", encoding="utf-8")
     monkeypatch.setenv(P + "ALLOW_UNAUTHENTICATED", "true")
     monkeypatch.setenv(P + "LOCK_DIR", str(parent / "run"))
-    assert app.main() == 3
+    assert app.main([]) == 3
     err = capsys.readouterr().err
     assert err.startswith("seriatim-node: cannot lock ") and str(parent) in err
     assert node_env == []
