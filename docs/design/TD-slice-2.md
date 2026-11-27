@@ -6,11 +6,12 @@ and the maintainer's rulings on #35 (issuecomment-7109174985 and issuecomment-71
 recorded as S2-R1 to S2-R8 in SPEC §9. Every question in §10 is now ruled. Revision 2 also
 mapped the 15 scenarios that #96 found missing (§8.2), and added A13 and A14.
 
-Enforced: no
+Enforced: yes
 
-(The `td-test-ids` check, SPEC REQ-63, reads this line. S2's code ships as the series of small
-PRs in §9. The **last** one, S2-5, sets it to `yes`. Each earlier PR marks the tests of the IDs
-its §9 row gives it with `@pytest.mark.td("<ID>")`.)
+(The `td-test-ids` check, SPEC REQ-63, reads this line. S2's code shipped as the series of small
+PRs in §9. Each PR marked the tests of the IDs its §9 row gives it with
+`@pytest.mark.td("<ID>")`. The **last** one, S2-5, set this line to `yes`, so every ID of §8,
+A1 to A14, must now have a passing test.)
 
 **Implements:** SPEC REQ-13, REQ-14, REQ-15 (S2 form: the refusal without keys, the hourly
 warning, and the loopback listen address that `ALLOW_UNAUTHENTICATED` no longer relaxes),
@@ -432,6 +433,39 @@ the test harness use.
   or not (S2-R1).
 - The task never touches the gate, so ADR-001 §6's "no background task ever frees a slot"
   still holds.
+
+**Details fixed by the code (S2-5).** S2-5 adds the hourly warning: `RequestLog.event`,
+`create_app`'s `warn_every_s`, and the task.
+- **The interval.** `WARN_EVERY_S = 3600.0` is in `app.py`. `create_app(…, warn_every_s=…)`
+  defaults to it and passes it to `_Dispatcher`, which keeps it as `self.warn_every_s`.
+  `from anyio import sleep` is the only `sleep` that `app.py` uses, so the task is the only
+  thing that A12's patch of `seriatim_node.app.sleep` changes.
+- **The task group.** The lifespan opens an `anyio` task group around its `yield`. It starts
+  `_warn_allow_unauthenticated` with `start_soon` only when `allow_unauthenticated` is true,
+  and cancels the group's scope once the `yield` returns, at shutdown. The clients are still
+  closed in the `finally` around it. So the first line is written just after the lifespan
+  starts, when the event loop first runs the task.
+- **`event` keeps the level threshold.** `emit(…)` is now `event("request", …)`, so both
+  share one path, the threshold included: with `LOG_LEVEL=ERROR` the warning line is not
+  written. The startup line on stderr (§2.2, step 8) is still written.
+- **The line** has exactly `ts`, `level`, `event`, `message` and `node`, in that order
+  (Appendix A).
+- **Where the tests are.** A12's four tests are in `test_http_auth.py`. The `sidecar` fixture
+  takes no `warn_every_s`, so the warning tests use `create_app` and `ThreadServer` directly,
+  with an interval of 0.2 s. The tests:
+  - **Test mode** opens every route, through the `sidecar` fixture.
+  - **The repeated lines**, with no keys and with keys. The test waits (up to `WAIT_S`) for
+    the startup line and two more. Their `ts` values must be at least the interval apart,
+    less `timer_slack()`, the wall clock's resolution and the 1 ms that `ts` is rounded to.
+    "None after shutdown" holds because the server's thread has ended, so its event loop
+    has finished, and it is checked again after one more interval plus `TIMING_BOUND_S`.
+  - **Keys and no flag.** The test serves one request, then waits two intervals plus
+    `TIMING_BOUND_S`, and no warning line may appear.
+  - **The 3600 s default.** `seriatim_node.app.sleep` is patched to record its argument and
+    then `anyio.sleep_forever()`.
+- **No S1 test changes.** Every unkeyed test sidecar now writes one warning line when it
+  starts. Every test that reads request lines filters them, by `harness.log_lines` (on
+  `event`) or by path or method, so none counts the warning, and `harness.py` is unchanged.
 
 ### 2.5 `proxy.py`
 

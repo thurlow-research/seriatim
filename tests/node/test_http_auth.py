@@ -1,4 +1,4 @@
-"""Sidecar authentication over real sockets (TD-slice-2 §8, the http tier): A6 to A11, A13 and A14.
+"""Sidecar authentication over real sockets (TD-slice-2 §8, the http tier): A6 to A14.
 
 The real sidecar on a loopback port, in front of `fake_ollama` (TD-slice-1 §7), with keys
 configured. Keys come from `new_key()`, never from a literal, so nothing that looks like a key
@@ -12,13 +12,17 @@ import base64
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 from harness import (
+    TIMING_BOUND_S,
     WAIT_S,
     FakeClock,
     RawResponse,
@@ -27,6 +31,7 @@ from harness import (
     closed_port,
     key_tables,
     log_lines,
+    make_settings,
     raw_connect,
     raw_exchange,
     read_response,
@@ -35,12 +40,14 @@ from harness import (
     reserve_socket,
     sequence,
     status,
+    timer_slack,
     wait_for,
 )
 
+import seriatim_node.app as app_module
 from seriatim_node.app import create_app
 from seriatim_node.auth import OTHER_SCHEME, TWO_HEADERS, WHITESPACE, new_key
-from seriatim_node.config import load_settings
+from seriatim_node.config import ALLOW_WARNING, ALLOW_WITH_KEYS_WARNING, Settings, load_settings
 from seriatim_node.gate import Gate, SlotState
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -125,6 +132,12 @@ class Log:
         wait_for(lambda: any(d["request_id"] == rid for d in self.lines()))
         (found,) = [d for d in self.lines() if d["request_id"] == rid]
         return found
+
+    def warnings(self) -> list[dict]:
+        """Test mode's warning lines (TD-slice-2 §2.4), which `log_lines` leaves out."""
+        self.lines()
+        docs = [json.loads(x) for x in self.text.splitlines() if x.startswith('{"ts"')]
+        return [d for d in docs if d["event"] == "allow_unauthenticated"]
 
 
 def call(
@@ -670,6 +683,131 @@ def test_a11_refused_or_ignored_secrets_are_never_logged_or_echoed(
     log.lines()
     assert not [m for m in marks if m in log.text or m in caplog.text]
     assert [r for r in caplog.records if r.name == "uvicorn.access"] == []  # L3: it stays off
+
+
+# --- A12: unauthenticated test mode and the hourly warning ----------------------------------
+
+EVERY_S = 0.2  # the warning's interval in A12's tests: `create_app(…, warn_every_s=…)`
+WARNING_KEYS = ["ts", "level", "event", "message", "node"]  # Appendix A, in order
+
+
+def serve(settings: Settings, **kwargs: object) -> ThreadServer:
+    """A sidecar run directly, so a test can pass `create_app` its `warn_every_s`."""
+    app = create_app(settings, gate=ready_gate()[0], **kwargs)
+    return ThreadServer(app, reserve_socket(), lifespan="on").start()
+
+
+def wall_s(ts: str) -> float:
+    """A line's `ts` in seconds, to the millisecond it is written with."""
+    return datetime.strptime(ts[:-1] + "+0000", "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+
+
+@pytest.mark.td("A12")
+def test_a12_unauthenticated_test_mode_opens_every_route(fake_ollama, sidecar, capsys):
+    """Q12: with no keys and the flag, no request is authenticated, `admin` routes included,
+    and an ambiguous `Authorization` is not even read; Ollama never sees it."""
+    for method, path in [("POST", "/api/create"), ("OPTIONS", "/api/tags"), ("GET", "/api/tags")]:
+        fake_ollama.script(method, path, status(200, OK))
+    gate, _ = ready_gate()
+    car = sidecar(fake_ollama.url, gate=gate)
+    assert car.settings.allow_unauthenticated and not car.settings.keys
+    log = Log(capsys)
+    assert call(car, "POST", "/api/create", "a12-create", content=b"{}").status_code == 200
+    assert call(car, "OPTIONS", "/api/tags", "a12-options").status_code == 200
+    two = b"Authorization: Bearer %s\r\nAuthorization: Basic x\r\n" % new_key().encode()
+    resp = raw_exchange(car.port, raw(b"/api/tags", "a12-two", two))
+    assert (resp.status, resp.body) == (200, OK)
+    assert [(r.method, r.raw_path) for r in fake_ollama.requests] == [
+        ("POST", b"/api/create"),
+        ("OPTIONS", b"/api/tags"),
+        ("GET", b"/api/tags"),
+    ]
+    for received in fake_ollama.requests:
+        assert b"authorization" not in {k.lower() for k, _ in received.headers}
+    for rid in ["a12-create", "a12-options", "a12-two"]:
+        line = log.line(rid)
+        assert (line["client"], line["outcome"], line["status"]) == (None, "ok", 200)
+    assert all_free(gate)
+
+
+@pytest.mark.td("A12")
+@pytest.mark.parametrize(
+    ("with_keys", "message"),
+    [(False, ALLOW_WARNING), (True, ALLOW_WITH_KEYS_WARNING)],
+    ids=["no-keys", "keys"],
+)
+def test_a12_the_warning_repeats_while_the_flag_is_set(
+    with_keys, message, fake_ollama, keys, capsys
+):
+    """REQ-15, S2-R1: a `WARNING` line at startup, then one every `warn_every_s`, keys or not,
+    with the message for the mode; none once the sidecar has stopped."""
+    tables = keys.tables if with_keys else []
+    settings = make_settings(fake_ollama.url, keys=tables, allow_unauthenticated=True)
+    log = Log(capsys)
+    server = serve(settings, warn_every_s=EVERY_S)
+    try:
+        wait_for(lambda: len(log.warnings()) >= 3)  # the startup line and two more
+    finally:
+        server.stop()
+    assert not server.thread.is_alive()  # its event loop has finished: nothing more can run
+    seen = log.warnings()
+    for doc in seen:
+        assert list(doc) == WARNING_KEYS  # no request fields
+        assert (doc["level"], doc["message"], doc["node"]) == ("WARNING", message, "node-a")
+    # Each sleep may end up to `timer_slack()` early, and `ts` is the wall clock to the ms.
+    slack = timer_slack() + time.get_clock_info("time").resolution + 0.001
+    stamps = [wall_s(doc["ts"]) for doc in seen]
+    assert all(b - a >= EVERY_S - slack for a, b in zip(stamps, stamps[1:], strict=False))
+    assert log.lines() == []  # `log_lines` never counts them as requests
+    time.sleep(EVERY_S + TIMING_BOUND_S)  # a negative check: time for one more, had it run
+    assert log.warnings() == seen
+
+
+@pytest.mark.td("A12")
+def test_a12_no_warning_without_the_flag(fake_ollama, keys, capsys):
+    """S2-R1: with keys and no flag there is no task, so not even the startup line."""
+    fake_ollama.script("GET", "/api/tags", status(200, OK))
+    settings = make_settings(fake_ollama.url, keys=keys.tables)
+    assert not settings.allow_unauthenticated
+    log = Log(capsys)
+    server = serve(settings, warn_every_s=EVERY_S)
+    try:
+        url = f"http://127.0.0.1:{server.port}/api/tags"
+        headers = [bearer(keys.infer), ("x-request-id", "a12-keys")]
+        assert httpx.get(url, headers=headers, timeout=WAIT_S).status_code == 200
+        assert log.line("a12-keys")["client"] == "client-a"
+        time.sleep(2 * EVERY_S + TIMING_BOUND_S)  # a negative check: two intervals and more
+    finally:
+        server.stop()
+    assert log.warnings() == []
+
+
+@pytest.mark.td("A12")
+def test_a12_the_warning_sleeps_an_hour_by_default(fake_ollama, capsys, monkeypatch):
+    """M8: without `warn_every_s`, the task sleeps 3600 s. `app.sleep`, app's own binding, is
+    patched to record its argument and then wait to be cancelled, so the loop never spins;
+    `anyio.sleep` itself is untouched."""
+    real_sleep = anyio.sleep
+    delays: list[float] = []
+
+    async def recording_sleep(delay: float) -> None:
+        delays.append(delay)
+        await anyio.sleep_forever()  # until the lifespan cancels the task
+
+    monkeypatch.setattr(app_module, "sleep", recording_sleep)
+    settings = make_settings(fake_ollama.url)
+    log = Log(capsys)
+    server = serve(settings)
+    try:
+        wait_for(lambda: delays)
+        wait_for(lambda: log.warnings())  # written before the sleep, so already there
+    finally:
+        server.stop()
+    assert not server.thread.is_alive()
+    assert delays == [3600]
+    (doc,) = log.warnings()
+    assert (doc["level"], doc["message"]) == ("WARNING", ALLOW_WARNING)
+    assert anyio.sleep is real_sleep
 
 
 # --- A13: rotation ----------------------------------------------------------------------------
