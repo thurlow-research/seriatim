@@ -21,7 +21,7 @@ name: seriatim-ppe
 
 services:
   ollama-a:
-    image: ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+    image: ollama/ollama:0.40.17@sha256:ccc42bcd3d5fcf7ab0d532b300382154e1a4da56fc666bdb313b78ebdd912754
     environment:
       # Bound to loopback inside its own network namespace, as in production.
       OLLAMA_HOST: "127.0.0.1:11435"
@@ -46,7 +46,7 @@ services:
 
   # Packet capture of the raw bytes Ollama receives.
   cap-a:
-    image: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+    image: nicolaka/netshoot:v0.17@sha256:7c6d613e96cbd29bc74f2d1d35035eeb2ec5e7b1cfbbc3277bd697bc3db7b40a
     network_mode: "service:ollama-a"
     cap_drop: [ALL]
     cap_add: [NET_RAW, NET_ADMIN]
@@ -64,7 +64,7 @@ services:
   # Loopback debug port: forwards 0.0.0.0:11434 in ollama-a's namespace to Ollama on
   # 127.0.0.1:11435. Published only on the host's 127.0.0.1 (see ollama-a's ports).
   dbg-a:
-    image: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+    image: nicolaka/netshoot:v0.17@sha256:7c6d613e96cbd29bc74f2d1d35035eeb2ec5e7b1cfbbc3277bd697bc3db7b40a
     network_mode: "service:ollama-a"
     cap_drop: [ALL]
     command: ["socat", "TCP-LISTEN:11434,fork,reuseaddr", "TCP:127.0.0.1:11435"]
@@ -78,7 +78,7 @@ services:
   # in ollama-a's namespace to the sidecar on 127.0.0.1:11437. Published only on the host's
   # 127.0.0.1 (see ollama-a's ports). The sidecar sees every PPE client as 127.0.0.1.
   fwd-a:
-    image: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+    image: nicolaka/netshoot:v0.17@sha256:7c6d613e96cbd29bc74f2d1d35035eeb2ec5e7b1cfbbc3277bd697bc3db7b40a
     network_mode: "service:ollama-a"
     cap_drop: [ALL]
     command: ["socat", "TCP-LISTEN:11436,fork,reuseaddr", "TCP:127.0.0.1:11437"]
