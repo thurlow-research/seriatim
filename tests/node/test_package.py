@@ -49,13 +49,15 @@ def test_run_reraises_other_missing_modules(monkeypatch):
         entry.run()
 
 
-def test_module_main_block_exits_with_run_status(monkeypatch):
+def test_module_main_block_exits_with_run_status(monkeypatch, capsys):
     monkeypatch.setenv("SERIATIM_NODE_SLOTS", "0")  # invalid, so main() exits 2 at once
+    monkeypatch.setattr(sys, "argv", ["seriatim-node"])  # not pytest's own arguments (S2-4)
     monkeypatch.delitem(sys.modules, "seriatim_node.app", raising=False)
     monkeypatch.delitem(sys.modules, "seriatim_node.__main__", raising=False)
     with pytest.raises(SystemExit) as e:
         runpy.run_module("seriatim_node", run_name="__main__", alter_sys=True)
     assert e.value.code == 2
+    assert "SERIATIM_NODE_SLOTS" in capsys.readouterr().err  # the config error, not usage
 
 
 @pytest.mark.process

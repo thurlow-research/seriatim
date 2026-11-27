@@ -714,9 +714,10 @@ seriatim-node keygen --id <id> --scope infer|admin
 - **`main()` under pytest.** With no argument, `main()` reads `sys.argv[1:]`, which under
   pytest is pytest's own command line. So the A4 and C8 tests call `main([])`, and A5 sets
   `sys.argv` when it tests the default. `test_package.py`'s `runpy` test of
-  `python -m seriatim_node` (outside §9's S2-4 files) still calls `main()` with pytest's
-  arguments: it still exits 2, but run as `pytest -m …` that 2 is the usage message, not the
-  invalid `SLOTS` it sets. The subprocess test beside it is unaffected.
+  `python -m seriatim_node` (outside §9's S2-4 files) also sets `sys.argv`, so its exit 2
+  comes from the invalid `SLOTS` it sets, not from a usage message for pytest's arguments. It
+  now checks that `SERIATIM_NODE_SLOTS` is on stderr. The subprocess test beside it is
+  unaffected.
 - **Where the tests are.** A5 is in `test_auth.py`. Its `keygen_only` fixture runs `main()`
   in an empty working directory, with `SLOTS=0`, `CONFIG` naming a directory, a `LOCK_DIR`
   that must stay absent, and `load_settings`, `acquire_singleton`, `create_app` and
