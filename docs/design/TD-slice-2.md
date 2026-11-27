@@ -673,13 +673,21 @@ seriatim-node keygen --id <id> --scope infer|admin
   description = "A Seriatim sidecar key (TD-slice-2 §7)"
   regex = '''(?:^|[^A-Za-z0-9_-])(seriatim_[A-Za-z0-9_-]{43})(?:[^A-Za-z0-9_-]|$)'''
   secretGroup = 1
-  entropy = 3.5
+  entropy = 4.3
   keywords = ["seriatim_"]
   ```
 
   The boundaries are explicit character classes, not `\b`, because a key may end in `-`,
-  where `\b` would not match before a newline. The entropy floor keeps identifiers such as `seriatim_node` (and longer `snake_case` names
-  that happen to be 43 characters after the prefix) from matching. The repository has no
+  where `\b` would not match before a newline. A short identifier such as `seriatim_node`
+  doesn't match the regex at all. The entropy floor keeps longer `snake_case` names that
+  happen to be 43 characters after the prefix from matching. gitleaks measures the Shannon
+  entropy of the secret group, prefix included. The floor is 4.3, not the 3.5 first written
+  here, because the maintainer ruled on #115 (option A). Measured over the whole match:
+  - 200,000 names of 43 characters, built from words in `seriatim_node`, reach at most 4.25
+    (mean 3.8), and most exceed 3.5.
+  - 2,000,000 `new_key()` outputs are at least 4.36 (mean 5.0). None was below 4.3.
+
+  The repository has no
   test of its gitleaks configuration, so S2-4 adds none; its PR shows the rule working by
   running gitleaks on a scratch directory outside the repository that holds one `new_key()`
   output (the check fails) and one 43-character identifier (it passes). The regex is exactly
