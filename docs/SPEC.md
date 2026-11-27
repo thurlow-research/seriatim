@@ -339,7 +339,8 @@ here as tags: `E1a`, `E1b`, and `E2` to `E6`. No candidate passed both *busy →
   - With no keys configured, the sidecar MUST refuse to start, unless
     `SERIATIM_NODE_ALLOW_UNAUTHENTICATED=true` is set. That setting exists for the PPE and
     tests; it logs a `WARNING` at startup and, from S2, every hour, whether or not keys are
-    configured (ruling S2-R1).
+    configured (ruling S2-R1). The hourly `WARNING` line is written whatever
+    `SERIATIM_NODE_LOG_LEVEL` says (TD-slice-2 §2.4).
   - When keys are configured, `ALLOW_UNAUTHENTICATED=true` MUST NOT disable authentication
     (ruling S2-R1).
   - The sidecar MUST refuse a non-loopback listen address unless authentication is configured

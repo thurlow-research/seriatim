@@ -427,6 +427,8 @@ the test harness use.
 - `RequestLog.event(name, *, level, **fields)` writes the same JSON line format as `emit`,
   with `event` set to `name` and no request fields (Appendix A). `emit` becomes
   `event("request", …)`.
+- **The warning is written whatever `LOG_LEVEL` says** (REQ-15; the maintainer's ruling B on
+  S2-5's PR). `LOG_LEVEL=ERROR` hides request lines below `ERROR`, but never this line.
 - `warn_every_s` is a `create_app` argument, not a setting, so a deployment can't change it
   (REQ-23 has no key for it).
 - With `allow_unauthenticated` false there is no task; with it true there is always one, keys
@@ -445,24 +447,36 @@ the test harness use.
   and cancels the group's scope once the `yield` returns, at shutdown. The clients are still
   closed in the `finally` around it. So the first line is written just after the lifespan
   starts, when the event loop first runs the task.
-- **`event` keeps the level threshold.** `emit(…)` is now `event("request", …)`, so both
-  share one path, the threshold included: with `LOG_LEVEL=ERROR` the warning line is not
-  written. The startup line on stderr (§2.2, step 8) is still written.
+- **The threshold is `emit`'s, not `event`'s.** `emit(…)` checks the level, then calls
+  `event("request", …)`. `event` writes its line whatever the configured level, so the
+  warning is written even with `LOG_LEVEL=ERROR` (ruling B, §2.4 above), and request lines
+  keep the threshold (HL9).
 - **The line** has exactly `ts`, `level`, `event`, `message` and `node`, in that order
   (Appendix A).
-- **Where the tests are.** A12's four tests are in `test_http_auth.py`. The `sidecar` fixture
+- **Where the tests are.** A12's five tests are in `test_http_auth.py`. The `sidecar` fixture
   takes no `warn_every_s`, so the warning tests use `create_app` and `ThreadServer` directly,
   with an interval of 0.2 s. The tests:
-  - **Test mode** opens every route, through the `sidecar` fixture.
+  - **Test mode** opens every route, through the `sidecar` fixture. `POST /api/create` and
+    `OPTIONS /api/tags` are both gated on the one slot, so the test waits for each one's
+    line, written once its lease has ended, before the next (TD-slice-1 §8.6).
   - **The repeated lines**, with no keys and with keys. The test waits (up to `WAIT_S`) for
-    the startup line and two more. Their `ts` values must be at least the interval apart,
-    less `timer_slack()`, the wall clock's resolution and the 1 ms that `ts` is rounded to.
-    "None after shutdown" holds because the server's thread has ended, so its event loop
-    has finished, and it is checked again after one more interval plus `TIMING_BOUND_S`.
+    the startup line and two more. Each `ts` is read as whole milliseconds, so each gap is
+    exact. The sleep is timed by the monotonic clock and `ts` by the wall clock, so a gap
+    may be shorter than the interval by the sum of four things:
+    - `timer_slack()`, for a sleep that ends early;
+    - twice the wall clock's resolution;
+    - the 1 ms of truncation;
+    - 500 ppm of NTP slewing.
+    A step of the wall clock is not allowed for. "None after shutdown" holds because the
+    server's thread has ended, so its event loop has finished, and it is checked again after
+    one more interval plus `TIMING_BOUND_S`.
+  - **Whatever the log level.** With `LOG_LEVEL=ERROR` and the flag, the warning lines are
+    written, and the `INFO` line of a request served between them is not.
   - **Keys and no flag.** The test serves one request, then waits two intervals plus
     `TIMING_BOUND_S`, and no warning line may appear.
-  - **The 3600 s default.** `seriatim_node.app.sleep` is patched to record its argument and
-    then `anyio.sleep_forever()`.
+  - **The 3600 s default.** `sleep` is patched in `create_app.__globals__`, the module the
+    harness runs (`conftest.py`'s import rule), to record its argument and then
+    `anyio.sleep_forever()`.
 - **No S1 test changes.** Every unkeyed test sidecar now writes one warning line when it
   starts. Every test that reads request lines filters them, by `harness.log_lines` (on
   `event`) or by path or method, so none counts the warning, and `harness.py` is unchanged.
@@ -804,7 +818,7 @@ committed. The http tests write their `[[keys]]` file under `tmp_path`.
 | A9 | Ambiguous credentials over HTTP (raw socket where httpx would merge headers): two `Authorization` headers, one of them a valid `admin` key; `Basic <b64>`; `Bearer <key> x`; `Bearer a, Bearer b` → 400 `AUTH_AMBIGUOUS` on a gated, an ungated and a `/seriatim/*` route: `error_code: AUTH_AMBIGUOUS`, `retryable: false`, `replay_safe: true`, `source: sidecar`, `node` equal to `settings.id`, `X-Seriatim-Gate: ungated`, and the body validates against `ErrorEnvelope` (K-OAS2); no `WWW-Authenticate`; nothing recorded upstream; no slot taken; the message names the reason and contains no header value. A valid key in `X-API-Key` with no `Authorization` → 401 `AUTH_MISSING` with the `X-API-Key` hint (Q11); with a valid Bearer key as well → passes, and Ollama receives neither header. `?key=<valid key>`, `Cookie: key=<valid key>` and `Proxy-Authorization: Bearer <valid key>`, each with no `Authorization` → 401 `AUTH_MISSING`, and `fake_ollama` recorded nothing (S2-R6) | http | 13, 25 |
 | A10 | Auth comes first (§3). With no key: a gated request while the only slot is held → 401, never 429; during the startup quarantine → 401, never 503 `NODE_STARTING`; with `Content-Length` over `max_body_bytes` → 401, never 413; in each case the slot holder is undisturbed and the gate state is unchanged. Over a raw socket, the headers of a `POST /api/chat` with `Content-Length: 4096` and no body bytes → the 401 arrives before any body is sent, with `Connection: close`, and the connection is closed; an `Expect: 100-continue` request gets its 401 with no `100 Continue`. A 401 to a `GET` with no body keeps the connection, and the next request on it with a valid key gets 200. S1's earlier checks still win: HTTP/1.0 → 505, `/api/../chat` → 400 `BAD_PATH`, `Transfer-Encoding` with `Content-Length` → 400 `BAD_REQUEST_BODY`, each with no key (Q5) | http | 13, 3, 20, 20a |
 | A11 | The key never leaves. With a valid `infer` key on a gated `/api/chat` (non-streaming and streaming) and on `/api/tags`, and a valid `admin` key on a streamed `POST /api/blobs/sha256:<hex>`, each also sending `X-API-Key`, `Cookie` and `Proxy-Authorization` → `fake_ollama` recorded none of `Authorization`, `X-API-Key`, `Cookie` or `Proxy-Authorization`. Across one request of every outcome in §5 and TD-slice-1 §5 that S2 can reach (200, 400 `AUTH_AMBIGUOUS`, 401 both ways, 403, 404, 413, 429, 502), no log line, response body or response header contains the key, its SHA-256 in hex, or the configured hash of any other key. The same holds for credentials that are refused or ignored, each its own marker secret: a wrong key (`Bearer <secret>`, 401 `AUTH_INVALID`); `Basic <secret>` (400); `Bearer <secret> x` (400); and a secret sent only in `X-API-Key`, only in `Cookie`, and only in the query string (`?key=<secret>`), each with no `Authorization` → no log line (traceback included) and no response body or header contains the secret. This asserts only that nothing is logged or echoed; how a query-string key is answered is A9's. An authenticated `GET /api/tags?key=<secret>` (valid Bearer `infer` key) → 200: `fake_ollama` receives the query string `key=<secret>` byte for byte (REQ-6 forwards it unchanged; the residual risk REQ-13 records), and no log line contains `<secret>` (S2-R6). `client` is the key's id on the authenticated lines (the 403 included) and `null` on the 400 and 401 lines. Each auth refusal's line has §2.4's `outcome` and `level`: `unauthenticated` for both 401s, `forbidden` for the 403 and `rejected` for the 400, each at `INFO`. `uvicorn`'s access log stays off (TD-slice-1 L3) | http | 13, 22 |
-| A12 | Unauthenticated test mode and the hourly warning. With no keys and `ALLOW_UNAUTHENTICATED=true`: `POST /api/create` and `OPTIONS /api/tags` with no key reach Ollama (every route is open, Q12); a request with two `Authorization` headers is not refused, and Ollama receives neither; `client` is `null`. With `create_app(…, warn_every_s=0.2)`: one `WARNING` line with `event: "allow_unauthenticated"` and S1's "no authentication" message at startup, and further ones at that interval (at least two more within a bounded wait, each at least the interval apart); none after shutdown. With keys and `ALLOW_UNAUTHENTICATED=true` → the same lines, with the "keys are enforced" message (S2-R1). With keys and no flag → none at all. The line has the fields in Appendix A, `level: WARNING`, and no request fields. Without `warn_every_s`, `create_app` uses 3600 s: with `seriatim_node.app.sleep` (`app`'s own binding, §2.4; `anyio.sleep` itself is untouched) patched to a fake that records its argument and then `await anyio.sleep_forever()`, so the loop suspends until the lifespan cancels it instead of spinning, the recorded first argument is exactly 3600 and exactly one warning line was written | http | 15 |
+| A12 | Unauthenticated test mode and the hourly warning. With no keys and `ALLOW_UNAUTHENTICATED=true`: `POST /api/create` and `OPTIONS /api/tags` with no key reach Ollama (every route is open, Q12); a request with two `Authorization` headers is not refused, and Ollama receives neither; `client` is `null`. With `create_app(…, warn_every_s=0.2)`: one `WARNING` line with `event: "allow_unauthenticated"` and S1's "no authentication" message at startup, and further ones at that interval (at least two more within a bounded wait, each at least the interval apart); none after shutdown. With keys and `ALLOW_UNAUTHENTICATED=true` → the same lines, with the "keys are enforced" message (S2-R1). With keys and no flag → none at all. With `LOG_LEVEL=ERROR` and the flag → the `WARNING` lines are still written, and an `INFO` request line is not (ruling B: the warning ignores `LOG_LEVEL`; request lines keep the threshold). The line has the fields in Appendix A, `level: WARNING`, and no request fields. Without `warn_every_s`, `create_app` uses 3600 s: with `seriatim_node.app.sleep` (`app`'s own binding, §2.4; `anyio.sleep` itself is untouched) patched to a fake that records its argument and then `await anyio.sleep_forever()`, so the loop suspends until the lifespan cancels it instead of spinning, the recorded first argument is exactly 3600 and exactly one warning line was written | http | 15 |
 | A13 | Rotation (SPEC §6.2). A config file with two `infer` keys, `old` and `new` → each gets 200 on `/api/tags`, each logged with its own `client`. The same sidecar stopped, the `old` table removed, and a sidecar started from the edited file → `old` gets 401 `AUTH_INVALID` and `new` still gets 200 | http | 13, §6.2 |
 | A14 | No CORS on any response (REQ-6; S2-R7). With keys configured, and `fake_ollama` answering `/api/tags` and `/api/chat` with `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Credentials: true` and `Access-Control-Expose-Headers: x` → the client receives no `access-control-*` header (an `infer` key; Ollama's other headers kept). Every Seriatim-made response, each sent with an `Origin: http://example.com` header, has none either: 400 `AUTH_AMBIGUOUS`, 401 both ways, 403, a preflight `OPTIONS /api/chat` with `Access-Control-Request-Method: POST` and no key (401), health 200 and 503, 404, 405, 413, 429 and 503 `NODE_STARTING` | http | 6, 13 |
 

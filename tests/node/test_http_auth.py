@@ -15,7 +15,7 @@ import logging
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import anyio
@@ -44,7 +44,6 @@ from harness import (
     wait_for,
 )
 
-import seriatim_node.app as app_module
 from seriatim_node.app import create_app
 from seriatim_node.auth import OTHER_SCHEME, TWO_HEADERS, WHITESPACE, new_key
 from seriatim_node.config import ALLOW_WARNING, ALLOW_WITH_KEYS_WARNING, Settings, load_settings
@@ -697,9 +696,29 @@ def serve(settings: Settings, **kwargs: object) -> ThreadServer:
     return ThreadServer(app, reserve_socket(), lifespan="on").start()
 
 
-def wall_s(ts: str) -> float:
-    """A line's `ts` in seconds, to the millisecond it is written with."""
-    return datetime.strptime(ts[:-1] + "+0000", "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+MS = timedelta(milliseconds=1)
+
+
+def ts_ms(ts: str) -> int:
+    """A line's `ts` as whole milliseconds since the epoch: an int, so the difference of two
+    is exact (as float seconds, two ~1.7e9 values lose the last digits when subtracted)."""
+    return (datetime.strptime(ts[:-1] + "+0000", "%Y-%m-%dT%H:%M:%S.%f%z") - EPOCH) // MS
+
+
+def gap_floor_ms(every_s: float) -> float:
+    """The least gap, in ms of `ts`, between two warning lines `every_s` apart. The sleep is
+    timed by the monotonic clock and `ts` is the wall clock, so the floor allows for:
+    - the sleep ending up to `timer_slack()` early, by the monotonic clock;
+    - the wall clock's own resolution, at each end, so twice;
+    - `ts` being truncated to the millisecond: two truncations differ by under 1 ms;
+    - the wall clock running slow against the monotonic one while NTP slews it, at most
+      500 ppm (the adjtime(2) limit).
+    A step of the wall clock during the test is not allowed for: it is the one thing that
+    could fail this, and the check would then be measuring the step, not the sidecar."""
+    wall = time.get_clock_info("time").resolution
+    slack_s = timer_slack() + 2 * wall + 0.001 + every_s * 500e-6
+    return (every_s - slack_s) * 1000
 
 
 @pytest.mark.td("A12")
@@ -712,8 +731,12 @@ def test_a12_unauthenticated_test_mode_opens_every_route(fake_ollama, sidecar, c
     car = sidecar(fake_ollama.url, gate=gate)
     assert car.settings.allow_unauthenticated and not car.settings.keys
     log = Log(capsys)
+    # Both are gated, on the gate's one slot: each line is written once its lease has ended,
+    # so waiting for it keeps the next request from a 429 (TD-slice-1 §8.6, as A7 does).
     assert call(car, "POST", "/api/create", "a12-create", content=b"{}").status_code == 200
+    log.line("a12-create")
     assert call(car, "OPTIONS", "/api/tags", "a12-options").status_code == 200
+    log.line("a12-options")
     two = b"Authorization: Bearer %s\r\nAuthorization: Basic x\r\n" % new_key().encode()
     resp = raw_exchange(car.port, raw(b"/api/tags", "a12-two", two))
     assert (resp.status, resp.body) == (200, OK)
@@ -754,13 +777,38 @@ def test_a12_the_warning_repeats_while_the_flag_is_set(
     for doc in seen:
         assert list(doc) == WARNING_KEYS  # no request fields
         assert (doc["level"], doc["message"], doc["node"]) == ("WARNING", message, "node-a")
-    # Each sleep may end up to `timer_slack()` early, and `ts` is the wall clock to the ms.
-    slack = timer_slack() + time.get_clock_info("time").resolution + 0.001
-    stamps = [wall_s(doc["ts"]) for doc in seen]
-    assert all(b - a >= EVERY_S - slack for a, b in zip(stamps, stamps[1:], strict=False))
+    stamps = [ts_ms(doc["ts"]) for doc in seen]
+    gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False)]  # exact, in ms
+    assert all(gap >= gap_floor_ms(EVERY_S) for gap in gaps), gaps
     assert log.lines() == []  # `log_lines` never counts them as requests
     time.sleep(EVERY_S + TIMING_BOUND_S)  # a negative check: time for one more, had it run
     assert log.warnings() == seen
+
+
+@pytest.mark.td("A12")
+def test_a12_the_warning_is_written_whatever_the_log_level(fake_ollama, capsys):
+    """REQ-15: with `LOG_LEVEL=ERROR` and the flag, the `WARNING` line is still written, while
+    request lines still obey the threshold (an `INFO` request line is not written)."""
+    fake_ollama.script("GET", "/api/tags", status(200, OK))
+    settings = make_settings(fake_ollama.url, log_level="ERROR")
+    assert settings.allow_unauthenticated and settings.log_level == "ERROR"
+    log = Log(capsys)
+    server = serve(settings, warn_every_s=EVERY_S)
+    try:
+        wait_for(lambda: log.warnings())  # the startup line
+        url = f"http://127.0.0.1:{server.port}/api/tags"
+        resp = httpx.get(url, headers=[("x-request-id", "a12-error")], timeout=WAIT_S)
+        assert resp.status_code == 200
+        # The request's line, had it been written, follows the response at once; two more
+        # warnings are at least one whole interval after it.
+        after = len(log.warnings())
+        wait_for(lambda: len(log.warnings()) >= after + 2)
+    finally:
+        server.stop()
+    for doc in log.warnings():
+        assert list(doc) == WARNING_KEYS
+        assert (doc["level"], doc["message"]) == ("WARNING", ALLOW_WARNING)
+    assert log.lines() == []  # the INFO request line is below the threshold
 
 
 @pytest.mark.td("A12")
@@ -794,7 +842,12 @@ def test_a12_the_warning_sleeps_an_hour_by_default(fake_ollama, capsys, monkeypa
         delays.append(delay)
         await anyio.sleep_forever()  # until the lifespan cancels the task
 
-    monkeypatch.setattr(app_module, "sleep", recording_sleep)
+    # The globals of the module `create_app` is defined in, so the one the harness runs, not
+    # whatever the package's `app` attribute or `sys.modules` holds now: test_package.py's
+    # runpy test rebinds the attribute, and mutmut runs pytest twice in one process
+    # (conftest.py's import rule).
+    app_globals = create_app.__globals__
+    monkeypatch.setitem(app_globals, "sleep", recording_sleep)
     settings = make_settings(fake_ollama.url)
     log = Log(capsys)
     server = serve(settings)

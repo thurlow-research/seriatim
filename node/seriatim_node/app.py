@@ -243,8 +243,9 @@ class RequestLog:
     """One JSON line per request to stdout (REQ-22; TD Appendix A), and the lines of other
     events in the same format (TD-slice-2 §2.4, Appendix A).
 
-    A line is written only when its `level` is at or above the configured one, so health
-    requests, logged at `DEBUG`, add nothing at the default `INFO` (HL9).
+    A request's line is written only when its `level` is at or above the configured one, so
+    health requests, logged at `DEBUG`, add nothing at the default `INFO` (HL9). An `event`
+    line is written whatever the level (test mode's warning, REQ-15; TD-slice-2 §2.4).
     """
 
     def __init__(self, level: str, node_id: str, wall: Callable[[], float] = time.time) -> None:
@@ -253,14 +254,14 @@ class RequestLog:
         self._wall = wall
 
     def emit(self, *, level: str = "INFO", **fields: object) -> None:
-        """A request's line: `event` is `request`."""
+        """A request's line, `event` set to `request`, if `level` reaches the threshold."""
+        if _LEVELS[level] < self._threshold:
+            return
         self.event("request", level=level, **fields)
 
     def event(self, name: str, *, level: str, **fields: object) -> None:
-        """One line with `event` set to `name`: `ts`, `level`, `event`, then `fields`, then
-        `node`."""
-        if _LEVELS[level] < self._threshold:
-            return
+        """One line with `event` set to `name`, whatever the configured level: `ts`, `level`,
+        `event`, then `fields`, then `node`."""
         ms = int(self._wall() * 1000)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms // 1000))
         line = {
