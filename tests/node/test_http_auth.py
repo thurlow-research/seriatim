@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import logging
+import sys
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -842,12 +843,13 @@ def test_a12_the_warning_sleeps_an_hour_by_default(fake_ollama, capsys, monkeypa
         delays.append(delay)
         await anyio.sleep_forever()  # until the lifespan cancels the task
 
-    # The globals of the module `create_app` is defined in, so the one the harness runs, not
-    # whatever the package's `app` attribute or `sys.modules` holds now: test_package.py's
-    # runpy test rebinds the attribute, and mutmut runs pytest twice in one process
-    # (conftest.py's import rule).
-    app_globals = create_app.__globals__
-    monkeypatch.setitem(app_globals, "sleep", recording_sleep)
+    # The module `create_app` comes from, not the package's `app` attribute: test_package.py's
+    # runpy test rebinds that, and mutmut runs pytest twice in one process (conftest.py's
+    # import rule). Not `create_app.__globals__` either: under mutmut, `create_app` is a
+    # trampoline whose globals are mutmut's. The identity check proves it is the right one.
+    app_module = sys.modules[create_app.__module__]
+    assert app_module.create_app is create_app
+    monkeypatch.setattr(app_module, "sleep", recording_sleep)
     settings = make_settings(fake_ollama.url)
     log = Log(capsys)
     server = serve(settings)

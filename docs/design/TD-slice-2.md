@@ -474,9 +474,10 @@ the test harness use.
     written, and the `INFO` line of a request served between them is not.
   - **Keys and no flag.** The test serves one request, then waits two intervals plus
     `TIMING_BOUND_S`, and no warning line may appear.
-  - **The 3600 s default.** `sleep` is patched in `create_app.__globals__`, the module the
-    harness runs (`conftest.py`'s import rule), to record its argument and then
-    `anyio.sleep_forever()`.
+  - **The 3600 s default.** `sleep` is patched in `sys.modules[create_app.__module__]`, the
+    module the harness runs (`conftest.py`'s import rule). It is not patched in
+    `create_app.__globals__`, which under mutmut is the trampoline's module. The patched
+    `sleep` records its argument and then calls `anyio.sleep_forever()`.
 - **No S1 test changes.** Every unkeyed test sidecar now writes one warning line when it
   starts. Every test that reads request lines filters them, by `harness.log_lines` (on
   `event`) or by path or method, so none counts the warning, and `harness.py` is unchanged.
